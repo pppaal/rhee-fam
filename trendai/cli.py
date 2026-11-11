@@ -86,8 +86,8 @@ _MSG: dict[str, dict[str, str]] = {
         "warn_notice": "안내",
         "warn_warning": "경고",
         "wiki_series": "{article} (위키백과 조회수)",
-        "arg_int": "{what}은(는) 정수여야 합니다: {text!r}",
-        "arg_min": "{what}은(는) {lo} 이상이어야 합니다: {v}",
+        "arg_int": "{what}: 정수를 입력하세요 (입력: {text!r})",
+        "arg_min": "{what}: {lo} 이상이어야 합니다 (입력: {v})",
         "what_horizon": "예측 기간",
         "what_n": "관측치 수(--n)",
     },
@@ -250,7 +250,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="Claude로 해석문 생성 (ANTHROPIC_API_KEY 필요, 실패 시 규칙 기반으로 대체)")
     p.add_argument("--model", default="claude-opus-5-5", help="--llm 사용 시 Claude 모델 ID")
     p.add_argument("--lang", choices=["ko", "en"], default="ko",
-                   help="해석문·터미널 요약표·CLI 안내 문구의 언어 (HTML 리포트는 한국어)")
+                   help="해석문·터미널 요약·CLI 안내와 데이터 오류·경고의 언어 (HTML 리포트와 도움말은 한국어)")
     p.add_argument("--quiet", "-q", action="store_true", help="해석문 출력 생략 (요약만)")
 
 

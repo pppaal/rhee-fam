@@ -572,7 +572,8 @@ def test_argument_errors_follow_lang(capsys):
                                                                                          .split("error:")[-1])
     with pytest.raises(SystemExit):
         main(["sample", "emerging", "-H", "0"])
-    assert "예측 기간은(는) 1 이상이어야 합니다: 0" in capsys.readouterr().err
+    # wording changed from '예측 기간은(는) …' (awkward particle) to a label-colon form
+    assert "예측 기간: 1 이상이어야 합니다 (입력: 0)" in capsys.readouterr().err
 
 
 def test_ranking_marks_tentative_phases(tmp_path, capsys):

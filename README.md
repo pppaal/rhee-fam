@@ -91,8 +91,8 @@ report.analysis.phase.label_ko          # '성장기'
 report.analysis.changepoints            # 구조 변화 시점들
 report.analysis.metrics.cagr_pct        # 연평균 성장률
 report.forecast.to_frame()              # 예측값 + 80/95% 구간
-report.forecast.skill                   # 백테스트 MAE / 최선 나이브 MAE (<1이면 나이브보다 정확)
-report.outlook.prob_increase            # 상승 확률
+report.forecast.skill                   # 백테스트 오차 / 최선 나이브 오차 (MAE, 간헐 수요는 RMSE; <1이면 나이브보다 정확)
+report.outlook.prob_increase            # 상승 확률 (의미 없을 때의 이유: trendai.narrative.prob_undefined(report.analysis))
 print(report.narrative)                 # 과거/현재/미래 해석
 render_html(report, "report.html")
 
@@ -102,8 +102,9 @@ print(ranking[["name", "phase_ko", "expected_change_ann_pct", "prob_increase", "
 render_compare_html(list(reports.values()), ranking, "compare.html")
 ```
 
-- 입력을 쓸 수 없으면 `trendai.DataError`(한국어 메시지), 데이터를 고쳐서 쓴 경우 `trendai.DataWarning`,
-  해석 방식 안내는 `trendai.DataNotice` 경고가 발생합니다.
+- 입력을 쓸 수 없으면 `trendai.DataError`, 데이터를 고쳐서 쓴 경우 `trendai.DataWarning`,
+  해석 방식 안내는 `trendai.DataNotice` 경고가 발생합니다. 메시지의 `str()`은 한국어, `exc.text('en')`은 영어이며
+  `exc.code`·`exc.params`로 종류를 구분할 수 있습니다.
 - `load_table`이 돌려준 시계열의 `series.attrs["trendai"]`에 감지한 날짜 열·형식이 들어 있습니다.
 - 순위 점수(rising score, 0–100, 50=중립)는 예상 변화·상승 확률·최근 변화·모멘텀을 섞되, 변화율은 연환산하고
   모멘텀은 월 기준으로 맞춰 일·주·월·분기 데이터를 공정하게 비교합니다. 표에는 각 리포트의 원래 값
