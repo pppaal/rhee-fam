@@ -2610,8 +2610,30 @@ def _probability_line(c: _Ctx, win: _OutlookWindows) -> str:
     ptxt = format_prob(p, c.lang)
     approx_ko, approx_en = ("", "") if ptxt[0] in "<>" else ("약 ", "about ")
     fut_ko, fut_en, cur_ko, cur_en = _level_names(c, win)
-    return c.t(f"- {fut_ko}이 {cur_ko}보다 높아질 확률은 {approx_ko}**{ptxt}**로, {p_ko}.",
+    line = c.t(f"- {fut_ko}이 {cur_ko}보다 높아질 확률은 {approx_ko}**{ptxt}**로, {p_ko}.",
                f"- Probability that {fut_en} is higher than {cur_en}: {approx_en}**{ptxt}** — {p_en}.")
+    return line + _skew_note(c, win, p)
+
+
+def _skew_note(c: _Ctx, win: _OutlookWindows, p: float) -> str:
+    """Intermittent demand: the expected (mean) level and the probability can point different ways,
+    because a few large orders lift the mean while most futures stay below it -- say so instead of
+    leaving '+30 %' next to 'a fall is slightly more likely' unexplained."""
+    if not is_intermittent(c.a) or win.current is None or win.future is None:
+        return ""
+    up_mean = win.future > win.current
+    down_mean = win.future < win.current
+    if not ((up_mean and p < 0.5) or (down_mean and p > 0.5)):
+        return ""
+    if up_mean:
+        return c.t(" 간헐 수요는 드문 큰 주문이 평균을 끌어올리므로, 예상 평균은 오르더라도 실제로 오를 확률은 "
+                   "절반에 못 미칠 수 있습니다.",
+                   " With intermittent demand a few large orders lift the average, so the expected average can "
+                   "rise while a rise itself is less likely than not.")
+    return c.t(" 간헐 수요는 드문 큰 주문이 평균을 좌우하므로, 예상 평균은 내려가더라도 실제로 오를 확률이 "
+               "절반을 넘을 수 있습니다.",
+               " With intermittent demand a few large orders dominate the average, so the expected average can "
+               "fall while a rise is still more likely than not.")
 
 
 def _undefined_change_line(c: _Ctx, win: _OutlookWindows, dir_word: str, fut_ko: str, fut_en: str,

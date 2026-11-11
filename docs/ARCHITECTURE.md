@@ -782,7 +782,10 @@ The public `backtest()` weights windows equally and scores raw forecasts
   The sum is skewed (the median of a few demands lies below their mean), so
   P can lean slightly against the sign of a small expected change
   (`k2started20_M96s91`: `+10.9 %` with 44 %, read `방향 불확실`): it is *not*
-  sign-consistent with `expected_change_pct` here. On simulations (two sets
+  sign-consistent with `expected_change_pct` here. When the two disagree the
+  narrative's probability line says why (`narrative._skew_note`: a few large
+  orders lift the average, so the average can rise while a rise itself is
+  less likely than not). On simulations (two sets
   of 383 / 374 intermittent series, 200 futures each) the Brier score is
   0.229 / 0.215 against 0.238 / 0.234 for the normal approximation and
   0.245 / 0.237 for climatology. Deterministic (no sampling).

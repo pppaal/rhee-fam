@@ -2823,3 +2823,32 @@ def test_negative_peak_reason_states_the_gap_in_units():
     assert "추세 규모(최대 절댓값)" not in reasons and "%만큼 낮습니다" not in reasons
     if rep.analysis.phase.label in ("declining", "peaking"):
         assert re.search(r"추세는 고점\([^)]*\) 이후 낮아져 현재 −[\d.,]+입니다", reasons)
+
+
+def test_intermittent_mean_and_probability_disagreement_is_explained():
+    """Final check: a just-started intermittent product read '+29.8 %' next to 'P(up) 40 %, a fall is
+    slightly more likely' with no explanation. Skewed demand (a few large orders) can make the mean rise
+    while a rise itself is less likely than not; the probability line must say so (ko and en)."""
+    import warnings
+
+    from trendai import run
+    from trendai.data import PANDAS_FREQ
+    from trendai.forecast import outlook_levels
+
+    n = 36
+    r = np.random.default_rng(92)
+    size = r.poisson(3, n) + 1
+    r.random(n), r.random(n), r.random(n)          # the generator's earlier draws (stopped / started 20 %)
+    z = (size * (r.random(n) < 0.5)).astype(float)
+    z[: n - int(n * 0.5)] = 0.0
+    s = pd.Series(z, index=pd.date_range(end="2025-12-31", periods=n, freq=PANDAS_FREQ["M"]), name="new SKU")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ko = run(s, lang="ko")
+        en = run(s, lang="en")
+    lv = outlook_levels(ko.analysis, ko.forecast)
+    assert lv.future > lv.current and ko.outlook.prob_increase < 0.5   # the disagreement itself
+    line_ko = next(ln for ln in ko.narrative.split("\n") if "높아질 확률" in ln)
+    line_en = next(ln for ln in en.narrative.split("\n") if "Probability that" in ln)
+    assert "큰 주문이 평균을 끌어올리므로" in line_ko
+    assert "a few large orders lift the average" in line_en
