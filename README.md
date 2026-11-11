@@ -58,7 +58,7 @@ CSV 예시 (값 열이 여러 개면 각각 분석하고 비교 순위까지 만
 - 시계열이 하나면 해석문까지 출력하고 HTML 리포트 1개를 씁니다. 여러 개면 요약 + 순위를 출력하고
   (해석문은 HTML/JSON에 들어 있음), `--html out.html`이면 비교 페이지 `out.html`과 개별 리포트
   `out_<이름>.html`을 씁니다. `--json`은 시계열 1개면 객체, 여러 개면 배열입니다.
-- `--lang en`은 해석문과 CLI 안내 문구를 영어로 바꿉니다(터미널 요약표와 HTML 리포트는 한국어).
+- `--lang en`은 해석문·터미널 요약·CLI 안내 문구를 영어로 바꿉니다(HTML 리포트와 데이터 오류·경고 본문은 한국어).
 - 데이터를 읽으면서 바꾼 점은 stderr에 한 줄씩 알려 줍니다: `안내:`(어떻게 해석했는지 — 감지한 날짜 열·형식,
   제외한 행 번호 열, 모호한 일/월 순서 등), `경고:`(값을 버리거나 메운 경우 — 읽을 수 없는 값, 보간한
   빈 기간, 평일만 있는 데이터, 분석에 실패한 시계열 등).
@@ -152,6 +152,6 @@ render_compare_html(list(reports.values()), ranking, "compare.html")
 ## 테스트
 
 ```bash
-python -m pytest            # 전체 (약 1분)
+python -m pytest            # 전체 (약 1,300개, 3분 안팎)
 python -m pytest tests/test_data.py tests/test_cli.py
 ```

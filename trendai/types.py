@@ -93,11 +93,12 @@ class TrendMetrics:
     end: pd.Timestamp
     last_value: float
     mean: float
-    total_change_pct: Optional[float]   # smoothed first -> last; None if base ~ 0 or for
-                                        # intermittent demand (mostly-zero series)
+    total_change_pct: Optional[float]   # smoothed first -> last; None when a % is not meaningful
+                                        # (analysis.pct_change_undefined: base ~ 0, negative base,
+                                        # zero crossing) or for intermittent demand
     cagr_pct: Optional[float]           # annualised growth rate in %, None if undefined
     recent_change_pct: Optional[float]  # change of the trend over the last season (YoY-like),
-                                        # None if undefined / intermittent demand
+                                        # None under the same rules as total_change_pct
     slope: float                        # robust (Theil-Sen) slope per period
     slope_pct: float                    # slope relative to mean level, % per period
     momentum: float                     # recent trend slope minus long-run Theil-Sen slope,
@@ -114,7 +115,8 @@ class TrendMetrics:
     peak_date: pd.Timestamp
     peak_value: float                   # highest observation; interior one-off spikes flagged
                                         # by detect_anomalies are ignored when n >= 16
-    drawdown_pct: float                 # (last - peak) / peak * 100, <= 0
+    drawdown_pct: float                 # (last - peak) / peak * 100, <= 0; not a meaningful %
+                                        # when pct_change_undefined(peak, last, series) is set
 
 
 @dataclass
