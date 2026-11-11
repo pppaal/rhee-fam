@@ -88,8 +88,9 @@ class Forecaster(ABC):
         if out.shape != (h,):
             raise RuntimeError(f"{self.name} returned shape {out.shape}, expected ({h},)")
         if not np.all(np.isfinite(out)):
-            # last-resort guard: never leak NaN/inf to callers
-            out = np.where(np.isfinite(out), out, self._y[-1])
+            # Never leak NaN/inf, but also never silently disguise a broken model as
+            # "naive": raise so the backtester skips it (forecast.py catches per model).
+            raise FloatingPointError(f"{self.name} produced a non-finite forecast")
         return out
 
     @abstractmethod

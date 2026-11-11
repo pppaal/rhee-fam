@@ -162,6 +162,9 @@ class ForecastResult:
     method: str                            # human readable description of the final method
     backtest_mase: Optional[float] = None  # estimated MASE of the final (ensemble) method
     nonnegative: bool = False              # whether the forecast was clipped at 0
+    skill: Optional[float] = None          # backtest MAE of the final method / MAE of the best
+                                           # naive benchmark (naive, seasonal_naive, drift) on the
+                                           # same windows; < 1 means better than naive, None if n/a
 
     @property
     def index(self) -> pd.DatetimeIndex:
