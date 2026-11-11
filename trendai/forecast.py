@@ -2195,8 +2195,9 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
       at the horizon end (the wider side when a bound was clipped at 0).
       σ_H is the uncertainty of one horizon-end value, which is at least that
       of the season-mean, so the probability is conservative (closer to 0.5).
-      It is consistent in sign with ``expected_change_pct`` and is NOT the
-      probability that the horizon-end value exceeds the current level.
+      For ordinary series it has the sign of ``expected_change_pct``
+      (intermittent demand: see below); it is NOT the probability that the
+      horizon-end value exceeds the current level.
       **Intermittent demand** (``_is_intermittent`` on :func:`fit_history`):
       the future level is a mean of mostly-zero periods, so the probability
       comes from a compound-Bernoulli model of that mean instead

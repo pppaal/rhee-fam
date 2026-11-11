@@ -95,9 +95,14 @@ class TrendMetrics:
     mean: float
     total_change_pct: Optional[float]   # smoothed first -> last; None when a % is not meaningful
                                         # (analysis.pct_change_undefined: base ~ 0, negative base,
-                                        # zero crossing) or under analysis.level_pct_blocked
-                                        # (intermittent demand, an all-zero history)
-    cagr_pct: Optional[float]           # annualised growth rate in %, None if undefined
+                                        # zero crossing, or 'at_zero' = a non-negative trend that
+                                        # fell to <= 0.05 % of its base) or under
+                                        # analysis.level_pct_blocked (intermittent demand, an
+                                        # all-zero history); narrative.metric_pct_undefined names
+                                        # the reason
+    cagr_pct: Optional[float]           # annualised growth rate in %, None under the rules of
+                                        # total_change_pct or for a span below
+                                        # analysis.CAGR_MIN_YEARS ('short_span')
     recent_change_pct: Optional[float]  # change of the trend over the last season (YoY-like),
                                         # None under the same rules as total_change_pct
     slope: float                        # robust (Theil-Sen) slope per period
@@ -105,7 +110,9 @@ class TrendMetrics:
                                         # % per period; slope_pct / momentum / volatility have no
                                         # meaningful % where analysis.level_rate_undefined is set
     momentum: float                     # recent trend slope minus long-run Theil-Sen slope,
-                                        # in % of the recent trend level, per period
+                                        # in % of the recent trend level, per period; check
+                                        # analysis.momentum_undefined (adds 'at_zero') before
+                                        # printing it
     acceleration: float                 # normalised 2nd derivative of trend near the end
     volatility: float                   # residual std / mean level (coefficient of variation)
     trend_strength: float               # 0..1
@@ -120,8 +127,8 @@ class TrendMetrics:
     peak_value: float                   # highest observation; interior one-off spikes flagged
                                         # by detect_anomalies are ignored when n >= 16
     drawdown_pct: float                 # (last - peak) / peak * 100, <= 0; not a meaningful %
-                                        # when pct_change_undefined(peak, last, series) is set or
-                                        # narrative.drawdown_undefined says 'at_zero'
+                                        # when narrative.drawdown_undefined is set
+                                        # (= analysis.pct_change_undefined(peak, last, series))
 
 
 @dataclass
@@ -206,6 +213,9 @@ class Outlook:
                                       # mostly_zero | floor | sign_change | negative | near_zero
     prob_increase: float              # 0..1, P(future level > current level) for the same two
                                       # season-mean levels (NOT P(horizon-end value > now));
+                                      # normal model (sign of expected_change_pct) except for
+                                      # intermittent demand (compound-Bernoulli model of the
+                                      # window mean, not used for an all-zero current window);
                                       # surfaces omit it where narrative.prob_undefined gives a
                                       # reason, and the JSON export sets it to null there
     scenarios: dict[str, float]       # {'pessimistic', 'base', 'optimistic'}: lo / mean / hi of

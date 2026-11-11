@@ -3318,9 +3318,13 @@ def _prob_increase_basis(analysis: AnalysisResult, forecast: ForecastResult,
     fut = ("the horizon-end forecast" if w.k_fut <= 1
            else f"the mean of the last {w.k_fut} forecast periods")
     cur = "the latest observation" if w.k_cur <= 1 else f"the mean of the last {w.k_cur} observed periods"
-    return (f"P({fut} > {cur}): the same two levels as expected_change_pct (compared_levels), so it describes "
-            f"that change; it is NOT the probability that the value at the horizon end exceeds the current level "
+    text = (f"P({fut} > {cur}): the same two levels as expected_change_pct (compared_levels); it is NOT the "
+            f"probability that the value at the horizon end exceeds the current level "
             f"(scenarios_at_horizon_end are single end-date values, a different quantity)")
+    if _intermittent(analysis):
+        text += ("; for intermittent demand it comes from a skewed model of the window mean (a few demands), so "
+                 "for a small change it can lie slightly on the other side of 50%")
+    return text
 
 
 def _future_phase_basis(analysis: AnalysisResult, outlook: Outlook) -> Optional[str]:
