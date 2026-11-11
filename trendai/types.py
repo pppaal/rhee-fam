@@ -93,21 +93,27 @@ class TrendMetrics:
     end: pd.Timestamp
     last_value: float
     mean: float
-    total_change_pct: Optional[float]   # smoothed first -> last, None if base ~ 0
+    total_change_pct: Optional[float]   # smoothed first -> last; None if base ~ 0 or for
+                                        # intermittent demand (mostly-zero series)
     cagr_pct: Optional[float]           # annualised growth rate in %, None if undefined
-    recent_change_pct: Optional[float]  # change of the trend over the last season (YoY-like)
+    recent_change_pct: Optional[float]  # change of the trend over the last season (YoY-like),
+                                        # None if undefined / intermittent demand
     slope: float                        # robust (Theil-Sen) slope per period
     slope_pct: float                    # slope relative to mean level, % per period
-    momentum: float                     # recent slope vs. long-run slope, see analysis docs
+    momentum: float                     # recent trend slope minus long-run Theil-Sen slope,
+                                        # in % of the recent trend level, per period
     acceleration: float                 # normalised 2nd derivative of trend near the end
     volatility: float                   # residual std / mean level (coefficient of variation)
     trend_strength: float               # 0..1
-    seasonal_strength: float            # 0..1
+    seasonal_strength: float            # 0..1, 1 - var(R)/var(S+R) discounted by a
+                                        # significance factor (noise -> ~0)
     mk_tau: float                       # Mann-Kendall tau
-    mk_pvalue: float                    # Mann-Kendall two-sided p-value
+    mk_pvalue: float                    # Mann-Kendall two-sided p-value, corrected for
+                                        # serial dependence (Hamed-Rao / unit-root drift test)
     direction: str                      # 'up' | 'down' | 'flat'
     peak_date: pd.Timestamp
-    peak_value: float
+    peak_value: float                   # highest observation; interior one-off spikes flagged
+                                        # by detect_anomalies are ignored when n >= 16
     drawdown_pct: float                 # (last - peak) / peak * 100, <= 0
 
 
@@ -159,8 +165,9 @@ class ForecastResult:
     horizon: int
     levels: tuple[int, ...]
     model_scores: list[ModelScore]         # sorted best (lowest MASE) first; recency-weighted
-                                           # backtest scores (benchmarks naive / seasonal_naive /
-                                           # drift included); empty when there was no backtest
+                                           # backtest scores of the candidates (the naive
+                                           # benchmarks appear when they were candidates, as for
+                                           # ordinary series); empty when there was no backtest
     method: str                            # human readable description of the final method
     backtest_mase: Optional[float] = None  # estimated MASE of the final (ensemble) method
     nonnegative: bool = False              # whether the forecast was clipped at 0

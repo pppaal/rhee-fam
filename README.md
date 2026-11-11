@@ -133,7 +133,7 @@ render_compare_html(list(reports.values()), ranking, "compare.html")
 
 - `--llm`/`ask`는 공식 `anthropic` SDK로 `claude-opus-5-5`를 호출합니다. 모델에는 **계산된 사실(JSON)만** 전달하고, 주어진 사실 밖의 사건을 단정하지 말고 불확실성을 밝히도록 지시합니다.
 - 안전 분류기 거절 시 서버 측 대체 모델로 자동 재시도하는 `fallbacks="default"`(베타 `server-side-fallback-2026-07-01`)가 켜져 있습니다.
-- 키가 없거나 호출이 실패하면 자동으로 규칙 기반 해석으로 대체합니다.
+- `--llm`은 키가 없거나 호출이 실패하면 자동으로 규칙 기반 해석으로 대체하고(stderr에 이유 안내), `ask`는 답할 모델이 없으므로 오류 메시지와 함께 종료 코드 1로 끝납니다.
 
 ## 한계와 주의
 
