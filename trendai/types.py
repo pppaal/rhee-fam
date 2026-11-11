@@ -158,7 +158,9 @@ class ForecastResult:
     upper: dict[int, pd.Series]            # level -> upper bound series
     horizon: int
     levels: tuple[int, ...]
-    model_scores: list[ModelScore]         # sorted best (lowest MASE) first
+    model_scores: list[ModelScore]         # sorted best (lowest MASE) first; recency-weighted
+                                           # backtest scores (benchmarks naive / seasonal_naive /
+                                           # drift included); empty when there was no backtest
     method: str                            # human readable description of the final method
     backtest_mase: Optional[float] = None  # estimated MASE of the final (ensemble) method
     nonnegative: bool = False              # whether the forecast was clipped at 0
@@ -183,12 +185,17 @@ class Outlook:
     """Interpretation of the forecast relative to the present."""
 
     direction: str                    # 'up' | 'down' | 'flat'
-    expected_change_pct: Optional[float]  # forecast at horizon end vs. current level, in %
-    prob_increase: float              # 0..1, P(value at horizon end > current level)
+    expected_change_pct: Optional[float]  # future level vs current level, in %: mean of the
+                                      # forecast's last season vs mean of the last observed
+                                      # season (partial seasons adjusted); None when undefined
+                                      # (zero / mostly-zero current level)
+    prob_increase: float              # 0..1, P(future level > current level) for the same two
+                                      # season-mean levels (NOT P(horizon-end value > now))
     scenarios: dict[str, float]       # {'pessimistic', 'base', 'optimistic'} values at horizon end
     forecast_peak_date: Optional[pd.Timestamp]  # date of max forecast mean if it peaks inside horizon
     future_phase: str                 # projected lifecycle phase at horizon end (one of PHASES)
-    confidence: str                   # 'high' | 'medium' | 'low' -- reliability of the forecast
+    confidence: str                   # 'high' | 'medium' | 'low' -- from forecast skill vs naive,
+                                      # relative 80% band width and sample size
 
 
 @dataclass
