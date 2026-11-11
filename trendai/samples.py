@@ -51,12 +51,29 @@ def _seasonal(t: np.ndarray, period: int, amp: float) -> np.ndarray:
     return amp * (np.sin(2 * np.pi * t / period) + 0.35 * np.cos(4 * np.pi * t / period))
 
 
-def sample(name: str, n: int = 120, freq: str = "M", start: str = "2016-01-01",
+#: fixed reference date the samples end at (the last full period on or before it), so every
+#: frequency and length ends in the same recent past -- deterministic, never ``today()``
+SAMPLE_END = "2025-12-31"
+
+
+def _sample_index(n: int, freq: str, start: Optional[str] = None) -> pd.DatetimeIndex:
+    """``n`` dates at ``freq``: from ``start`` if given, else ending at :data:`SAMPLE_END`."""
+    alias = PANDAS_FREQ[freq]
+    if start is not None:
+        return pd.date_range(start=start, periods=n, freq=alias)
+    return pd.date_range(end=SAMPLE_END, periods=n, freq=alias)
+
+
+def sample(name: str, n: int = 120, freq: str = "M", start: Optional[str] = None,
            seed: int = 0, noise: float = 1.0) -> pd.Series:
     """Generate the synthetic archetype ``name`` with ``n`` observations.
 
     ``noise`` scales the random component (0 gives a noiseless curve).
-    Values are always positive.
+    Values are always positive.  Without ``start`` the series ends at the
+    last full period on or before :data:`SAMPLE_END` (2025-12-31: December
+    2025, 2025-Q4, the year 2025, the week ending 2025-12-28), whatever the
+    frequency and length -- the default monthly sample runs 2016-01 to
+    2025-12.  With ``start`` it begins there instead.
     """
     if name not in DESCRIPTIONS:
         raise KeyError(f"알 수 없는 샘플 {name!r} (unknown sample); 사용 가능: {list_samples()}")
@@ -101,16 +118,16 @@ def sample(name: str, n: int = 120, freq: str = "M", start: str = "2016-01-01",
         raise KeyError(name)
 
     y = np.maximum(y, 0.5)
-    idx = pd.date_range(start=start, periods=n, freq=PANDAS_FREQ[freq])
+    idx = _sample_index(n, freq, start)
     s = pd.Series(y.astype(float), index=idx, name=name)
     s.index.name = "date"
     return s
 
 
-def breakout_date(n: int = 120, freq: str = "M", start: str = "2016-01-01") -> pd.Timestamp:
-    """The planted changepoint date of the ``breakout`` sample."""
+def breakout_date(n: int = 120, freq: str = "M", start: Optional[str] = None) -> pd.Timestamp:
+    """The planted changepoint date of the ``breakout`` sample (same dates as :func:`sample`)."""
     k = int(round(0.6 * (n - 1)))
-    return pd.date_range(start=start, periods=n, freq=PANDAS_FREQ[freq])[k]
+    return _sample_index(n, freq, start)[k]
 
 
 def sample_set(names: Optional[list[str]] = None, **kwargs) -> dict[str, pd.Series]:

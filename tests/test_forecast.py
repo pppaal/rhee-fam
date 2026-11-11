@@ -10,6 +10,7 @@ on :mod:`trendai.analysis`).
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import time
 import warnings
@@ -627,10 +628,45 @@ def test_outlook_zero_base_and_nonnegative_asymmetric_bands():
     ("peaking", "flat", False, 0.5, "high", "peaking"),
     ("declining", "flat", False, -0.5, "high", "stable"),
     ("volatile", "flat", False, 0.0, "low", "volatile"),
-    ("volatile", "flat", False, 0.0, "high", "stable"),
+    # UX-2: was 'stable' -- a smooth mean forecast cannot show the noise going away, so a
+    # volatile series stays volatile whatever the forecast's direction or confidence
+    ("volatile", "flat", False, 0.0, "high", "volatile"),
+    ("volatile", "up", True, 30.0, "high", "volatile"),
+    # UX-2: 'flat' only for its uncertainty (the base case moves +75 %), or with low
+    # confidence, says nothing about the current move ending: the phase is kept
+    ("emerging", "flat", False, 75.0, "low", "emerging"),
+    ("emerging", "flat", False, 75.0, "medium", "emerging"),
+    ("growing", "flat", False, 1.0, "low", "growing"),
+    ("reviving", "flat", False, -6.0, "medium", "reviving"),
+    ("reviving", "flat", False, -1.0, "medium", "stable"),
 ])
 def test_future_phase_rules(current, direction, strong, change, conf, expected):
     assert F._future_phase(current, direction, strong, change, conf) == expected
+
+
+def test_future_phase_flat_needs_a_settled_forecast():
+    """UX-2 end to end: `sample volatile` read '변동성 장세 → 안정기', `sample emerging --freq Y
+    --n 12` (+75 % base case, rated flat for its uncertainty) '태동기 → 정점/성숙기' and
+    `sample reviving --freq Q --n 40` (80 % band ±41 % of the level) '재부상 → 안정기'."""
+    from trendai.pipeline import run
+
+    for name, freq, n in (("volatile", "M", 120), ("emerging", "Y", 12), ("reviving", "Q", 40)):
+        rep = run(sample(name, n=n, freq=freq), name=name)
+        assert rep.outlook.direction == "flat", (name, rep.outlook)
+        assert rep.outlook.future_phase == rep.analysis.phase.label, (name, rep.outlook)
+    # an explicit `settled` decides for a flat outlook
+    assert F._future_phase("growing", "flat", False, 1.0, "high", settled=False) == "growing"
+    assert F._future_phase("growing", "flat", False, 1.0, "high", settled=True) == "peaking"
+    # a precise flat forecast of a declining series still projects the decline ending
+    s = from_values(np.r_[np.linspace(200, 100, 36), np.full(24, 100.0)]
+                    + np.tile([0.5, -0.5], 30), freq="M")
+    o = F.compute_outlook(_make_analysis(s, "M", "declining"),
+                          _hand_forecast(s, "M", np.full(12, 100.0), np.full(12, 2.0), 0.5))
+    assert o.direction == "flat" and o.confidence != "low" and o.future_phase == "stable"
+    # ... but not when the band is too wide to tell a continuing decline from a stop
+    wide = F.compute_outlook(_make_analysis(s, "M", "declining"),
+                             _hand_forecast(s, "M", np.full(12, 100.0), np.full(12, 30.0), 0.5))
+    assert wide.direction == "flat" and wide.future_phase == "declining"
 
 
 # --------------------------------------------------------------------------- adversarial regressions
@@ -1268,3 +1304,225 @@ def test_error_dof_factor_reflects_autocorrelated_errors():
     assert F._error_dof_factor(walk) < 0.15
     assert F._error_dof_factor(np.ones((3, 1))) == 1.0 and F._error_dof_factor(np.zeros((3, 4))) == 1.0
     assert F._error_dof_factor(1e300 * walk) == pytest.approx(F._error_dof_factor(walk))
+
+
+# --------------------------------------------------------------------------- intermittent demand: sba
+
+
+def _spare_parts(seed: int, n: int = 150) -> pd.Series:
+    rng = np.random.default_rng(seed)
+    y = np.where(rng.random(n) < 0.15, rng.integers(1, 6, n), 0).astype(float)
+    return pd.Series(y, index=pd.date_range("2021-01-03", periods=n, freq="W-SUN"))
+
+
+def test_intermittent_demand_uses_sba_and_squared_error_selection():
+    """Spare-part demand (P(sale) = 0.15/week, 1-5 units, mean 0.45/week).  'sba' (Croston /
+    Syntetos-Boylan) is a candidate for intermittent series only, and the candidates are
+    ranked and weighted by RMSE: MAE is minimised by the median, which for mostly-zero data
+    is about 0, so MASE ranking prefers forecasts that under-state the demand rate.  Mean
+    |forecast rate - 0.45| over these 30 seeds: 0.159 before (level models ranked by MASE),
+    0.132 now."""
+    errs = []
+    for seed in range(30):
+        fc = F.auto_forecast(_spare_parts(seed), freq="W")
+        _assert_valid(fc, 26)
+        names = [ms.name for ms in fc.model_scores]
+        assert "sba" in names and not any(nm in names for nm in ("naive", "drift", "analog_knn"))
+        mases = [ms.mase for ms in fc.model_scores]
+        assert mases == sorted(mases)                       # still reported best MASE first
+        chosen = {ms.name for ms in fc.model_scores if ms.weight > 0}
+        by_rmse = [ms.name for ms in sorted(fc.model_scores, key=lambda ms: ms.rmse)]
+        assert chosen == set(by_rmse[:len(chosen)]), (seed, fc.method)
+        assert fc.lower[95].iloc[0] == 0.0
+        errs.append(abs(float(fc.mean.mean()) - 0.45))
+    assert float(np.mean(errs)) < 0.145, np.mean(errs)
+    # ordinary series never get it (and keep MASE selection)
+    for kind in ("growing", "seasonal", "volatile"):
+        fc = F.auto_forecast(sample(kind), freq="M")
+        assert "sba" not in [ms.name for ms in fc.model_scores]
+
+
+# --------------------------------------------------------------------------- multiplicative seasonality
+
+
+def _multiplicative_analysis(freq: str, n: int, H: int, growth: float, ratio):
+    """``y = trend * (1 + r)`` with an exact multiplicative decomposition (``seasonal = trend * r``,
+    ``r = ratio(t)`` periodic) and the trend growing by ``growth`` per season.
+
+    Returns ``(series, analysis, future values, future trend)``.
+    """
+    p = season_length(freq)
+    t = np.arange(n + H, dtype=float)
+    trend = 100 * growth ** (t / p)
+    r = ratio(t)
+    y = trend * (1 + r)
+    s = from_values(y[:n], freq=freq)
+    dec = Decomposition(trend=pd.Series(trend[:n], index=s.index),
+                        seasonal=pd.Series(trend[:n] * r[:n], index=s.index),
+                        resid=pd.Series(np.zeros(n), index=s.index), period=p)
+    an = dataclasses.replace(_make_analysis(s, freq, "growing"), decomposition=dec)
+    return s, an, y[n:], trend[n:]
+
+
+@pytest.mark.parametrize("growth", [2.0, 0.5])
+def test_outlook_multiplicative_seasonality_follows_the_forecast_level(growth):
+    """Multiplicative seasonality (decomposed in log space): the seasonal swing scales with the
+    level.  Monthly, horizon 6 = half a season (a seasonal high): the partial-season adjustment
+    repeated last year's seasonal values, too small once the level has doubled (+87.7 %
+    reported, +71.3 % true) and too large once it has halved (-50.4 %, true -43.2 %)."""
+    n, H = 60, 6
+    s, an, fut, fut_trend = _multiplicative_analysis(
+        "M", n, H, growth, lambda t: 0.3 * np.sin(2 * np.pi * t / 12))
+    o = F.compute_outlook(an, _hand_forecast(s, "M", fut, 0.02 * fut))
+    truth = 100 * (fut_trend.mean() / s.to_numpy()[-12:].mean() - 1)
+    assert o.expected_change_pct == pytest.approx(truth, abs=0.05)
+    assert o.direction == ("up" if growth > 1 else "down")
+    # the continued seasonal component is the forecast's own seasonal part (trend x ratio)
+    r = 0.3 * np.sin(2 * np.pi * np.arange(n, n + H) / 12)
+    assert np.allclose(F._future_seasonal(an, H, fut), fut_trend * r, rtol=1e-9, atol=1e-9)
+    # without a forecast the last season is repeated, as for additive decompositions
+    last = an.decomposition.seasonal.to_numpy()[-12:]
+    assert np.allclose(F._future_seasonal(an, H), last[:H])
+    additive = _make_analysis(s, "M", "growing", seasonal=an.decomposition.seasonal)
+    assert np.allclose(F._future_seasonal(additive, H, fut), last[:H])
+
+
+def test_outlook_multiplicative_growth_has_no_false_peak():
+    """Exponential growth (x2 a year) with a 40 % multiplicative seasonal swing has no peak,
+    but the forecast minus last year's smaller seasonal values still swung, and a seasonal
+    high inside the horizon was reported as the forecast peak (e.g. 2025-08)."""
+    for n, H, phases in ((60, 12, (8, 9, 10, 11)), (48, 18, (1, 2, 3, 4, 5))):
+        for ph in phases:
+            s, an, fut, _ = _multiplicative_analysis(
+                "M", n, H, 2.0, lambda t: 0.4 * np.sin(2 * np.pi * (t + ph) / 12))
+            o = F.compute_outlook(an, _hand_forecast(s, "M", fut, 0.02 * fut))
+            assert o.forecast_peak_date is None, (n, H, ph, o.forecast_peak_date)
+            assert o.direction == "up"
+
+
+# --------------------------------------------------------------------------- round 3: percentages, skill
+
+
+def test_expected_change_pct_needs_a_level_away_from_zero():
+    """F1: a P&L going from 10 to -10 read '향후 26주 동안 −578,464.7% 변화'; a monthly temperature
+    with an annual mean of 0.3 ℃ gave +656.8 %.  No percentage across or near zero."""
+    rng = np.random.default_rng(1)
+    pnl = pd.Series(np.linspace(10, -10, 40) + rng.normal(0, 1, 40),
+                    index=pd.date_range("2022-01-02", periods=40, freq="W-SUN"))
+    fc = F.auto_forecast(pnl, freq="W")
+    an = _make_analysis(prepare(pnl)[0], "W", "declining")
+    o = F.compute_outlook(an, fc)
+    assert o.expected_change_pct is None
+    assert o.direction == "down" and o.prob_increase < 0.2       # the rest of the outlook stands
+    lv = F.outlook_levels(an, fc)
+    assert lv.undefined in ("near_zero", "sign_change") and lv.future < lv.current
+    t = np.arange(120)
+    temp = from_values(0.3 + 15 * np.sin(2 * np.pi * (t - 3) / 12)
+                       + np.random.default_rng(17).normal(0, 1.5, 120), freq="M")
+    fc_t = F.auto_forecast(temp, freq="M", candidates=list(BASELINES))
+    assert F.compute_outlook(_make_analysis(temp, "M", "stable"), fc_t).expected_change_pct is None
+    # crossing zero: no percentage even when the current level is large
+    s = from_values(np.linspace(100, 20, 36), freq="M")
+    cross = _hand_forecast(s, "M", np.linspace(10, -60, 12), np.full(12, 3.0))
+    lv_c = F.outlook_levels(_make_analysis(s, "M", "declining"), cross)
+    assert lv_c.undefined == "sign_change"
+    assert F.compute_outlook(_make_analysis(s, "M", "declining"), cross).expected_change_pct is None
+    # unchanged where a percentage is meaningful: positive series, and negative series far from 0
+    neg = from_values(-100.0 + np.sin(np.arange(36.0)), freq="M")
+    o_neg = F.compute_outlook(_make_analysis(neg, "M", "stable"),
+                              _hand_forecast(neg, "M", np.full(12, -110.0), np.full(12, 1.0)))
+    assert o_neg.expected_change_pct == pytest.approx((-110 - neg.iloc[-12:].mean())
+                                                      / abs(neg.iloc[-12:].mean()) * 100)
+
+
+def test_outlook_levels_reproduce_compute_outlook():
+    """outlook_levels is the public contract for the two compared levels (narrative mirror)."""
+    for name, freq, n in (("growing", "W", 156), ("seasonal", "M", 120), ("fad", "M", 120),
+                          ("emerging", "Y", 12)):
+        s = sample(name, n=n, freq=freq)
+        fc = F.auto_forecast(s, freq=freq)
+        an = _make_analysis(s, freq, "growing")
+        lv, o = F.outlook_levels(an, fc), F.compute_outlook(an, fc)
+        m = season_length(freq)
+        assert (lv.k_cur, lv.k_fut) == (min(m, n), min(m, fc.horizon))
+        assert lv.undefined is None
+        assert o.expected_change_pct == pytest.approx((lv.future - lv.current) / abs(lv.current) * 100)
+
+
+def test_skill_of_intermittent_demand_uses_the_ranking_metric():
+    """F9: the skill was MAE-based although intermittent candidates are ranked by RMSE; MAE favours
+    the all-zero naive forecast, so 28 of 40 iid demand series read 'worse than naive'."""
+    worse = 0
+    for seed in range(12):
+        rng = np.random.default_rng(seed)
+        occ = rng.random(150) < 0.15
+        y = np.where(occ, rng.integers(1, 6, 150), 0).astype(float)
+        fc = F.auto_forecast(pd.Series(y, index=pd.date_range("2021-01-03", periods=150, freq="W-SUN")),
+                             freq="W")
+        assert fc.skill is not None
+        worse += fc.skill > 1.05
+    assert worse <= 2
+
+
+def test_skill_on_exact_data_is_not_a_ratio_of_rounding_noise():
+    """F10: on y = -5 - t every model is exact; ensemble MAE 7e-16 / drift MAE 0 read as
+    'skill 100' ('오차 +9,900%', confidence low)."""
+    s = pd.Series(-5 - np.arange(9.0), index=pd.date_range("2024-01-01", periods=9, freq="D"))
+    fc = F.auto_forecast(s, freq="D")
+    assert fc.skill == pytest.approx(1.0)
+    assert F._skill(7e-16, {"drift": 0.0}, scale=9.0) == pytest.approx(1.0)
+    assert F._skill(0.0, {"naive": 1e-15}, scale=9.0) == pytest.approx(1.0)
+    # real errors are still compared as before
+    assert F._skill(0.5, {"naive": 1.0, "drift": 2.0}, scale=9.0) == pytest.approx(0.5)
+    assert F._skill(3.0, {"drift": 0.0}, scale=9.0) == 100.0
+    assert F._skill(1.0, {}, scale=9.0) is None
+
+
+def test_driftless_random_walk_gets_no_trend_extrapolation():
+    """F6: a daily geometric random walk (seed 2032) got p_up 0.95 / +16.1 % from
+    ensemble(linear_trend@log, linear_trend, drift); the analysis knew it was a random walk."""
+    from trendai.analysis import analyze
+
+    rng = np.random.default_rng(2032)
+    s = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.018, 730))),
+                  index=pd.date_range("2023-01-01", periods=730, freq="D"))
+    an = analyze(s, freq="D")
+    assert F.is_random_walk(an)
+    fc = F.auto_forecast(s, freq="D", random_walk=True)
+    assert not set(F._TREND_EXTRAPOLATORS) & {ms.name for ms in fc.model_scores}
+    o = F.compute_outlook(an, fc)
+    assert o.direction == "flat" and 0.3 < o.prob_increase < 0.7, o
+    # explicit candidates are honoured; trending and stationary series are not random walks
+    assert "linear_trend" in F.auto_forecast(s, freq="D", random_walk=True,
+                                             candidates=["linear_trend", "naive"]).method
+    assert not F.is_random_walk(analyze(sample("growing")))
+    assert not F.is_random_walk(analyze(sample("seasonal")))
+
+
+def test_stationary_noise_intervals_do_not_widen_like_a_random_walk():
+    """F5: the random-walk sqrt(k) prior widened the long leads of stationary series even
+    when the backtest showed flat errors: white noise D400 got an 80 % half-width at lead 30
+    of 1.44x the true one (review Monte Carlo: 85 / 96 % for nominal 80 / 95 %)."""
+    last, first = [], []
+    for seed in range(10):
+        y = 100 + 10 * np.random.default_rng(seed).standard_normal(400)
+        fc = F.auto_forecast(from_values(y, freq="D"), horizon=30, freq="D",
+                             candidates=["ses", "naive", "theta", "drift"])
+        hw = (fc.upper[80] - fc.lower[80]).to_numpy() / 2 / (F._level_z(80) * 10.0)
+        first.append(hw[0])
+        last.append(hw[-1])
+    assert np.mean(last) < 1.36, np.mean(last)                 # was 1.44; now 1.29
+    assert np.mean(first) > 0.75, np.mean(first)       # not narrower than the noise itself
+
+
+def test_compounding_growth_offers_log_drift(registry):
+    """F12: GDP-like annual series (2.5 % a year) were forecast by level-space models only:
+    median bias -2.2 % at h = 5, 73 % of the forecasts below the outcome."""
+    rng = np.random.default_rng(3)
+    y = 5000 * np.exp(np.cumsum(rng.normal(0.03, 0.01, 40)))
+    assert F._multiplicative_growth(y)
+    assert not F._multiplicative_growth(50 + 3 * np.arange(40.0) + rng.normal(0, 2, 40))
+    assert not F._multiplicative_growth(100 + rng.normal(0, 5, 40))
+    fc = F.auto_forecast(from_values(y, freq="Y"), horizon=5, freq="Y")
+    names = {ms.name for ms in fc.model_scores}
+    assert ("drift@log" in names) == ("drift@log" in M.MODEL_REGISTRY)

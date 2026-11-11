@@ -651,3 +651,146 @@ def test_fit_predict_speed(freq, m):
         if dt >= 0.25:
             slow[nm] = dt
     assert not slow, f"too slow at n=500: {slow}"
+
+
+# --------------------------------------------------------------------------- drift@log and sba
+
+
+NEW_NAMES = ["drift@log", "sba"]
+_GENERIC_CHECKS = [
+    test_all_samples_monthly, test_min_obs_and_short_series, test_constant_series,
+    test_series_with_zeros, test_huge_and_tiny_magnitudes_are_scale_equivariant, test_deterministic,
+    test_refit_same_instance_matches_fresh_model, test_input_types_and_no_mutation,
+    test_unusual_season_lengths, test_adversarial_shapes,
+]
+
+
+@pytest.mark.parametrize("check", _GENERIC_CHECKS, ids=lambda f: f.__name__)
+@pytest.mark.parametrize("name", NEW_NAMES)
+def test_new_models_pass_the_generic_checks(name, check):
+    # the models outside ALL_NAMES (not default candidates for ordinary series) get the same
+    # robustness checks as every registered model
+    check(name)
+
+
+@pytest.mark.parametrize("name", NEW_NAMES)
+def test_new_models_every_frequency_negative_and_extreme_inputs(name):
+    for args in [("W", 156, 52, 26), ("D", 400, 7, 30), ("Q", 40, 4, 8), ("Y", 30, 1, 5),
+                 ("W", 110, 52, 26), ("D", 730, 7, 30)]:
+        test_every_frequency_all_samples(name, *args)
+    if not M.make_model(name).requires_positive:
+        test_negative_series(name)
+    import warnings
+    rng = np.random.default_rng(14)
+    occ = rng.random(40) < 0.4
+    for scale in (1e300, -1e300, 1e-300, 1e-200):
+        for y in (1 + rng.random(40), np.where(occ, 1 + rng.random(40), 0.0)):
+            Y = scale * y
+            ref = np.abs(Y).max()
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                f = M.make_model(name).fit(Y, 12).predict(6)
+            unit = M.make_model(name).fit(Y / ref, 12).predict(6) * ref
+            assert np.all(np.isfinite(f)), (name, scale)
+            # (atol: a log model's shift for data with zeros leaves rounding residue near 0)
+            assert np.allclose(f, unit, rtol=1e-9, atol=1e-12 * ref), (name, scale)
+
+
+def test_drift_at_log_compounds_the_average_growth_rate():
+    # GDP-like compounding: level-space drift projects linear growth and falls behind every step
+    y = 100 * 1.03 ** np.arange(40.0)
+    f = _fit_predict("drift@log", y, 1, 5)
+    assert np.allclose(f, 100 * 1.03 ** np.arange(40.0, 45.0), rtol=1e-9)
+    assert np.all(_fit_predict("drift", y, 1, 5) < f - 1.0)
+    # noisy growth: the average rate from the first to the last value, compounded (at most:
+    # the LogTransformed growth guard may slow it to the recent pace), above level-space drift
+    rng = np.random.default_rng(5)
+    z = 5000 * np.exp(np.cumsum(rng.normal(0.025, 0.01, 40)))
+    g = (z[-1] / z[0]) ** (1 / 39)
+    fz = _fit_predict("drift@log", z, 1, 5)
+    assert fz[0] == pytest.approx(z[-1] * g, rel=1e-9)
+    assert np.all(fz <= z[-1] * g ** np.arange(1, 6) * (1 + 1e-9))
+    assert np.all(fz > _fit_predict("drift", z, 1, 5)) and np.all(np.diff(fz) > 0)
+    model = M.make_model("drift@log")
+    assert model.requires_positive and not model.needs_season and model.min_obs == 2
+
+
+def test_drift_at_log_is_registered_but_only_used_on_request():
+    # as a default candidate it helped GDP-like series but cost the general accuracy testbed
+    # (S-curves cut mid-transition compound into overshoots), so it is opt-in
+    assert "drift@log" in M.available_models()
+    assert M.make_model("drift@log").offered_for == "explicit"
+    for n, m, pos in ((120, 12, True), (40, 1, True), (40, 1, False)):
+        for intermittent in (False, True):
+            assert "drift@log" not in M.default_candidates(n, m, pos, intermittent=intermittent)
+
+
+def _sba_reference(y, alpha=0.1, k=5):
+    """Scalar Croston / SBA (sizes and intervals smoothed separately, mean-of-first-k start)."""
+    pos = [i for i, v in enumerate(y) if v != 0]
+    sizes = [float(y[i]) for i in pos]
+    intervals = [pos[0] + 1.0] + [float(b - a) for a, b in zip(pos, pos[1:])]
+
+    def ses(x):
+        lvl = sum(x[:k]) / len(x[:k])
+        for v in x:
+            lvl += alpha * (v - lvl)
+        return lvl
+
+    factor = 1.0 if len(pos) == len(y) else 1.0 - alpha / 2.0
+    return factor * ses(sizes) / ses(intervals)
+
+
+def test_sba_matches_the_croston_recursion():
+    y = np.array([0, 0, 3, 0, 0, 0, 5, 0, 2, 0, 0, 4, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 3, 0], float)
+    model = M.make_model("sba").fit(y, 1)
+    f = model.predict(7)
+    assert np.allclose(f, _sba_reference(y), rtol=1e-12) and np.ptp(f) == 0.0
+    assert model.params_["demands"] == 7 and model.params_["bias_factor"] == pytest.approx(0.95)
+    # SBA = Croston x (1 - alpha/2): below the plain size/interval ratio
+    assert f[0] < model.params_["size"] / model.params_["interval"]
+    # no zeros at all: nothing to correct, SES of the values
+    v = np.array([2.0, 4.0, 3.0, 5.0, 4.0, 6.0, 5.0])
+    assert _fit_predict("sba", v, 1, 3) == pytest.approx(np.full(3, _sba_reference(v)), rel=1e-12)
+    # one demand, all zeros, a demand at the very start
+    assert _fit_predict("sba", np.r_[np.zeros(9), 4.0], 1, 2) == pytest.approx(np.full(2, 0.95 * 4 / 10))
+    assert np.array_equal(_fit_predict("sba", np.zeros(10), 12, 4), np.zeros(4))
+    assert _fit_predict("sba", np.r_[2.0, np.zeros(5)], 1, 1)[0] == pytest.approx(0.95 * 2.0)
+
+
+def test_sba_is_offered_for_intermittent_demand_only():
+    assert M.make_model("sba").offered_for == "intermittent"
+    for pos in (False, True):
+        assert "sba" not in M.default_candidates(150, 52, positive=pos)
+    inter = M.default_candidates(150, 52, positive=False, intermittent=True)
+    assert "sba" in inter and "ses" in inter and "holt_damped" in inter
+    assert "sba" not in M.default_candidates(1, 1, positive=False, intermittent=True)  # min_obs
+    # the regular candidate list is unchanged by the new keyword
+    assert M.default_candidates(120, 12, True) == M.default_candidates(120, 12, True, intermittent=False)
+
+
+def test_sba_estimates_the_demand_rate_better_than_level_models():
+    """Spare-part demand (P(sale) = 0.15/week, 1-5 units, mean 0.45/week).  SES-type models
+    jump towards every sale and decay through the zeros, so their forecast depends on when
+    the last sale happened; SBA smooths sizes and intervals separately."""
+    err = {nm: [] for nm in ("sba", "ses", "holt_damped", "theta")}
+    for seed in range(60):
+        rng = np.random.default_rng(seed)
+        y = np.where(rng.random(150) < 0.15, rng.integers(1, 6, 150), 0).astype(float)
+        for nm in err:
+            err[nm].append(abs(float(_fit_predict(nm, y, 52, 26).mean()) - 0.45))
+    mean = {nm: float(np.mean(v)) for nm, v in err.items()}
+    assert mean["sba"] < 0.11, mean
+    assert mean["sba"] < 0.9 * min(v for nm, v in mean.items() if nm != "sba"), mean
+
+
+def test_log_wrapper_shift_is_scale_free():
+    # degraded mode (non-positive input): the shift had an absolute floor of 1e-9, so data of
+    # magnitude 1e-300 with zeros were forecast at ~1e-25, 1e275 times the data
+    rng = np.random.default_rng(3)
+    y = np.where(rng.random(48) < 0.6, 1 + rng.random(48), 0.0)
+    for nm in ("holt_damped@log", "holt_winters@log", "linear_trend@log", "drift@log"):
+        base = _fit_predict(nm, y, 12, 6)
+        for scale in (1e-300, 1e-12, 1e9):
+            f = _fit_predict(nm, y * scale, 12, 6)
+            assert np.allclose(f / scale, base, rtol=1e-6, atol=1e-9), (nm, scale)

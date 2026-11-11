@@ -30,7 +30,13 @@ Registered models
 ``analog_knn``         k nearest historical windows ("past analogues")
 ``logistic_growth``    S-curve fit, observed transitions only, capped saturation (``requires_positive``)
 ``*@log``              ``holt_damped`` / ``holt_winters`` / ``linear_trend`` in log space (growth-guarded)
+``drift@log``          drift in log space: constant growth *rate* (only when requested by name)
+``sba``                Croston's method with the Syntetos-Boylan bias correction (intermittent demand only)
 =====================  ==========================================================
+
+``offered_for`` (class attribute) controls :func:`default_candidates`:
+``drift@log`` is ``"explicit"`` (never offered automatically) and ``sba`` is
+``"intermittent"`` (offered only for intermittent demand).
 
 ``*``: like the M4-competition benchmarks, these non-seasonal methods are
 applied to the seasonally adjusted series (classical decomposition) when a
@@ -61,6 +67,10 @@ class Forecaster(ABC):
     min_obs: int = 2          # minimum len(y) needed to fit
     needs_season: bool = False  # True if the model only makes sense with seasonality
     requires_positive: bool = False  # True if the model needs all y > 0 (log / multiplicative)
+    #: which series :func:`default_candidates` offers the model for: ``"regular"`` (every
+    #: series, the default), ``"intermittent"`` (only intermittent demand, i.e. when called
+    #: with ``intermittent=True``) or ``"explicit"`` (never: only when requested by name)
+    offered_for: str = "regular"
 
     def __init__(self) -> None:
         self._y: np.ndarray | None = None
@@ -744,6 +754,78 @@ class Theta(Forecaster):
         return self._adj.reseasonalise(f, self._n)
 
 
+# --------------------------------------------------------------------------- intermittent demand
+
+
+def _ses_level(x: np.ndarray, alpha: float, k_init: int) -> float:
+    """Final SES level of ``x`` (smoothing constant ``alpha``).
+
+    The usual heuristic start: the mean of the first ``k_init`` values, then
+    the filter runs through all of ``x``.
+    """
+    lvl = float(x[0]) + float(np.mean(x[:k_init] - x[0]))  # exact for constant x
+    for v in x.tolist():
+        lvl += alpha * (v - lvl)
+    return lvl
+
+
+class SBA(Forecaster):
+    """Syntetos-Boylan approximation (SBA) of Croston's method, for intermittent demand.
+
+    Croston: the non-zero demand sizes and the intervals between demands
+    (in periods; the first one counted from the start of the series) are
+    smoothed separately by SES, updated only when a demand occurs, and the
+    forecast is the demand rate ``size / interval`` per period, flat over the
+    horizon.  That ratio is biased upwards (``E[z/p] > E[z]/E[p]``), so SBA
+    multiplies it by ``1 - alpha / 2`` (Syntetos & Boylan 2005).  A series
+    without any zero has nothing to correct (every interval is 1): the factor
+    is then 1 and the model is SES of the values.
+
+    ``alpha = 0.1`` for both parts (the customary SBA constant) and each SES
+    starts from the mean of its first ``k_init = 5`` values.  In simulations
+    of stationary and changing demand (occurrence 15-60 %, 24-150 periods)
+    this was more accurate than choosing alpha per series by in-sample SSE
+    (the one-step errors of a few demands mostly measure noise) and than
+    starting from the first demand alone.  An all-zero series is forecast as
+    exactly 0, a constant one as that constant; exactly scale-equivariant
+    (the sizes are scaled by a power of two).
+
+    Unlike SES on the raw series, whose level jumps at every sale and then
+    decays through the zeros after it, the rate only changes when a demand
+    occurs, so the forecast hardly depends on how long ago the last sale
+    was.  On an ordinary series it is only SES without trend, so
+    :func:`default_candidates` offers it for intermittent demand only
+    (``offered_for = "intermittent"``).
+    """
+
+    name = "sba"
+    min_obs = 2
+    offered_for = "intermittent"
+    #: smoothing constant of the demand sizes and of the intervals
+    alpha: float = 0.1
+    #: the SES levels start from the mean of this many first sizes / intervals
+    k_init: int = 5
+
+    def _fit(self, y: np.ndarray, m: int) -> None:
+        pos = np.flatnonzero(y != 0)
+        self._rate = 0.0
+        self.params_ = {"demands": int(pos.size)}
+        if pos.size == 0:
+            return
+        e = math.frexp(float(np.max(np.abs(y[pos]))))[1]
+        sizes = np.ldexp(y[pos], -e)  # exact: |sizes| in (0, 1)
+        intervals = np.diff(np.r_[-1, pos]).astype(float)
+        size = _ses_level(sizes, self.alpha, self.k_init)
+        interval = _ses_level(intervals, self.alpha, self.k_init)
+        factor = 1.0 if pos.size == len(y) else 1.0 - 0.5 * self.alpha
+        self._rate = float(np.ldexp(factor * size / interval, e))
+        self.params_.update({"size": float(np.ldexp(size, e)), "interval": interval,
+                             "bias_factor": factor})
+
+    def _predict(self, h: int) -> np.ndarray:
+        return np.full(h, self._rate)
+
+
 # --------------------------------------------------------------------------- linear trend
 
 
@@ -1360,7 +1442,11 @@ class LogTransformed(Forecaster):
             self._shift = 0.0
         else:
             rng = float(y.max()) - ymin
-            self._shift = -ymin + max(0.01 * rng, 1e-9 * max(1.0, abs(ymin)))
+            # relative floor (keeps y + shift > 0 after rounding when the range is tiny next to
+            # |ymin|); an absolute one broke scale-equivariance below ~1e-7 (1e-300 data with
+            # zeros: forecasts of 1e-25)
+            ref = max(abs(ymin), abs(float(y.max())))
+            self._shift = -ymin + max(0.01 * rng, 1e-9 * ref) if ref > 0 else 1.0  # 1.0: all zero
         ly = np.log(y + self._shift)
         self._ly = ly
         lo, hi = float(ly.min()), float(ly.max())
@@ -1399,6 +1485,32 @@ class _LogLinearTrend(LogTransformed):
         super().__init__(LinearTrend(), "linear_trend@log")
 
 
+class _LogDrift(LogTransformed):
+    """Random walk with drift in log space: constant average growth *rate*.
+
+    ``log y`` is extrapolated along the line from its first to its last
+    value, i.e. the forecast compounds the average growth rate of the
+    history (``y_n * g**k`` with ``g = (y_n / y_1) ** (1 / (n - 1))``), at
+    most: like every ``*@log`` model it is growth-guarded, so a recent pace
+    slower than the average caps it.  For steadily compounding series (GDP, prices, populations) level-space drift
+    projects *linear* growth and falls further behind with every step.
+
+    Not offered automatically (``offered_for = "explicit"``): request it by
+    name (``auto_forecast(..., candidates=[...])``).  As a default candidate
+    it cut the error on simulated annual GDP-like series (MAPE at h = 1..5
+    -11 %, median bias at h = 5 -2.2 % -> -1.5 %) but made the general
+    accuracy testbed slightly worse (MAE +0.5 % over 966 series, interval
+    coverage -0.1 pt): on S-curves cut mid-transition, which start from a
+    low base, the average log growth compounds into large overshoots
+    (``peaking`` W n=104: x2.6-4 the MAE).
+    """
+
+    offered_for = "explicit"
+
+    def __init__(self) -> None:
+        super().__init__(Drift(), "drift@log")
+
+
 # --------------------------------------------------------------------------- registry
 
 MODEL_REGISTRY: dict[str, Callable[[], Forecaster]] = {
@@ -1426,16 +1538,25 @@ def available_models() -> list[str]:
     return sorted(MODEL_REGISTRY)
 
 
-def default_candidates(n_obs: int, season_length: int, positive: bool) -> list[str]:
+def default_candidates(n_obs: int, season_length: int, positive: bool,
+                       intermittent: bool = False) -> list[str]:
     """Registry names worth trying for a series of this shape.
 
     Only returns models whose ``min_obs`` is satisfied; seasonal models only
     when at least two full seasons are available.  ``positive`` means all
     observations are > 0 (enables log-space variants if registered).
+    ``intermittent`` (many exact zeros, see ``forecast._is_intermittent``)
+    adds the models meant only for intermittent demand
+    (``offered_for == "intermittent"``, e.g. ``sba``); they are never offered
+    for ordinary series.  Models with ``offered_for == "explicit"`` are never
+    returned (request them by name).
     """
     names = []
     for nm, factory in MODEL_REGISTRY.items():
         m = factory()
+        offered = getattr(m, "offered_for", "regular")
+        if offered == "explicit" or (offered == "intermittent" and not intermittent):
+            continue
         if n_obs < m.min_obs:
             continue
         if m.needs_season and (season_length <= 1 or n_obs < 2 * season_length):
@@ -1460,6 +1581,8 @@ for _name, _factory in (
     ("holt_damped@log", _LogHoltDamped),
     ("holt_winters@log", _LogHoltWinters),
     ("linear_trend@log", _LogLinearTrend),
+    ("drift@log", _LogDrift),
+    ("sba", SBA),
 ):
     register(_name, _factory)
 del _name, _factory

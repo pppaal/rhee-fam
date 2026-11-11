@@ -5,6 +5,10 @@ Pipeline of :func:`auto_forecast`::
     prepared series ──► history cap (the SAME recent history is used for the
                         backtest and for the final fit)
                     ──► isolated spikes replaced by their expected value
+                    ──► candidates: level models only for intermittent demand, no
+                        trend extrapolators for a driftless random walk
+                        (``random_walk``, see :func:`is_random_walk`), plus
+                        ``drift@log`` for steadily compounding positive series
                     ──► rolling-origin backtest of every candidate model and of the
                         naive benchmarks (same windows for all, MASE on the training
                         scale, recent windows weighted more, every forecast passed
@@ -15,10 +19,12 @@ Pipeline of :func:`auto_forecast`::
                     ──► prediction intervals from the chosen method's own backtest
                         errors per horizon step (σ_k ≈ s₁·k^b), rescaled to the
                         current level when the errors grow with the level, shrunk
-                        towards a random-walk prior and widened with Student-t
+                        towards a prior (random-walk scale at lead 1, growing like
+                        the backtest errors) and widened with Student-t
                         quantiles when the backtest is small, and wide enough for
                         the 95 % band to contain every ensemble member
                     ──► skill = backtest MAE / MAE of the best naive benchmark
+                        (RMSE for intermittent demand, the metric that ranked it)
 
 :func:`compute_outlook` then turns a forecast into an interpretation relative
 to the present (direction, expected change, probability of an increase,
@@ -33,12 +39,13 @@ import functools
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import NamedTuple, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
 from . import models as _models
+from .analysis import _is_multiplicative
 from .data import default_horizon, future_index, prepare
 from .data import season_length as _freq_season_length
 from .types import AnalysisResult, ForecastResult, ModelScore, Outlook
@@ -47,7 +54,10 @@ __all__ = [
     "mase_scale",
     "backtest",
     "auto_forecast",
+    "is_random_walk",
     "compute_outlook",
+    "outlook_levels",
+    "OutlookLevels",
     "norm_cdf",
     "norm_ppf",
     "t_cdf",
@@ -79,7 +89,9 @@ _RECENCY_RATIO = 3.0
 #: bounds of the horizon exponent b in sigma_k = s1 * k**b.  The lower bound keeps
 #: intervals (mildly) widening with the horizon even when the backtest errors do not
 #: grow; 0.1 rather than 0.3 because simulations showed 0.3 under-covers at h = 1 and
-#: over-covers at long horizons for series with stationary noise.
+#: over-covers at long horizons for series with stationary noise.  (0 gave flatter
+#: per-lead coverage but a pooled, wider h = 1 band: step-1 coverage 0.86 instead of 0.78
+#: on daily noise, and fewer direction calls through the h = 1 noise threshold.)
 _B_MIN, _B_MAX = 0.1, 1.0
 #: horizon exponent used when it cannot be estimated (random-walk like growth)
 _B_DEFAULT = 0.5
@@ -88,8 +100,16 @@ _B_DEFAULT = 0.5
 _B_EXTRAPOLATE = 0.5
 #: multiplier of the robust in-sample noise scale used as the floor of s1
 _FLOOR_FACTOR = 0.5
-#: small-sample / model-selection inflation of the backtest error scale
+#: small-sample / model-selection inflation of the backtest error scale.  (Dropping it for
+#: backtests of >= 30 distinct targets brought well-specified long series from 84-86 / 96-97 %
+#: to 82-84 / 95-97 % coverage of the 80 / 95 % bands, but a mixed testbed of 483 series,
+#: whose 95 % coverage is already short at 0.933 through misspecified mean forecasts, fell to
+#: 0.924; kept.)
 _SIGMA_INFLATION_BASE = 1.05
+#: the random-walk prior of the interval scale takes the growth with the lead from the
+#: backtest errors whenever the backtest covers at least 3 leads, unless the series is a
+#: driftless random walk (see auto_forecast)
+_PRIOR_FOLLOWS_BACKTEST = True
 #: prior degrees of freedom of the random-walk error scale the backtest scale is shrunk
 #: towards (see _shrink_sigma); it dominates tiny backtests and vanishes for long ones
 _PRIOR_DOF = 2.0
@@ -121,6 +141,29 @@ _INTERMITTENT_ZEROS = 0.3
 #: level (a demand rate) instead of following the last observations; 'croston' / 'sba' are
 #: picked up automatically if the models module registers them
 _INTERMITTENT_MODELS = ("ses", "theta", "holt_damped", "croston", "sba")
+#: backtest metric that ranks and weights the candidates for intermittent demand.  MAE (and so
+#: MASE) is minimised by the median, which for mostly-zero data is 0 or close to it, so it
+#: prefers forecasts that under-state the demand rate; squared error is minimised by the mean
+#: rate.  Simulations of intermittent demand (W/M/D, 15-60 % non-zero, 60 seeds x 6 settings):
+#: mean relative error of the forecast rate 0.280 with MASE ranking, 0.266 with RMSE
+_INTERMITTENT_METRIC = "rmse"
+#: models that extrapolate a fitted (global or local) trend; for a driftless random walk the
+#: fitted trend is the noise path of the sample, which they project forward as a direction
+#: (40 daily geometric random walks: p_up 0.95 / +16 % from linear_trend@log + linear_trend,
+#: Brier 0.270 against 0.250 for a constant 0.5), so they are not offered there
+_TREND_EXTRAPOLATORS = ("linear_trend", "linear_trend@log", "logistic_growth", "holt",
+                        "holt_winters", "holt_winters@log")
+#: noise-model persistence (AR(1) phi of the noise around the trend, see analysis) from which a
+#: series without a significant trend counts as a driftless random walk
+_RW_PHI = 0.9
+#: candidate added for strictly positive series whose growth is multiplicative (see
+#: _multiplicative_growth): level-space drift / holt / ar project *linear* growth, so on
+#: compounding series (GDP-like annual data) every forecast falls behind (median bias -2.2 % at
+#: h = 5, 73 % of the forecasts below the outcome)
+_LOG_DRIFT = "drift@log"
+#: ... when the average log growth of the two halves of the history differs by less than this
+#: (log of the ratio): compounding at a steady rate, not an S-curve
+_STEADY_GROWTH_LOG = math.log(1.5)
 
 
 # --------------------------------------------------------------------------- normal / t
@@ -512,6 +555,45 @@ def _is_intermittent(y: np.ndarray, m: int) -> bool:
         return False
     k = min(len(y), max(m, 12))
     return bool(zero.mean() >= _INTERMITTENT_ZEROS and zero[-k:].mean() >= _INTERMITTENT_ZEROS)
+
+
+def _multiplicative_growth(y: np.ndarray) -> bool:
+    """Strictly positive series whose changes scale with the level (compounding growth or decay).
+
+    The level moved by at least 50 % between the first and the last quarter
+    of the history in one direction (the average change per period has the
+    same sign in both halves), and that average change differs between the
+    first and the second half less in log terms than in levels, and by less
+    than a factor 1.5 in log terms: steady percentage growth has a steady
+    average log change and level changes that grow with the level; a
+    straight line (or a random walk with drift) is the other way round, and
+    an S-curve's growth rate is not steady.  Average changes are differences of the half's end
+    points, so period-to-period noise hardly matters.
+    """
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < 12 or not np.all(y > 0):
+        return False
+    q = max(2, n // 4)
+    lv1, lv2 = float(np.mean(y[:q])), float(np.mean(y[-q:]))
+    if max(lv1, lv2) < 1.5 * min(lv1, lv2):
+        return False
+    half = n // 2
+    ly = np.log(y)
+    # mean change of each half, from the mean of its first and last few points
+    k = max(2, half // 4)
+
+    def avg_change(v: np.ndarray, lo: int, hi: int) -> float:
+        return (float(np.mean(v[hi - k:hi])) - float(np.mean(v[lo:lo + k]))) / (hi - lo - k)
+
+    a1, a2 = avg_change(y, 0, half), avg_change(y, n - half, n)
+    b1, b2 = avg_change(ly, 0, half), avg_change(ly, n - half, n)
+    if not (a1 * a2 > 0 and b1 * b2 > 0):
+        return False
+    lb, la = abs(math.log(b2 / b1)), abs(math.log(a2 / a1))
+    # steady: the growth *rate* of the two halves is similar (an S-curve accelerates, then
+    # stalls -- its log growth rate collapses, and log drift would extrapolate the early pace)
+    return lb < la and lb < _STEADY_GROWTH_LOG
 
 
 def _max_moves(x: np.ndarray, J: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1015,22 +1097,58 @@ _BENCHMARKS: dict[str, type[_models.Forecaster]] = {
 }
 
 
-def _skill(final_mae: float, bench_mae: dict[str, float]) -> Optional[float]:
-    """``final_mae / min(bench_mae)`` (finite, capped at 100); ``None`` without benchmarks."""
-    vals = [v for v in bench_mae.values() if math.isfinite(v)]
-    if not vals or not math.isfinite(final_mae):
+#: backtest errors below this share of the series' mean absolute level are rounding noise
+#: (an exact line fitted by drift, holt and linear_trend: errors ~1e-16 of the level)
+_EXACT_FRAC = 1e-9
+
+
+def _skill(final_err: float, bench_err: dict[str, float], scale: float = 0.0) -> Optional[float]:
+    """``final_err / min(bench_err)`` (finite, capped at 100); ``None`` without benchmarks.
+
+    Both errors are floored at ``1e-9 · scale`` (``scale`` = mean absolute level
+    of the series): on exact data every model is exact up to rounding, and
+    ``1e-16 / 0`` used to read as "100 times worse than naive".  Both exact
+    gives ``1.0`` (as good as the benchmark).
+    """
+    vals = [v for v in bench_err.values() if math.isfinite(v)]
+    if not vals or not math.isfinite(final_err):
         return None
     best = min(vals)
-    tiny = 1e-12 * max(best, final_mae, 1e-300)
-    if best <= tiny:
-        return 1.0 if final_mae <= tiny else 100.0
-    return float(min(final_mae / best, 100.0))
+    eps = max(_EXACT_FRAC * float(scale) if math.isfinite(scale) else 0.0,
+              1e-12 * max(best, final_err), 1e-300)
+    return float(min(max(final_err, eps) / max(best, eps), 100.0))
+
+
+def is_random_walk(analysis: AnalysisResult) -> bool:
+    """Whether the analysis found a driftless random walk (for ``auto_forecast(random_walk=)``).
+
+    The noise around the trend is (near) a unit root -- the analysis' AR(1)
+    noise model gives ``phi >= 0.9`` -- and the dependence-corrected trend test
+    finds no significant trend (``metrics.direction == 'flat'``): the series
+    wanders, and any slope fitted to it is that sample's noise path.
+    """
+    try:
+        from .analysis import _noise_model, _unit
+        if getattr(analysis.metrics, "direction", "flat") != "flat":
+            return False
+        dec = analysis.decomposition
+        # the same scaling as analysis.compute_metrics, so its noise-model cache is reused
+        c = _unit(np.asarray(analysis.series.to_numpy(dtype=float)))
+        T = np.asarray(pd.Series(dec.trend).to_numpy(dtype=float)) / c
+        R = np.asarray(pd.Series(dec.resid).to_numpy(dtype=float)) / c
+        z = T + R
+        if len(z) < 12 or len(T) != len(R) or not np.all(np.isfinite(z)):
+            return False
+        phi = float(_noise_model(z, int(dec.period), R)[0])
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return False
+    return bool(phi >= _RW_PHI)
 
 
 def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | None = None,
                   levels: tuple[int, ...] = (80, 95), candidates: list[str] | None = None,
                   top_k: int = 3, n_windows: int | None = None,
-                  nonnegative: bool | None = None) -> ForecastResult:
+                  nonnegative: bool | None = None, random_walk: bool = False) -> ForecastResult:
     """Forecast ``series`` ``horizon`` steps ahead with automatic model selection.
 
     Parameters
@@ -1053,6 +1171,12 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
         40 / 100 / more observations; fewer are used if the series is short).
     nonnegative:
         Clip mean and bounds at 0 (default: iff all observations are >= 0).
+    random_walk:
+        The series is a driftless random walk (see :func:`is_random_walk`):
+        the trend-extrapolating models (``linear_trend``, ``logistic_growth``,
+        ``holt``, ``holt_winters`` and their log variants) are not default
+        candidates, since the slope they would fit is the noise path of the
+        sample.  Ignored when ``candidates`` is given.
 
     Notes
     -----
@@ -1068,7 +1192,9 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
       every seasonal model at 2 to ~2.4 seasons (see :func:`_make_plan`).
     * Scores: ``ModelScore`` metrics are averages over the backtest windows
       weighted towards the recent windows (newest 3x the oldest), computed on
-      the guarded forecasts; models are ranked by that MASE.
+      the guarded forecasts; models are ranked by that MASE (by the RMSE for
+      intermittent demand, see below).  ``model_scores`` is always listed by
+      MASE.
     * The ensemble (inverse-MASE weights over the top-k) is used unless the
       best single model's backtest MASE is below 0.9 x the ensemble's (and the
       backtest has at least 6 errors per model); ``ModelScore.weight`` holds
@@ -1079,19 +1205,34 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
       strongest recent pace x k)`` away from the last observation (see
       :func:`_move_envelope`).  Steady trends and seasonal swings pass
       unchanged; compounding a short burst into an explosion does not.
+    * Driftless random walk (``random_walk=True``): ``linear_trend``,
+      ``logistic_growth``, ``holt``, ``holt_winters`` and their log variants
+      are left out of the default candidates (their slope would be the noise
+      path of the sample), and the interval prior keeps its ``√k`` growth.
+    * Compounding growth (strictly positive, steady percentage growth or
+      decay, see :func:`_multiplicative_growth`): ``drift@log`` joins the
+      default candidates (level-space models project linear growth and fall
+      behind a compounding series).
     * Intermittent demand (``>= 30 %`` zeros overall and recently): only
       level-type models (``ses``, ``theta``, ``holt_damped``, ``croston``,
-      ``sba`` -- those registered) are default candidates (MAE-based ranking
-      would otherwise pick naive/drift and anchor the forecast on the last
-      observation), spikes are not cleaned and ``compute_outlook`` reports no
-      percentage change.
+      ``sba`` -- those registered; ``sba`` is offered for intermittent
+      demand only) are default candidates (MAE-based ranking would otherwise
+      pick naive/drift and anchor the forecast on the last observation).  They
+      are ranked and weighted by backtest RMSE rather than MASE: MAE is
+      minimised by the median, about 0 for mostly-zero data, so it favours
+      forecasts that under-state the demand rate.  Spikes are not cleaned and
+      ``compute_outlook`` reports no percentage change.
     * Intervals: ``mean ± q·σ_k``.  ``σ_k = s₁·k^b`` is fitted to the final
       method's backtest errors (``b`` in ``[0.1, 1]``, at least ``√k`` growth
       beyond the backtest horizon, ``s₁`` floored by a robust in-sample noise
-      level); for positive series the errors are first rescaled to the
-      current level (see :func:`_level_adjust`).  It is then pooled with a
-      random-walk prior scale with weight ``ν/(ν+2)`` (``ν`` = distinct
-      backtest targets - 1) and ``q`` is the Student-t quantile on
+      level, slightly inflated for few windows); for positive series the
+      errors are first rescaled to the current level (see
+      :func:`_level_adjust`).  It is then pooled
+      with a prior scale -- the random-walk scale at lead 1, growing with
+      the lead like the backtest errors when the backtest covers at least 3
+      leads (like ``√k`` otherwise, and for a driftless random walk) -- with
+      weight ``ν/(ν+2)`` (``ν`` = distinct backtest targets - 1) and ``q``
+      is the Student-t quantile on
       ``f·ν + 2`` degrees of freedom (``f = min(0.5, (1-ρ)/(1+ρ))``, ``ρ`` the
       lag-1 autocorrelation of the backtest errors), so tiny backtests (short
       series) and few independent long-horizon paths get honest, wide
@@ -1101,7 +1242,10 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
     * ``skill`` = backtest MAE of the final method / MAE of the best of the
       naive benchmarks (naive, drift, seasonal naive when ``m > 1`` and the
       windows hold a season) on the same windows -- always backtested, even
-      when they are not candidates.  ``< 1`` means better than naive.
+      when they are not candidates.  ``< 1`` means better than naive.  For
+      intermittent demand both are RMSEs (the metric the models were chosen
+      by: MAE prefers the all-zero naive forecast).  Errors below ``1e-9`` of
+      the mean level count as exact (both exact: ``1.0``).
     * Series too short for a 2-window backtest (fewer than ~8 points), or for
       which every candidate fails, get an equal-weight drift + naive forecast
       with wide heuristic intervals, ``backtest_mase=None``, ``skill=None``
@@ -1143,11 +1287,20 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
     # ---- candidates
     positive = bool(np.all(y > 0))
     if candidates is None:
-        names = list(_models.default_candidates(plan.min_train, m, positive))
+        names = list(_models.default_candidates(plan.min_train, m, positive,
+                                                intermittent=intermittent))
         if intermittent:
             level_models = [nm for nm in names if nm in _INTERMITTENT_MODELS]
             if level_models:
                 names = level_models
+        if random_walk:
+            no_trend = [nm for nm in names if nm not in _TREND_EXTRAPOLATORS]
+            if no_trend:
+                names = no_trend
+        elif (not intermittent and _LOG_DRIFT in _models.MODEL_REGISTRY and _LOG_DRIFT not in names
+              and plan.min_train >= _models.make_model(_LOG_DRIFT).min_obs
+              and _multiplicative_growth(y)):
+            names.append(_LOG_DRIFT)
     else:
         names = [str(c) for c in candidates]
     names = list(dict.fromkeys(names))  # dedupe, keep order
@@ -1181,7 +1334,11 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
                       RuntimeWarning, stacklevel=2)
         return fallback("no usable candidate model")
 
-    bench_mae: dict[str, float] = {}
+    # selection metric: MASE, except RMSE for intermittent demand (see _INTERMITTENT_METRIC);
+    # the skill is measured in the same terms (MAE, or RMSE for intermittent demand)
+    key = _INTERMITTENT_METRIC if intermittent else "mase"
+    skill_key = _INTERMITTENT_METRIC if intermittent else "mae"
+    bench_err: dict[str, float] = {}
     for nm, cls in _BENCHMARKS.items():
         if nm == "seasonal_naive" and not (m > 1 and plan.min_train >= m):
             continue
@@ -1189,10 +1346,10 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
             fc = clip0(_window_forecasts(y, nm, m, plan, factory=cls))
         except Exception:  # noqa: BLE001 - benchmarks are built-ins; never fatal
             continue
-        bench_mae[nm] = _scores(fc, actuals, scales, wts)["mae"]
+        bench_err[nm] = _scores(fc, actuals, scales, wts)[skill_key]
 
     order = {nm: i for i, nm in enumerate(names)}
-    ranked = sorted(results, key=lambda nm: (results[nm][1]["mase"], order[nm]))
+    ranked = sorted(results, key=lambda nm: (results[nm][1][key], order[nm]))
 
     # ---- ensemble vs. best single model
     best = ranked[0]
@@ -1200,12 +1357,14 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
     k = min(int(top_k), len(ranked))
     if k >= 2:
         top = ranked[:k]
-        inv = np.array([1.0 / max(results[nm][1]["mase"], 1e-9) for nm in top])
+        vals = [results[nm][1][key] for nm in top]
+        floor = 1e-9 if key == "mase" else 1e-12 * max(max(vals), 1e-300)
+        inv = np.array([1.0 / max(v, floor) for v in vals])
         ens_w = inv / inv.sum()
         ens_fc = np.tensordot(ens_w, np.stack([results[nm][0] for nm in top]), axes=1)
-        ens_mase = _scores(ens_fc, actuals, scales, wts)["mase"]
+        ens_score = _scores(ens_fc, actuals, scales, wts)[key]
         enough = plan.n_windows * plan.horizon >= _MIN_ERRORS_FOR_SINGLE
-        if not (enough and results[best][1]["mase"] < _ENSEMBLE_MARGIN * ens_mase):
+        if not (enough and results[best][1][key] < _ENSEMBLE_MARGIN * ens_score):
             chosen = {nm: float(w) for nm, w in zip(top, ens_w)}
 
     # ---- final fit on the same history the backtest used
@@ -1248,7 +1407,9 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
         mean += w * fitted[nm]
         bt_fc += w * results[nm][0]
     final_scores = _scores(bt_fc, actuals, scales, wts)
-    skill = _skill(final_scores["mae"], bench_mae)
+    with np.errstate(over="ignore"):
+        level = float(np.mean(np.abs(y)))
+    skill = _skill(final_scores[skill_key], bench_err, level)
 
     # ---- prediction intervals from the final method's backtest errors
     errors = actuals - bt_fc
@@ -1259,16 +1420,24 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
     sigma_bt = sigma_bt * math.sqrt(1.0 + _SELECTION_PENALTY * math.log(max(len(results), 1))
                                     / plan.n_targets)
     dof_factor = min(_DOF_PER_TARGET, _error_dof_factor(errors))
-    sigma, dof = _shrink_sigma(sigma_bt, _prior_sigma(y, m, H), plan.n_targets - 1, dof_factor)
+    prior = _prior_sigma(y, m, H)
+    if _PRIOR_FOLLOWS_BACKTEST and plan.horizon >= 3 and sigma_bt[0] > 0 and not random_walk:
+        # the backtest shows how the errors grow with the lead (at least 3 leads): the prior
+        # only sets the level, with that growth -- a random-walk sqrt(k) prior widened the
+        # long leads of stationary series (white noise D400: sigma at lead 30 x1.25 from a
+        # prior weighted 1.5 %)
+        prior = prior[0] * (sigma_bt / sigma_bt[0])
+    sigma, dof = _shrink_sigma(sigma_bt, prior, plan.n_targets - 1, dof_factor)
     sigma = np.maximum(sigma, _member_spread(fitted, weights))
     sigma = np.maximum.accumulate(sigma)
     mean_s, lower, upper = _bands(mean, sigma, lvls, nonnegative, index, dof)
 
+    # reported best (lowest MASE) first, whatever metric selected the models
     model_scores = [
         ModelScore(name=nm, mae=results[nm][1]["mae"], rmse=results[nm][1]["rmse"],
                    smape=results[nm][1]["smape"], mase=results[nm][1]["mase"],
                    weight=float(weights.get(nm, 0.0)))
-        for nm in ranked
+        for nm in sorted(results, key=lambda nm: (results[nm][1]["mase"], order[nm]))
     ]
     return ForecastResult(mean=mean_s, lower=lower, upper=upper, horizon=H, levels=lvls,
                           model_scores=model_scores, method=_describe(weights),
@@ -1346,13 +1515,39 @@ def _seasonal_component(analysis: AnalysisResult) -> tuple[Optional[np.ndarray],
     return seas, p
 
 
-def _future_seasonal(analysis: AnalysisResult, horizon: int) -> np.ndarray:
-    """The analysis' seasonal component continued over the forecast horizon (zeros if none)."""
+def _future_seasonal(analysis: AnalysisResult, horizon: int,
+                     forecast_mean: Optional[np.ndarray] = None) -> np.ndarray:
+    """The analysis' seasonal component continued over the forecast horizon (zeros if none).
+
+    Additive decompositions: the last season repeated.  Multiplicative ones
+    (``analysis._is_multiplicative``: ``seasonal = trend · r`` with a
+    periodic ratio ``r``) keep the *ratio* instead, applied to the level of
+    the forecast: with ``forecast_mean`` given, step ``k`` gets
+    ``r_k · f_k / (1 + r_k)``, i.e. the forecast split into trend and
+    seasonal parts in the decomposition's proportions.  Repeating the last
+    season's values would keep its swing at the current level, too small for
+    a level that has doubled by the end of the horizon and too large after a
+    collapse.  Without ``forecast_mean`` the last season is repeated.
+    """
     seas, p = _seasonal_component(analysis)
     if seas is None:
         return np.zeros(horizon)
+    phase = np.arange(horizon) % p
     last = seas[-p:]  # phases of observations n-p .. n-1; step k (0-based) is t = n + k
-    return last[np.arange(horizon) % p]
+    if forecast_mean is not None and len(forecast_mean) == horizon:
+        dec = analysis.decomposition
+        try:
+            mult = _is_multiplicative(dec)
+        except (AttributeError, TypeError, ValueError):
+            mult = False
+        trend = np.asarray(pd.Series(dec.trend).to_numpy(dtype=float)) if mult else None
+        if trend is not None and len(trend) == len(seas):
+            r = (last / trend[-p:])[phase]
+            f = np.asarray(forecast_mean, dtype=float)
+            out = r * f / (1.0 + r)
+            if np.all(np.isfinite(out)) and np.all(1.0 + r > 0):
+                return out
+    return last[phase]
 
 
 def _seasonal_share(f: np.ndarray, s: np.ndarray, period: int) -> float:
@@ -1434,10 +1629,31 @@ def _confidence(skill: Optional[float], backtest_mase: Optional[float], n: int, 
     return "high" if (good and enough) else "medium"
 
 
+#: a 'flat' forecast whose level moves by at most this share of the current level is flat
+#: in itself (the base case stops the current move); a larger move rated 'flat' only for
+#: its uncertainty says nothing about whether the move stops
+_FLAT_POINT_FRAC = 0.02
+
+
 def _future_phase(current: str, direction: str, strong: bool, change_pct: Optional[float],
-                  confidence: str) -> str:
-    """Project the lifecycle phase at the horizon end from the current phase + direction."""
-    if current == "volatile" and confidence == "low":
+                  confidence: str, settled: Optional[bool] = None) -> str:
+    """Project the lifecycle phase at the horizon end from the current phase + direction.
+
+    * ``'volatile'`` stays ``'volatile'``: a mean forecast never carries the
+      noise, so its smoothness cannot show the noise going away.
+    * ``'up'`` / ``'down'``: the phase the move leads to (e.g. growing ->
+      declining only for a strong fall, otherwise peaking).
+    * ``'flat'``: the end of the current move (growing / emerging -> peaking,
+      declining / reviving -> stable) is projected only when the flat forecast
+      is informative -- ``settled``: the base case itself barely moves
+      (``|change| <= 2 %``), the confidence is not ``'low'`` and the band is
+      not too wide to tell a continuing move from a stop (see
+      :func:`compute_outlook`).  Otherwise the forecast cannot tell whether
+      the current phase ends, and the current phase is kept (a +75 % base case
+      rated 'flat' for its uncertainty is no peak).  Without ``settled`` it is
+      derived from ``change_pct`` and ``confidence`` alone.
+    """
+    if current == "volatile":
         return "volatile"
     if direction == "up":
         if current == "emerging":
@@ -1454,9 +1670,111 @@ def _future_phase(current: str, direction: str, strong: bool, change_pct: Option
             return "declining" if strong else "peaking"
         return "declining"
     # flat
+    if settled is None:
+        settled = (confidence != "low"
+                   and (change_pct is None or abs(change_pct) <= 100.0 * _FLAT_POINT_FRAC))
+    if not settled:
+        return current
     if current in ("growing", "peaking", "emerging"):
         return "peaking"
     return "stable"
+
+
+#: a series that takes negative values (net profit, temperature, a growth rate) has no natural
+#: zero for percentages: a change in % is stated only when the current level is at least this
+#: many standard deviations of the history away from 0 (a level near 0 made a P&L that went
+#: from 10 to -10 read as a -578,465 % change)
+_PCT_MIN_LEVEL_SD = 0.5
+
+
+def _pct_undefined(y: np.ndarray, current: float, future: float, k_cur: int) -> Optional[str]:
+    """Why ``(future - current) / |current|`` is no meaningful percentage (``None``: it is).
+
+    * ``'zero'``: the current level is ~0 (or not finite);
+    * ``'mostly_zero'``: at least half of the current window is exactly 0 for
+      a non-negative series (intermittent demand: a percentage of a mean of
+      mostly zeros is meaningless);
+    * ``'sign_change'``: the future level has the opposite sign (a change
+      across zero has no percentage);
+    * ``'near_zero'``: the series takes negative values and the current level
+      is closer to 0 than 0.5 standard deviations of the history.
+      Non-negative series are on a ratio scale, so any positive level
+      qualifies there.
+    """
+    ref = float(np.mean(np.abs(y))) if len(y) else 0.0
+    if not (math.isfinite(current) and abs(current) > 1e-6 * max(ref, 1e-300)):
+        return "zero"
+    nonneg = bool(np.all(y >= 0))
+    if nonneg and np.mean(y[-k_cur:] == 0) >= 0.5:
+        return "mostly_zero"
+    if not math.isfinite(future) or (future != 0.0 and (future > 0) != (current > 0)):
+        return "sign_change"
+    if not nonneg:
+        sd = float(np.std(y / ref)) * ref  # on a unit scale: no overflow at |y| ~ 1e200
+        if abs(current) < _PCT_MIN_LEVEL_SD * sd:
+            return "near_zero"
+    return None
+
+
+class OutlookLevels(NamedTuple):
+    """The two levels :func:`compute_outlook` compares (see :func:`outlook_levels`)."""
+
+    current: float           # current level (mean of the last k_cur observations, adjusted)
+    future: float            # future level (mean of the last k_fut forecast means, adjusted)
+    k_cur: int               # observations in the current window: min(season length, n)
+    k_fut: int               # forecast steps in the future window: min(season length, horizon)
+    period: Optional[int]    # period of the usable seasonal component (None: there is none)
+    adj_cur: bool            # current window is a partial season: seasonal effect removed
+    adj_fut: bool            # future window is a partial season: (scaled) seasonal effect removed
+    undefined: Optional[str]  # why expected_change_pct is None ('zero', 'mostly_zero',
+                              # 'sign_change', 'near_zero'), None when it is defined
+
+
+def _levels(analysis: AnalysisResult, forecast: ForecastResult
+            ) -> tuple[OutlookLevels, np.ndarray]:
+    """:func:`outlook_levels` plus the scaled seasonal continuation over the horizon."""
+    y_all = np.asarray(analysis.series.to_numpy(dtype=float))
+    finite = np.isfinite(y_all)
+    y = y_all[finite]
+    n = len(y)
+    m = max(1, int(analysis.season_length))
+    fm = np.asarray(forecast.mean.to_numpy(dtype=float))
+    H = len(fm)
+    if n == 0 or H == 0:
+        raise ValueError("analysis series and forecast must be non-empty")
+    k_cur, k_fut = min(m, n), min(m, H)
+    current = float(np.mean(y[-k_cur:]))
+    future = float(np.mean(fm[-k_fut:]))
+    seas, p = _seasonal_component(analysis)
+    # the analysis' seasonal pattern carried forward, scaled by how much of it the
+    # forecast actually contains (0 if the chosen models forecast no seasonality)
+    seas_fut = _future_seasonal(analysis, H, fm)
+    seas_fut = _seasonal_share(fm, seas_fut, p) * seas_fut
+    adj_cur = adj_fut = False
+    if seas is not None:
+        # compare like with like: remove the seasonal effect of partial-season windows
+        if k_fut % p:
+            future -= float(np.mean(seas_fut[-k_fut:]))
+            adj_fut = True
+        if k_cur % p:
+            current -= float(np.mean(seas[finite][-k_cur:]))
+            adj_cur = True
+    levels = OutlookLevels(current=current, future=future, k_cur=k_cur, k_fut=k_fut,
+                           period=p if seas is not None else None, adj_cur=adj_cur,
+                           adj_fut=adj_fut, undefined=_pct_undefined(y, current, future, k_cur))
+    return levels, seas_fut
+
+
+def outlook_levels(analysis: AnalysisResult, forecast: ForecastResult) -> OutlookLevels:
+    """The current and future levels behind ``Outlook.expected_change_pct`` / ``prob_increase``.
+
+    Exactly the levels, windows, partial-season adjustments and percentage rule
+    of :func:`compute_outlook` (which uses this function), so a narrative can
+    name and print them without re-implementing the rules.
+    ``expected_change_pct == (future - current) / |current| * 100`` whenever
+    ``undefined`` is ``None``; otherwise it is ``None`` for the reason given.
+    """
+    return _levels(analysis, forecast)[0]
 
 
 #: |future - current| must exceed this many σ_H for a direction to be stated: Φ⁻¹(2/3), i.e.
@@ -1487,8 +1805,10 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
       for the forecast window scaled by the share of the seasonal pattern the
       forecast actually contains (0 for a flat / straight-line forecast) --
       so that a seasonal high or low is not reported as a trend change.  For
-      windows of whole seasons (the default for D/M/Q/Y) nothing changes and
-      the two levels are plain means.
+      a multiplicative decomposition the continued seasonal component scales
+      with the forecast level (see :func:`_future_seasonal`).  For windows of
+      whole seasons (the default for D/M/Q/Y) nothing changes and the two
+      levels are plain means.
 
     Fields:
 
@@ -1497,9 +1817,12 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
       last season to the last season of the horizon -- not the change of the
       horizon-end value (that is ``scenarios['base']``, a single date that
       carries its own seasonal effect).  ``None`` when the current level is
-      ~0, or when at least half of the current window is exactly 0 for a
-      non-negative series (intermittent demand: a percentage of a mean of
-      mostly zeros is meaningless).
+      ~0, when the future level has the opposite sign, when at least half of
+      the current window is exactly 0 for a non-negative series (intermittent
+      demand: a percentage of a mean of mostly zeros is meaningless), or --
+      for a series with negative values (net profit, temperature) -- when the
+      current level is within 0.5 standard deviations of the history from 0
+      (see :func:`_pct_defined`).
     * ``prob_increase`` = P(future level > current level) =
       ``Φ((future − current) / σ_H)``, σ_H recovered from the 80 % interval
       at the horizon end (the wider side when a bound was clipped at 0).
@@ -1520,40 +1843,24 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
       it rose to it by more than the noise threshold used for ``direction``
       (checked on the forecast and on its seasonally adjusted version).
     * ``future_phase`` from the current lifecycle phase + direction (+ size of
-      the change); ``confidence`` from ``forecast.skill``, the sample size and
-      the relative width of the 80 % band (see :func:`_confidence`).
+      the change); ``'volatile'`` is kept, and a ``'flat'`` outlook keeps the
+      current phase unless the base case itself moves by at most 2 % with a
+      confidence above ``'low'`` and an 80 % half-width of at most 25 % of the
+      level (see :func:`_future_phase`); ``confidence`` from
+      ``forecast.skill``, the sample size and the relative width of the 80 %
+      band (see :func:`_confidence`).
     """
-    y_all = np.asarray(analysis.series.to_numpy(dtype=float))
-    finite = np.isfinite(y_all)
-    y = y_all[finite]
+    lv_, seas_fut = _levels(analysis, forecast)
+    y = np.asarray(analysis.series.to_numpy(dtype=float))
+    y = y[np.isfinite(y)]
     n = len(y)
     m = max(1, int(analysis.season_length))
     fm = np.asarray(forecast.mean.to_numpy(dtype=float))
-    H = len(fm)
-    if n == 0 or H == 0:
-        raise ValueError("analysis series and forecast must be non-empty")
-
-    k_cur, k_fut = min(m, n), min(m, H)
-    current = float(np.mean(y[-k_cur:]))
-    future = float(np.mean(fm[-k_fut:]))
-    seas, p = _seasonal_component(analysis)
-    # the analysis' seasonal pattern carried forward, scaled by how much of it the
-    # forecast actually contains (0 if the chosen models forecast no seasonality)
-    seas_fut = _future_seasonal(analysis, H)
-    seas_fut = _seasonal_share(fm, seas_fut, p) * seas_fut
-    if seas is not None:
-        # compare like with like: remove the seasonal effect of partial-season windows
-        if k_fut % p:
-            future -= float(np.mean(seas_fut[-k_fut:]))
-        if k_cur % p:
-            current -= float(np.mean(seas[finite][-k_cur:]))
+    current, future = lv_.current, lv_.future
     diff = future - current
-    ref = float(np.mean(np.abs(y)))
-    mostly_zero = bool(np.all(y >= 0) and np.mean(y[-k_cur:] == 0) >= 0.5)
-    if abs(current) > 1e-6 * max(ref, 1e-300) and not mostly_zero:
-        expected_change_pct: Optional[float] = float(diff / abs(current) * 100.0)
-    else:
-        expected_change_pct = None
+    expected_change_pct: Optional[float] = None
+    if lv_.undefined is None:
+        expected_change_pct = float(diff / abs(current) * 100.0)
 
     # uncertainty from the (closest to) 80 % interval
     lv = _interval_level(forecast, 80)
@@ -1604,8 +1911,12 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
             rel_width = (_level_z(80) * sigma_h) / level_ref
     confidence = _confidence(getattr(forecast, "skill", None), forecast.backtest_mase, n, m,
                              rel_width)
+    # a flat forecast projects the end of the current move only when it is flat in itself and
+    # precise enough to tell a continuing move from a stop
+    settled = (abs(diff) <= _FLAT_POINT_FRAC * abs(current) and confidence != "low"
+               and (rel_width is None or rel_width <= _CONF_WIDTH_MEDIUM))
     future_phase = _future_phase(analysis.phase.label, direction, strong, expected_change_pct,
-                                 confidence)
+                                 confidence, settled)
     return Outlook(direction=direction, expected_change_pct=expected_change_pct,
                    prob_increase=prob_increase, scenarios=scenarios,
                    forecast_peak_date=peak_date, future_phase=future_phase,

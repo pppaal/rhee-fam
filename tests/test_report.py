@@ -478,8 +478,11 @@ def test_compare_page_ships_chart_styles():
 
 
 def test_probability_formatting_near_bounds():
-    assert R._fmt_prob(0.997) == ">99%" and R._fmt_prob(1.0) == "100%"
-    assert R._fmt_prob(0.001) == "<1%" and R._fmt_prob(0.0) == "0%"
+    # Exactly 1.0 / 0.0 used to print '100%' / '0%'.  They are model estimates (forecast
+    # returns exactly 1.0 e.g. for daily breakout), never certainty, and the narrative
+    # (narrative.format_prob) prints '>99%' / '<1%' for them: the report now does the same.
+    assert R._fmt_prob(0.997) == ">99%" and R._fmt_prob(1.0) == ">99%"
+    assert R._fmt_prob(0.001) == "<1%" and R._fmt_prob(0.0) == "<1%"
     assert R._fmt_prob(None) == "—" and R._fmt_prob(float("nan")) == "—"
 
 
@@ -1028,3 +1031,418 @@ def test_leaderboard_model_names_break_only_at_separators(fake_report):
     assert re.search(r"\.mname\{[^}]*overflow-wrap:break-word", html_text)
     assert not re.search(r"\.mname\{[^}]*anywhere", html_text)
     assert '<th class="num hide-sm">sMAPE</th>' in html_text
+
+
+# --------------------------------------------------------------------------- round 3 regressions
+
+
+def test_probabilities_never_read_as_certain_anywhere(fake_report):
+    """Exactly 1.0 / 0.0 (daily breakout, yearly growing n=8) must read like the narrative."""
+    from trendai.narrative import format_prob
+
+    for p, shown, never in ((1.0, ">99%", "100%"), (0.0, "<1%", None)):
+        fake_report.outlook.prob_increase = p
+        html_text = R.render_html(fake_report)
+        text = R.render_text(fake_report, width=100)
+        cmp_html = R.render_compare_html([fake_report], _ranking([fake_report]))
+        assert R._fmt_prob(p) == format_prob(p) == shown
+        assert f"<span>{R._esc(shown)}</span>" in html_text                    # KPI tile
+        assert f"상승 확률 {R._esc(shown)}" in html_text                         # outlook card
+        assert f"상승 확률 {shown}" in text
+        assert f'<td class="num hide-sm">{R._esc(shown)}</td>' in cmp_html     # ranking row
+        visible = re.sub(r"<[^>]+>", " ", re.sub(r"<style>.*?</style>", "", html_text + cmp_html, flags=re.S))
+        if never:
+            assert never not in visible + text
+        assert not re.search(r"상승 확률\s+(0|100)%", visible + text)
+
+
+def _seasonal_report(horizon: int = 6, seasonal_strength: float = 0.96) -> TrendReport:
+    """Flat monthly series with a +-10 seasonal swing that ends in its low season."""
+    n = 120
+    t = np.arange(n)
+    seas = 10 * np.sin(2 * np.pi * t / 12)
+    trend = np.linspace(50.6, 50.0, n)                       # trend 1.2% below its own high
+    rep = build_report(trend + seas, freq="M", horizon=horizon)
+    s = rep.analysis.series
+    rep.analysis.season_length = 12
+    rep.analysis.decomposition = Decomposition(trend=pd.Series(trend, index=s.index),
+                                               seasonal=pd.Series(seas, index=s.index),
+                                               resid=pd.Series(np.zeros(n), index=s.index), period=12)
+    m = rep.analysis.metrics
+    m.seasonal_strength = seasonal_strength
+    i_pk = int(np.argmax(s.to_numpy()))
+    m.peak_value, m.peak_date = float(s.iloc[i_pk]), s.index[i_pk]
+    m.drawdown_pct = float((s.iloc[-1] - s.iloc[i_pk]) / s.iloc[i_pk] * 100)   # a seasonal low, ~ -25 %
+    # forecast: the seasonal pattern continues; scenarios are horizon-end values
+    k = np.arange(n, n + horizon)
+    mean = pd.Series(50.0 + 10 * np.sin(2 * np.pi * k / 12), index=rep.forecast.mean.index)
+    sd = np.sqrt(np.arange(1, horizon + 1))
+    rep.forecast.mean = mean
+    rep.forecast.lower = {80: mean - 1.28 * sd, 95: mean - 1.96 * sd}
+    rep.forecast.upper = {80: mean + 1.28 * sd, 95: mean + 1.96 * sd}
+    rep.outlook.scenarios = {"pessimistic": float(rep.forecast.lower[80].iloc[-1]), "base": float(mean.iloc[-1]),
+                             "optimistic": float(rep.forecast.upper[80].iloc[-1])}
+    rep.outlook.prob_increase, rep.outlook.expected_change_pct = 0.53, 0.4
+    return rep
+
+
+def test_seasonal_drawdown_is_shown_on_the_trend():
+    rep = _seasonal_report()
+    assert rep.analysis.metrics.drawdown_pct < -20                      # raw: measured from a seasonal high
+    html_text = R.render_html(rep)
+    assert "추세 고점 대비 −1.2%" in html_text
+    assert "최고점 대비 −2" not in html_text
+    rep.analysis.decomposition.trend.iloc[-1] = 50.6                   # trend back at its high
+    assert "추세 최고 수준" in R.render_html(rep)
+    # weak seasonality: the observation-based drawdown is kept
+    weak = _seasonal_report(seasonal_strength=0.2)
+    dd = R._fmt_pct(weak.analysis.metrics.drawdown_pct)
+    assert f"최고점 대비 {dd}" in R.render_html(weak) and "추세 고점" not in R.render_html(weak)
+
+
+def test_outlook_labels_say_what_each_number_is():
+    rep = _seasonal_report(horizon=6)
+    html_text = R.render_html(rep)
+    card = re.search(r"<h2>미래 전망</h2>.*?</section>", html_text).group(0)
+    # the probability compares the same two season means as the expected change (the 6-month
+    # forecast window covers half a season, so compute_outlook removes its seasonal effect: UX-17)
+    basis = "계절 보정한 향후 6개월 평균이 최근 12개월 평균보다 높을 확률"
+    assert basis in html_text                                            # KPI tile
+    assert f'title="{basis}">상승 확률 53%' in card                      # next to the expected change
+    assert "변화율과 상승 확률은 모두 계절 보정한 향후 6개월 평균을 최근 12개월 평균과 비교한 값입니다" in card
+    # ... and is no longer listed right under the horizon-end scenarios
+    assert "<dt>상승 확률</dt>" not in card
+    # scenarios: single horizon-end values, compared with the same point of the seasonal cycle
+    assert "시나리오 (2030-06 시점 값)" in card
+    assert "현재 수준" not in html_text                                   # the old season-mean tick
+    assert "2029-06 실제 55.0" in card
+    assert "세로선은 같은 계절 시점인 2029-06의 실제값입니다" in card
+    # the tick sits at the observed same-month value (55), next to the base scenario (55)
+    tick = float(re.search(r'class="rc" style="left:([\d.]+)%"', card).group(1))
+    base = float(re.search(r'class="rm" style="left:([\d.]+)%"', card).group(1))
+    assert abs(tick - base) < 1.0
+    text = R.render_text(rep, width=100)
+    assert "상승 확률 53% (같은 기준)" in text
+    assert "시나리오(2030-06 시점)" in text and "(비교: 2029-06 실제 55.0)" in text
+    # without a noticeable seasonal pattern the latest observation is the reference
+    flat = build_report(np.linspace(10, 20, 36), slope=0.5)
+    card = re.search(r"<h2>미래 전망</h2>.*?</section>", R.render_html(flat)).group(0)
+    assert "현재 20.0" in card and "세로선은 현재 값(2022-12)입니다" in card
+    assert "(비교: 현재 20.0)" in R.render_text(flat, width=100)
+    _assert_balanced(html_text)
+
+
+def _spike_report(flag: bool = True) -> TrendReport:
+    vals = 50 + 5 * np.sin(np.arange(60) / 3.0)
+    vals[30] = 90.0
+    rep = build_report(vals, freq="M")
+    s = rep.analysis.series
+    m = rep.analysis.metrics
+    rest = s.drop(s.index[30])
+    m.peak_value, m.peak_date = float(rest.max()), rest.idxmax()        # analysis ignores the spike
+    m.drawdown_pct = float((s.iloc[-1] - rest.max()) / rest.max() * 100)
+    rep.analysis.anomalies = ([Anomaly(date=s.index[30], index=30, value=90.0, expected=50.0, zscore=6.0)]
+                              if flag else [])
+    return rep
+
+
+def test_peak_mentions_an_excluded_one_off_spike():
+    rep = _spike_report()
+    html_text = R.render_html(rep)
+    assert "일회성 급등 90.0(2022-07) 제외" in html_text                  # diagnosis card
+    assert f"최고점 대비 {R._fmt_pct(rep.analysis.metrics.drawdown_pct)} (일회성 급등 제외)" in html_text
+    _assert_balanced(html_text)
+    # without a flagged spike there is nothing to explain
+    plain = R.render_html(_spike_report(flag=False))
+    assert "일회성 급등" not in plain
+
+
+def test_method_note_names_the_decomposition_that_was_used():
+    n = 72
+    t = np.arange(n)
+    trend = 100 * np.exp(0.02 * t)
+    seas = trend * (np.exp(0.2 * np.sin(2 * np.pi * t / 12)) - 1)       # swing grows with the level
+    rep = build_report(trend + seas, freq="M")
+    s = rep.analysis.series
+    rep.analysis.decomposition = Decomposition(trend=pd.Series(trend, index=s.index),
+                                               seasonal=pd.Series(seas, index=s.index),
+                                               resid=pd.Series(np.zeros(n), index=s.index), period=12)
+    notes = re.search(r"<h2>분석 방법</h2>.*?</section>", R.render_html(rep)).group(0)
+    assert "로그 공간에서 승법 분해" in notes and "가법" not in notes
+    add = _seasonal_report()
+    notes = re.search(r"<h2>분석 방법</h2>.*?</section>", R.render_html(add)).group(0)
+    assert "강건한 가법 분해(STL 유사)" in notes and "승법" not in notes
+    # the interval note matches forecast.py (t quantiles from the method's backtest errors)
+    assert "경험적 분포" not in notes and "t-분포" in notes
+    none = re.search(r"<h2>분석 방법</h2>.*?</section>", R.render_html(build_report(np.arange(12.0)))).group(0)
+    assert "계절 성분 없이" in none and "가법 분해" not in none
+
+
+def test_compare_links_are_safe_and_escaped():
+    reports = [build_report(np.arange(12.0), name="a"), build_report(np.arange(12.0)[::-1], name="검색 량"),
+               build_report(np.arange(12.0), name="evil"), build_report(np.arange(12.0), name="tab")]
+    ranking = _ranking(reports)
+    links = {"a": "cmp_a.html?x=1&y=\"2\"", "검색 량": "cmp_검색 량.html",
+             "evil": "javascript:alert(1)", "tab": "java\tscript:alert(1)"}
+    html_text = R.render_compare_html(reports, ranking, links=links)
+    # card title and ranking name, escaped
+    assert html_text.count('<a href="cmp_a.html?x=1&amp;y=%222%22">a</a>') == 2
+    assert html_text.count('<a href="cmp_%EA%B2%80%EC%83%89%20%EB%9F%89.html">검색 량</a>') == 2
+    assert "javascript" not in html_text and "script:" not in html_text
+    assert html_text.count("<a href=") == 4
+    _assert_balanced(html_text)
+    for bad in ("data:text/html,<b>x</b>", " JavaScript:alert(1)", "vbscript:x", "java\nscript:x", "", None):
+        assert R._safe_href(bad) is None, bad
+    for good in ("x.html", "sub/x.html#top", "https://example.com/a?b=1", "http://example.com"):
+        assert R._safe_href(good) == good
+    # links are optional and keep the page unchanged otherwise
+    assert "<a href=" not in R.render_compare_html(reports, ranking)
+
+
+def test_compare_shows_the_span_of_every_change():
+    m = build_report(np.linspace(10, 20, 36), name="월간", horizon=12)
+    d = build_report(np.linspace(10, 20, 120), name="일간", freq="D", horizon=30)
+    ranking = pd.DataFrame([
+        {"name": "일간", "phase": "growing", "momentum": 0.1, "recent_change_pct": 3.0,
+         "expected_change_pct": 23.2, "prob_increase": 0.9, "score": 80.0, "expected_change_ann_pct": 1169.0},
+        {"name": "월간", "phase": "growing", "momentum": 0.2, "recent_change_pct": 8.0,
+         "expected_change_pct": 7.9, "prob_increase": 0.8, "score": 60.0, "expected_change_ann_pct": 7.9},
+    ])
+    html_text = R.render_compare_html([m, d], ranking)
+    table = re.search(r"<table>.*?</table>", html_text).group(0)
+    # raw values, each with its own horizon (never an extrapolated annual rate)
+    assert '+23.2%</span><span class="hz">30일</span>' in table
+    assert '+7.9%</span><span class="hz">12개월</span>' in table
+    assert '+3.0%</span><span class="hz">7일</span>' in table             # recent change: one week
+    assert "1,169" not in html_text
+    assert "주기가 다른 시계열이 섞여 있어" in html_text
+    assert "예측 변화 <span class=\"nw\">(30일)</span>" in html_text      # card label
+    # a shared span goes to the header once
+    m2 = build_report(np.linspace(20, 10, 36), name="월간2", horizon=12)
+    rk = pd.DataFrame([{"name": "월간", "expected_change_pct": 7.9, "score": 60.0},
+                       {"name": "월간2", "expected_change_pct": -3.0, "score": 40.0}])
+    html_text = R.render_compare_html([m, m2], rk)
+    table = re.search(r"<table>.*?</table>", html_text).group(0)
+    assert '예측 변화</abbr><span class="hz">(12개월)</span>' in table
+    assert '<span class="hz">12개월</span>' not in table
+    assert "주기가 다른 시계열" not in html_text
+    # the probability header says what it compares
+    assert "예측 변화와 같은 기준" in table
+
+
+# --------------------------------------------------------------------------- final-round regressions
+
+
+def test_reversal_labels_follow_the_slope_before():
+    """UX-13: 'reversal_up' from a flat stretch is a turn upwards, not a reversal -- same rule
+    (and wording) as narrative._changepoint_line, in the chart, the table and the terminal."""
+    rep = build_report(np.linspace(10, 60, 60), slope=0.5, changepoints=True)
+    cp = rep.analysis.changepoints[0]
+
+    def outputs() -> str:
+        return R.svg_chart(rep) + R.render_html(rep) + R.render_text(rep, width=100)
+
+    cp.kind, cp.slope_before, cp.slope_after = "reversal_up", 0.17, 16.6       # flat -> rising
+    out = outputs()
+    assert "횡보→상승 전환" in out and "반전" not in out
+    cp.slope_before, cp.slope_after = -0.5, 0.7                                # falling -> rising
+    out = outputs()
+    assert "하락→상승 반전" in out and "횡보" not in out
+    cp.kind, cp.slope_before, cp.slope_after = "reversal_down", 2.0, -1.0      # rising -> falling
+    out = outputs()
+    assert "상승→하락 반전" in out and "횡보" not in out
+    cp.slope_before = 0.05                                                     # flat -> falling
+    out = outputs()
+    assert "횡보→하락 전환" in out and "반전" not in out
+    assert re.search(r'background:#d03b3b"></span>횡보→하락 전환', R.render_html(rep))
+    cp.slope_before = float("nan")                                             # unknown: plain label
+    assert "하락 반전" in R.render_text(rep, width=100)
+
+
+def test_reversal_label_matches_the_narrative_end_to_end():
+    from trendai.pipeline import run
+    from trendai.samples import sample
+
+    rep = run(sample("emerging", n=12, freq="Y", seed=0), name="emerging")
+    ups = [cp for cp in rep.analysis.changepoints if cp.kind == "reversal_up"]
+    assert ups, "the repro needs a reversal_up changepoint"
+    text = R.render_text(rep, width=100)
+    for cp in ups:
+        flat = cp.slope_before >= -0.1 * max(abs(cp.slope_before), abs(cp.slope_after))
+        label, narr = ("횡보→상승 전환", "횡보에서 상승으로 전환") if flat else ("하락→상승 반전", "하락에서 상승으로 반전")
+        assert f"{R._fmt_date(cp.date, 'Y')} {label}" in text and narr in rep.narrative
+
+
+def test_hover_titles_do_not_repeat_the_row_label(fake_report):
+    """UX-15: the native tooltip read '2026-01 · 예측 예측 70.9, 80% …'."""
+    svg = R.svg_chart(fake_report)
+    titles = re.findall(r'<rect class="tai-hit"[^>]*><title>([^<]*)</title>', svg)
+    assert titles and not any("예측 예측" in t for t in titles)
+    fc_titles = [t for t in titles if t.startswith(("2026", "2027"))]
+    assert fc_titles and all(re.match(r"\d{4}-\d{2} 예측 \S+, 80% \S+ ~ \S+, 95% ", t) for t in fc_titles)
+    assert any(re.match(r"\d{4}-\d{2} 실제 \S+, 추세 \S+", t) for t in titles)
+    # the visible read-out box keeps marking the forecast dates
+    assert re.search(r'font-weight="600">\d{4}-\d{2} · 예측</text>', svg)
+
+
+def test_partial_season_windows_are_labelled_seasonally_adjusted():
+    """UX-17: compute_outlook removes the average seasonal effect of a window that is not a whole
+    number of seasons (6 of 12 months here, 26 of 52 weeks by default); the labels say so."""
+    rep = _seasonal_report(horizon=6)
+    text, html_text = R.render_text(rep, width=120), R.render_html(rep)
+    assert "예측 변화 +0.4% (계절 보정한 향후 6개월 평균, 최근 12개월 평균 대비)" in text
+    assert "계절 보정한 향후 6개월 평균 · <span class=\"nw\">최근 12개월 평균 대비</span>" in html_text  # KPI
+    assert "계절 보정한 향후 6개월 평균이 최근 12개월 평균보다 높을 확률" in html_text
+    card = re.search(r"<h2>미래 전망</h2>.*?</section>", html_text).group(0)
+    assert "6개월 구간은 계절 주기(12개월)를 다 채우지 못해" in card
+    # whole seasons, or no seasonal component: plain means, no adjustment mentioned
+    whole = _seasonal_report(horizon=12)
+    assert "계절 보정" not in R.render_text(whole, width=120) + R.render_html(whole)
+    plain = build_report(np.linspace(10, 20, 36), horizon=6)
+    plain.analysis.season_length = 12
+    assert "계절 보정" not in R.render_text(plain, width=120) + R.render_html(plain)
+
+
+def test_weekly_kpi_label_matches_the_narratives_adjustment():
+    from trendai.pipeline import run
+    from trendai.samples import sample
+
+    rep = run(sample("growing", n=156, freq="W", seed=0), name="growing")
+    assert "계절 효과를 보정한 향후 26주 예측 평균" in rep.narrative
+    assert "계절 보정한 향후 26주 평균" in R.render_text(rep, width=120)
+    assert "계절 보정한 향후 26주 평균" in R.render_html(rep)
+
+
+def test_drawdown_tile_uses_the_narratives_rule():
+    """UX-18: the tile switches to the trend drawdown only when the narrative does
+    (seasonal strength >= 0.5 *and* the two drawdowns differ by >= 5 points)."""
+    rep = _seasonal_report()
+    s, trend = rep.analysis.series, rep.analysis.decomposition.trend
+    m = rep.analysis.metrics
+    # raw drawdown within 5 points of the trend's (-1.2 %): the observation basis is kept
+    m.drawdown_pct = -4.0
+    html_text = R.render_html(rep)
+    assert "최고점 대비 −4.0%" in html_text and "추세 고점" not in html_text
+    m.drawdown_pct = -6.5                                                # 5.3 points apart
+    assert "추세 고점 대비 −1.2%" in R.render_html(rep)
+    assert len(s) == len(trend)
+
+
+@pytest.mark.parametrize("name,freq,n", [("reviving", "Q", 40), ("declining", "M", 120),
+                                          ("seasonal", "M", 120), ("fad", "M", 120)])
+def test_drawdown_tile_agrees_with_the_narrative_end_to_end(name, freq, n):
+    from trendai.pipeline import run
+    from trendai.samples import sample
+
+    rep = run(sample(name, n=n, freq=freq, seed=0), name=name)
+    tile = re.search(r'<div class="lbl">현재 값</div>.*?<div class="sub">(.*?)</div>', R.render_html(rep)).group(1)
+    trend_basis = "계절 요인을 뺀 추세선" in rep.narrative          # narrative._seasonal_drawdown applied
+    assert ("추세 " in tile) == trend_basis, (tile, rep.narrative)
+    if not trend_basis and "최고점 대비" in tile:
+        gap = R._fmt_pct(abs(rep.analysis.metrics.drawdown_pct), signed=False)
+        assert gap in rep.narrative                                      # same number in both places
+
+
+def _huge_report(scale: float) -> TrendReport:
+    import warnings
+
+    base = 100 + 10 * np.sin(np.arange(48) / 3) + np.arange(48)
+    with warnings.catch_warnings():          # the builder's own sums overflow (metrics.mean): not report code
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return build_report(base * scale, slope=scale, anomalies=True, changepoints=True)
+
+
+@pytest.mark.parametrize("scale", [1e300, -1e300, 1e306, -1.1e306, 1e250])
+def test_charts_render_beyond_1e300(scale):
+    """F8: |y| > 1e300 crashed _nice_ticks (math domain error) and values above 1e300 fell off
+    the axis; tick labels of huge values printed hundreds of digits."""
+    rep = _huge_report(scale)
+    html_text = R.render_html(rep)
+    _assert_balanced(html_text)
+    for w, h in ((960, 380), (600, 360), (380, 340)):
+        svg = R.svg_chart(rep, w, h)
+        ET.fromstring(svg)
+        ticks = _y_ticks(svg)
+        labels = [lab for _, lab in ticks]
+        assert 4 <= len(ticks) <= 6 and len(set(labels)) == len(labels)
+        assert all(len(lab) <= 9 for lab in labels), labels
+        vals = sorted(_tick_value(lab) for lab in labels)
+        data = rep.analysis.series.to_numpy()
+        assert vals[0] <= data.min() * (1 + 1e-9 * np.sign(data.min())) and vals[-1] >= data.max() * (1 - 1e-9 * np.sign(data.max()))
+        assert "inf" not in svg and "nan" not in svg
+    R.render_text(rep)
+    R.render_compare_html([rep], _ranking([rep]))
+
+
+def test_axis_spanning_the_whole_float_range_renders():
+    import warnings
+
+    vals = np.concatenate([np.linspace(-1.5e308, 0, 20), np.linspace(0, 1.5e308, 20)])
+    with warnings.catch_warnings():          # the builder's own sums overflow: not report code
+        warnings.simplefilter("ignore", RuntimeWarning)
+        rep = build_report(vals, slope=1e306)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                      # no overflow on the way either
+        svg = R.svg_chart(rep)
+        R.render_html(rep), R.render_text(rep), R._mini_chart(rep)
+    ET.fromstring(svg)
+    vals_t = sorted(_tick_value(lab) for _, lab in _y_ticks(svg))
+    assert vals_t[0] <= -1.5e308 and vals_t[-1] >= 1.5e308
+    ys = [float(v) for v in re.findall(r'<path class="tai-hist" d="M[\d.]+,([\d.]+)', svg)]
+    assert ys and "inf" not in svg and "nan" not in svg
+
+
+def test_nice_ticks_cover_any_finite_range():
+    for lo, hi in [(1e301, 2e301), (1e300, 1.6e308), (-1.6e308, -1e305), (1.2e308, 1.5e308),
+                   (1.79e308, 1.797e308), (-1e308, 1e308), (1.7e308, 1.7e308), (-1.79e308, 1.79e308)]:
+        t = R._nice_ticks(lo, hi)
+        assert 2 <= len(t) <= 6 and all(math.isfinite(v) for v in t), (lo, hi, t)
+        assert t[0] <= lo * (1 + 1e-12 * np.sign(lo)) and t[-1] >= hi * (1 - 1e-12 * np.sign(hi)), (lo, hi, t)
+        assert t == sorted(t) and len(set(t)) == len(t)
+        labels = R._axis_labels(t)
+        assert len(set(labels)) == len(labels) and all(len(lab) <= 12 for lab in labels), labels
+    assert R._axis_labels([0, 5e15, 1e16, 1.5e16]) == ["0", "5e15", "1e16", "1.5e16"]
+    assert R._axis_labels([1.0e300, 1.25e300, 1.5e300, 1.75e300]) == ["1e300", "1.25e300", "1.5e300", "1.75e300"]
+    assert R._fmt_axis_value(1.234e300, 2e300) == "1.23e300"
+
+
+def test_english_narrative_reasons_are_not_repeated_in_korean():
+    """UX-20: on --lang en pages the diagnosis card repeated the 'Evidence:' bullets in Korean."""
+    from trendai.narrative import translate_reason
+    from trendai.pipeline import run
+    from trendai.samples import sample
+
+    rep = run(sample("fad", seed=0), name="fad", lang="en")
+    reasons = [r for r in rep.analysis.phase.reasons if translate_reason(r)]
+    assert reasons and all(f"Evidence: {translate_reason(r)}" in rep.narrative for r in reasons)
+    card = re.search(r"<h2>현재 진단</h2>.*?</section>", R.render_html(rep)).group(0)
+    assert not any(R._esc(r) in card for r in reasons)
+    assert "판단 근거는 ‘AI 트렌드 해석’" in card
+
+
+def test_leaderboard_fits_phone_width(fake_report):
+    """UX-20: on phones the weight bar is hidden (the % stays) so model names get the width."""
+    html_text = R.render_html(fake_report)
+    phone = re.search(r"@media \(max-width:640px\)\{(.*?)\n\}", html_text, flags=re.S).group(1)
+    assert ".wcell .track{display:none}" in phone
+    assert re.search(r'<td class="wcell"><div class="wbar"><div class="track">.*?<span class="pct">50%</span>', html_text)
+    assert '<th><span class="hide-sm">앙상블 </span>가중치</th>' in html_text
+
+
+def test_intermittent_models_are_labelled():
+    """forecast ranks intermittent-demand candidates (offered 'sba') by RMSE: say so."""
+    assert R._model_desc("sba") and R._model_desc("drift@log").endswith("(로그 공간)")
+    vals = np.where(np.arange(48) % 3 == 0, 5.0, 0.0)
+    rep = build_report(vals)
+    rep.forecast.model_scores = [ModelScore("theta", 2.0, 2.3, 150.0, 0.80, 0.33),
+                                 ModelScore("ses", 2.1, 2.2, 150.0, 0.84, 0.34),
+                                 ModelScore("sba", 2.2, 2.28, 150.0, 0.91, 0.33),
+                                 ModelScore("holt_damped", 2.3, 2.34, 150.0, 0.93, 0.0)]
+    html_text = R.render_html(rep)
+    assert "간헐 수요 Croston(SBA 보정)" in html_text
+    assert "제곱 오차(RMSE)" in html_text
+    text = R.render_text(rep, width=100)
+    assert "상위 모델(RMSE):  ses 2.20  sba 2.28  theta 2.30" in text
+    # ordinary series: unchanged
+    plain = build_report(np.linspace(10, 20, 36))
+    assert "RMSE" not in R.render_html(plain) + R.render_text(plain, width=100)

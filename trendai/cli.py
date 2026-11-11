@@ -13,7 +13,9 @@ Examples::
 
 Exit codes: 0 success, 1 runtime failure (network, Claude, unexpected error),
 2 input error (bad file / data / arguments).  Data notes and warnings are
-printed to stderr as single ``안내:`` / ``경고:`` lines.
+printed to stderr as single ``안내:`` / ``경고:`` lines (the CLI's own notes and
+errors follow ``--lang``: ``Note:`` / ``Error:``).  ``--json`` is written before
+``--html``, so a rendering problem never loses the JSON result.
 """
 
 from __future__ import annotations
@@ -35,41 +37,74 @@ from .types import TrendReport
 
 FREQ_CHOICES = ["D", "W", "M", "Q", "Y"]
 
-# CLI chrome per language (the terminal summary and the HTML reports are Korean).
+# CLI chrome per language (the terminal summary and the HTML reports are Korean).  Messages
+# that quote the data module (DataError / DataWarning texts) keep its Korean wording.
 _MSG: dict[str, dict[str, str]] = {
     "ko": {
         "synthetic": "※ 합성(가상) 샘플 데이터입니다 — 실제 데이터가 아닙니다.",
-        "rank_title": "■ 상승 트렌드 순위 (rising score: 50=중립, 높을수록 강한 상승 전망)",
-        "rank_cols": "예상변화(연환산)",
+        "rank_title": "■ 상승 트렌드 순위 (상승 점수: 50=중립, 높을수록 강한 상승 전망)",
+        "rank_cols": "예측 변화",
+        "rank_span": "기간",
         "rank_prob": "상승확률",
         "rank_score": "점수",
-        "mixed_freq": "※ 주기가 다른 시계열이 섞여 있어 변화율을 연환산·월 기준으로 맞춰 점수를 매겼습니다.",
+        "mixed_freq": ("※ 주기가 다른 시계열이 섞여 있어, 점수는 변화율을 연 단위(모멘텀은 월 단위)로 환산해 "
+                       "매겼습니다. 예측 변화는 각 시계열의 기간 기준입니다."),
+        "rank_basis": "※ 예측 변화와 상승확률은 예측 마지막 한 주기의 평균을 최근 한 주기의 평균과 비교한 값입니다.",
         "narr_hidden": ("※ 시계열이 여러 개라 개별 해석문은 생략했습니다 — HTML(--html)·JSON(--json) "
                         "리포트 또는 --value-col 로 하나씩 실행해 확인하세요."),
         "html_one": "HTML 리포트 저장: {path}",
         "html_many": "HTML 비교 리포트 저장: {path} (+ 개별 리포트 {n}개)",
         "json": "JSON 저장: {path}",
         "none_ok": "오류: 분석에 성공한 시계열이 없습니다.",
+        "columns": "안내: {file} — 날짜 열 '{date_col}' (형식: {date_format}), 값 열 {n}개: {names}",
+        "first_col": "안내: 여러 열 중 첫 번째 열 '{name}'만 사용합니다 (--value-col 로 지정 가능).",
+        "ask_failed": "오류: Claude에 질문할 수 없습니다 — {exc}",
+        "error": "오류: {exc}",
+        "unknown_sample": "오류: 알 수 없는 샘플 {bad}. 사용 가능: {names}",
+        "no_series": "오류: 비교할 시계열이 없습니다 (파일 또는 --samples 지정).",
+        "save_failed": "오류: 파일을 저장할 수 없습니다 — {exc}",
+        "data_error": "데이터 오류: {exc}",
+        "not_found": "파일 없음: {exc}",
+        "interrupted": "중단되었습니다.",
+        "unexpected": ("오류: 예기치 못한 문제가 발생했습니다 ({kind}: {exc}). "
+                       "자세한 내용은 TRENDAI_DEBUG=1 로 다시 실행해 확인하세요."),
     },
     "en": {
         "synthetic": "※ Synthetic sample data — not real data.",
         "rank_title": "■ Rising-trend ranking (rising score: 50 = neutral, higher = stronger expected rise)",
-        "rank_cols": "Exp. change/yr",
+        "rank_cols": "Exp. change",
+        "rank_span": "Horizon",
         "rank_prob": "P(up)",
         "rank_score": "Score",
-        "mixed_freq": "※ Series of different frequencies: changes were annualised (momentum per month) before scoring.",
+        "mixed_freq": ("※ Series of different frequencies: changes were annualised (momentum per month) before "
+                       "scoring. Expected changes are shown over each series' own horizon."),
+        "rank_basis": ("※ Exp. change and P(up) compare the mean of the last forecast cycle with the mean "
+                       "of the last observed cycle."),
         "narr_hidden": ("※ Several series: individual narratives are not printed — see the HTML (--html) / "
                         "JSON (--json) output or run one column at a time with --value-col."),
         "html_one": "HTML report saved: {path}",
         "html_many": "HTML comparison saved: {path} (+ {n} individual reports)",
         "json": "JSON saved: {path}",
         "none_ok": "Error: no series could be analysed.",
+        "columns": "Note: {file} — date column '{date_col}' (format: {date_format}), {n} value columns: {names}",
+        "first_col": "Note: using only the first column '{name}' of several (choose one with --value-col).",
+        "ask_failed": "Error: cannot ask Claude — {exc}",
+        "error": "Error: {exc}",
+        "unknown_sample": "Error: unknown sample {bad}. Available: {names}",
+        "no_series": "Error: nothing to compare (give files or --samples).",
+        "save_failed": "Error: cannot save the file — {exc}",
+        "data_error": "Data error: {exc}",
+        "not_found": "File not found: {exc}",
+        "interrupted": "Interrupted.",
+        "unexpected": ("Error: unexpected problem ({kind}: {exc}). "
+                       "Run again with TRENDAI_DEBUG=1 for details."),
     },
 }
 
 
-def _t(args: argparse.Namespace, key: str, **kw: Any) -> str:
-    lang = getattr(args, "lang", "ko")
+def _t(args: Any, key: str, **kw: Any) -> str:
+    """Message ``key`` in the language of ``args.lang`` (or ``args`` itself when it is a language code)."""
+    lang = args if isinstance(args, str) else getattr(args, "lang", "ko")
     return _MSG.get(lang, _MSG["ko"])[key].format(**kw)
 
 
@@ -234,36 +269,64 @@ def _fmt_pct(x: Any) -> str:
 
 
 def _fmt_prob(p: Any) -> str:
-    """Probability as a whole percentage; ``>99%`` / ``<1%`` near (but not at) the bounds."""
+    """Probability as a whole percentage, the same text as the reports and the narrative
+    (``>99%`` / ``<1%`` at and near the bounds, exactly 1.0 / 0.0 included; ``—`` when missing)."""
+    from .report import _fmt_prob as fmt
+
+    return fmt(p)
+
+
+# forecast-horizon units per language ("12개월" / "12 mo")
+_SPAN_UNIT: dict[str, dict[str, str]] = {
+    "ko": {"D": "일", "W": "주", "M": "개월", "Q": "분기", "Y": "년"},
+    "en": {"D": " d", "W": " wk", "M": " mo", "Q": " qtr", "Y": " yr"},
+}
+
+
+def _span(h: Any, freq: Any, lang: str) -> str:
+    """Forecast horizon as text (``12개월``, ``30일`` / ``12 mo``); ``''`` when unknown."""
     try:
-        v = float(p)
+        k = int(h)
     except (TypeError, ValueError):
-        return "—"
-    if v != v:
-        return "—"
-    v = min(1.0, max(0.0, v))
-    if 0.995 <= v < 1.0:
-        return ">99%"
-    if 0.0 < v < 0.005:
-        return "<1%"
-    return f"{v * 100:.0f}%"
+        return ""
+    if k <= 0:
+        return ""
+    units = _SPAN_UNIT.get(lang, _SPAN_UNIT["ko"])
+    return f"{k:,}{units.get(str(freq), '')}"
 
 
-def _format_ranking(df: pd.DataFrame, lang: str = "ko") -> str:
-    """Ranking table aligned by display width (Korean names/phases count double)."""
+def _format_ranking(df: pd.DataFrame, lang: str = "ko",
+                    horizons: Optional[dict[str, int]] = None) -> str:
+    """Ranking table aligned by display width (Korean names/phases count double).
+
+    The expected change is shown as reported (``expected_change_pct``), always
+    with its forecast horizon: in the header when every series shares it
+    (``예측 변화(12개월)``), otherwise in a ``기간`` column next to the value, so a
+    30-day change of a daily series is never read as a 12-month one.
+    ``horizons`` maps a series name to its number of forecast steps.
+    """
     msg = _MSG.get(lang, _MSG["ko"])
-    exp_col = "expected_change_ann_pct" if "expected_change_ann_pct" in df.columns else "expected_change_pct"
+    horizons = horizons or {}
     names = [str(n) for n in df["name"]]
+    freqs = list(df["freq"]) if "freq" in df.columns else [None] * len(names)
+    spans = [_span(horizons.get(nm), fq, lang) for nm, fq in zip(names, freqs)]
+    shared = spans[0] if spans and len(set(spans)) == 1 else None
     name_w = min(28, max([_dw(n) for n in names] + [4]))
     phases = [str(p) for p in (df["phase_ko"] if lang == "ko" else df["phase"])]
     phase_w = max([_dw(p) for p in phases] + [4])
-    head = (f"  {'#':>3}  {_pad('', name_w)}  {_pad('', phase_w)}  {_pad(msg['rank_cols'], 16, '>')}  "
+    exp_head = f"{msg['rank_cols']}({shared})" if shared else msg["rank_cols"]
+    exps = [_fmt_pct(v) for v in df["expected_change_pct"]]
+    exp_w = max([_dw(exp_head)] + [_dw(e) for e in exps])
+    span_w = 0 if shared is not None else max([_dw(msg["rank_span"])] + [_dw(sp) for sp in spans])
+    span_head = f"  {_pad(msg['rank_span'], span_w)}" if span_w else ""
+    head = (f"  {'#':>3}  {_pad('', name_w)}  {_pad('', phase_w)}  {_pad(exp_head, exp_w, '>')}{span_head}  "
             f"{_pad(msg['rank_prob'], 8, '>')}  {_pad(msg['rank_score'], 6, '>')}")
     lines = ["", msg["rank_title"], head.rstrip()]
-    for (rank, row), nm, ph in zip(df.iterrows(), names, phases):
+    for (rank, row), nm, ph, ex, sp in zip(df.iterrows(), names, phases, exps, spans):
         score = "{:.1f}".format(float(row["score"]))
+        span_cell = f"  {_pad(sp, span_w)}" if span_w else ""
         lines.append(f"  {str(rank) + '.':>3}  {_pad(nm, name_w)}  {_pad(ph, phase_w)}  "
-                     f"{_pad(_fmt_pct(row[exp_col]), 16, '>')}  {_pad(_fmt_prob(row['prob_increase']), 8, '>')}  "
+                     f"{_pad(ex, exp_w, '>')}{span_cell}  {_pad(_fmt_prob(row['prob_increase']), 8, '>')}  "
                      f"{_pad(score, 6, '>')}")
     return "\n".join(lines)
 
@@ -330,12 +393,21 @@ def _emit(reports: dict[str, TrendReport], args: argparse.Namespace, fail_code: 
     ranking = None
     if many:
         ranking = rank_trends(reports)
-        _say(_format_ranking(ranking, getattr(args, "lang", "ko")))
+        horizons = {str(rep.name): len(rep.forecast.mean) for rep in reports.values()}
+        _say(_format_ranking(ranking, getattr(args, "lang", "ko"), horizons))
+        _say(_t(args, "rank_basis"))
         if ranking["freq"].nunique() > 1:
             _say(_t(args, "mixed_freq"))
         if not args.quiet:
             _say(_t(args, "narr_hidden"))
     try:
+        # JSON first: it does not depend on the (much larger) HTML rendering, so a rendering
+        # problem never costs the user the machine-readable result
+        if args.json:
+            out = _ensure_parent(args.json)
+            text = reports_to_json(reports.values()) if many else report_to_json(next(iter(reports.values())))
+            out.write_text(text, encoding="utf-8")
+            _say(_t(args, "json", path=out))
         if args.html:
             out = _ensure_parent(args.html)
             if many:
@@ -352,24 +424,20 @@ def _emit(reports: dict[str, TrendReport], args: argparse.Namespace, fail_code: 
             else:
                 render_html(next(iter(reports.values())), path=out)
                 _say(_t(args, "html_one", path=out))
-        if args.json:
-            out = _ensure_parent(args.json)
-            text = reports_to_json(reports.values()) if many else report_to_json(next(iter(reports.values())))
-            out.write_text(text, encoding="utf-8")
-            _say(_t(args, "json", path=out))
     except OSError as exc:
-        _err(f"오류: 파일을 저장할 수 없습니다 — {exc}")
+        _err(_t(args, "save_failed", exc=exc))
         return 1
     return 0
 
 
-def _load(path: str, date_col: Optional[str], value_cols: Optional[list[str]]) -> dict[str, pd.Series]:
+def _load(path: str, date_col: Optional[str], value_cols: Optional[list[str]],
+          lang: str = "ko") -> dict[str, pd.Series]:
     series = load_table(path, date_col=date_col, value_cols=value_cols)
     info = next(iter(series.values())).attrs.get("trendai", {}) if series else {}
     if info:
         names = ", ".join(list(series)[:6]) + (" …" if len(series) > 6 else "")
-        _err(f"안내: {Path(path).name} — 날짜 열 '{info.get('date_col')}' "
-             f"(형식: {info.get('date_format')}), 값 열 {len(series)}개: {names}")
+        _err(_t(lang, "columns", file=Path(path).name, date_col=info.get("date_col"),
+                date_format=info.get("date_format"), n=len(series), names=names))
     return series
 
 
@@ -377,17 +445,17 @@ def _load(path: str, date_col: Optional[str], value_cols: Optional[list[str]]) -
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
-    series = _load(args.file, args.date_col, args.value_col)
+    series = _load(args.file, args.date_col, args.value_col, args.lang)
     reports, code = _analyse(series, args)
     return _emit(reports, args, fail_code=code)
 
 
-def _check_samples(names: Sequence[str]) -> Optional[str]:
+def _check_samples(names: Sequence[str], lang: str = "ko") -> Optional[str]:
     from .samples import DESCRIPTIONS, list_samples
 
     bad = [nm for nm in names if nm not in DESCRIPTIONS]
     if bad:
-        return f"오류: 알 수 없는 샘플 {', '.join(map(repr, bad))}. 사용 가능: {', '.join(list_samples())}"
+        return _t(lang, "unknown_sample", bad=", ".join(map(repr, bad)), names=", ".join(list_samples()))
     return None
 
 
@@ -395,7 +463,7 @@ def cmd_sample(args: argparse.Namespace) -> int:
     from .samples import list_samples, sample
 
     names = list_samples() if args.name == "all" else [args.name]
-    problem = _check_samples(names)
+    problem = _check_samples(names, args.lang)
     if problem:
         _err(problem)
         return 2
@@ -424,7 +492,7 @@ def cmd_wiki(args: argparse.Namespace) -> int:
             s = fetch_wikipedia_pageviews(article, lang=args.wiki_lang, start=args.start, end=args.end,
                                           granularity=args.granularity)
         except ConnectorError as exc:
-            _err(f"오류: {exc}")
+            _err(_t(args, "error", exc=exc))
             return 1
         series[f"{article} (위키백과 조회수)"] = s
     reports, code = _analyse(series, args)
@@ -439,7 +507,7 @@ def cmd_trends(args: argparse.Namespace) -> int:
         try:
             series[f"{kw} (Google Trends)"] = fetch_google_trends(kw, timeframe=args.timeframe, geo=args.geo)
         except ConnectorError as exc:
-            _err(f"오류: {exc}")
+            _err(_t(args, "error", exc=exc))
             return 1
     reports, code = _analyse(series, args)
     return _emit(reports, args, fail_code=code)
@@ -449,19 +517,19 @@ def cmd_compare(args: argparse.Namespace) -> int:
     from .samples import sample
 
     sample_names = [nm.strip() for nm in (args.samples or "").split(",") if nm.strip()]
-    problem = _check_samples(sample_names)
+    problem = _check_samples(sample_names, args.lang)
     if problem:
         _err(problem)
         return 2
     series: dict[str, pd.Series] = {}
     for f in args.files:
-        for nm, s in _load(f, args.date_col, args.value_col).items():
+        for nm, s in _load(f, args.date_col, args.value_col, args.lang).items():
             key = nm if nm not in series else f"{Path(f).stem}:{nm}"
             series[key] = s
     for nm in sample_names:
         series[nm if nm not in series else f"sample:{nm}"] = sample(nm, freq=args.freq or "M")
     if len(series) < 1:
-        _err("오류: 비교할 시계열이 없습니다 (파일 또는 --samples 지정).")
+        _err(_t(args, "no_series"))
         return 2
     reports, code = _analyse(series, args)
     return _emit(reports, args, fail_code=code)
@@ -471,18 +539,18 @@ def cmd_ask(args: argparse.Namespace) -> int:
     from .narrative import NarrativeUnavailable, ask
     from .pipeline import run
 
-    series = _load(args.file, args.date_col, args.value_col)
+    series = _load(args.file, args.date_col, args.value_col, args.lang)
     nm, s = next(iter(series.items()))
     if len(series) > 1:
-        _err(f"안내: 여러 열 중 첫 번째 열 '{nm}'만 사용합니다 (--value-col 로 지정 가능).")
+        _err(_t(args, "first_col", name=nm))
     report = run(s, name=nm, freq=args.freq, horizon=args.horizon, lang=args.lang)
     try:
         answer = ask(report, args.question, lang=args.lang, model=args.model)
     except NarrativeUnavailable as exc:
-        _err(f"오류: Claude에 질문할 수 없습니다 — {exc}")
+        _err(_t(args, "ask_failed", exc=exc))
         return 1
     except ValueError as exc:
-        _err(f"오류: {exc}")
+        _err(_t(args, "error", exc=exc))
         return 2
     _say(answer)
     return 0
@@ -570,20 +638,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _install_warning_filters()
             return int(args.func(args) or 0)
     except DataError as exc:
-        _err(f"데이터 오류: {exc}")
+        _err(_t(args, "data_error", exc=exc))
         return 2
     except FileNotFoundError as exc:
-        _err(f"파일 없음: {exc}")
+        _err(_t(args, "not_found", exc=exc))
         return 2
     except BrokenPipeError:
         _Out._silence()
         return 0
     except KeyboardInterrupt:
-        _err("중단되었습니다.")
+        _err(_t(args, "interrupted"))
         return 130
     except Exception as exc:  # noqa: BLE001 - one clean line instead of a traceback
         if os.environ.get("TRENDAI_DEBUG"):
             raise
-        _err(f"오류: 예기치 못한 문제가 발생했습니다 ({type(exc).__name__}: {exc}). "
-             "자세한 내용은 TRENDAI_DEBUG=1 로 다시 실행해 확인하세요.")
+        _err(_t(args, "unexpected", kind=type(exc).__name__, exc=exc))
         return 1

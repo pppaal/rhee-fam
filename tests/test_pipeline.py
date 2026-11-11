@@ -230,3 +230,98 @@ def test_run_on_loaded_formatted_csv(tmp_path):
     assert len(rep.analysis.series) == 120
     assert rep.analysis.series.index[-1] == pd.Timestamp("2025-12-01")
     assert rep.analysis.metrics.last_value == pytest.approx(1500)
+
+
+# --------------------------------------------------------------------------- round 3
+
+
+def test_json_export_keeps_relative_precision():
+    """F4: round(f, 6) exported a ~1.2e-5 token price as 1.2e-05 (bands merged) and a ~1e-7
+    series as all 0.0."""
+    rng = np.random.default_rng(0)
+    price = pd.Series(1.234e-5 * np.exp(np.cumsum(rng.normal(0, 0.03, 60))),
+                      index=pd.date_range("2024-01-01", periods=60, freq="D"))
+    d = json.loads(pipeline.report_to_json(pipeline.run(price, horizon=6)))
+    assert [h["value"] for h in d["history"][:3]] == pytest.approx(price.iloc[:3].tolist(), rel=1e-11)
+    row = d["forecast"]["table"][0]
+    assert row["lo80"] < row["mean"] < row["hi80"]
+    tiny = pd.Series((np.arange(36.0) + 100) * 1e-9, index=pd.date_range("2021-01-01", periods=36, freq="MS"))
+    d = json.loads(pipeline.report_to_json(pipeline.run(tiny, horizon=3)))
+    assert [h["value"] for h in d["history"][:3]] == pytest.approx([1e-7, 1.01e-7, 1.02e-7], rel=1e-9)
+    assert d["metrics"]["slope"] == pytest.approx(1e-9, rel=1e-6)
+    # ordinary values stay short: no float noise in the export
+    assert pipeline._clean(0.1 + 0.2) == 0.3 and pipeline._clean(np.float64(61.2)) == 61.2
+
+
+def test_run_rejects_horizons_beyond_the_date_range():
+    """F14: -H 300000 on yearly data raised a raw OutOfBoundsDatetime; 290,000 ran > 2 minutes."""
+    from trendai.data import DataError, DataWarning
+
+    s = pd.Series(np.arange(20.0) * 2 + 50, index=pd.date_range("2001-01-01", periods=20, freq="YS"))
+    with pytest.raises(DataError, match="예측 기간"):
+        pipeline.run(s, horizon=300_000)
+    with pytest.raises(DataError, match="최대"):
+        pipeline.run(s, horizon=pipeline.MAX_HORIZON + 1)
+    ns = pd.Series(s.to_numpy(), index=s.index.as_unit("ns"))     # nanoseconds end in 2262
+    with pytest.raises(DataError, match="날짜로 표현할 수 있는 범위"):
+        pipeline.run(ns, horizon=400)
+    with pytest.warns(DataWarning, match="5배"):
+        rep = pipeline.run(s, horizon=150)
+    assert len(rep.forecast.mean) == 150
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pipeline.run(s, horizon=10)                                 # ordinary horizons: silent
+
+
+def test_rising_score_ignores_noise_momentum():
+    """UX-4: `sample all` ranked volatile (▼ −1.4 %, P 48 %, score 54.6) above seasonal (▲ +0.4 %)
+    and peaking (▲ +0.9 %): its lead came from momentum the narrative calls 잡음 수준."""
+    reps = {nm: pipeline.run(sample(nm), name=nm) for nm in ("volatile", "seasonal", "peaking")}
+    df = compare.rank_trends(reps).set_index("name")
+    vol = reps["volatile"]
+    assert vol.analysis.phase.label in compare.NOISE_PHASES
+    assert compare.momentum_per_month(vol) > 0.5                # the noisy upswing is still reported
+    assert df.loc["volatile", "score"] < 50.0
+    for nm in ("seasonal", "peaking"):
+        o = reps[nm].outlook
+        if o.expected_change_pct > 0 and o.prob_increase > 0.5:
+            assert df.loc[nm, "score"] > df.loc["volatile", "score"], df
+    # in a noise phase the score is the outlook alone
+    o = vol.outlook
+    expected = 50 + 50 * (0.35 * np.tanh(compare.expected_change_annualised(vol) / 50.0)
+                          + 0.25 * (2 * o.prob_increase - 1))
+    assert compare.rising_score(vol) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("freq,n,last", [("M", 120, "2025-12-01"), ("M", 36, "2025-12-01"),
+                                         ("Y", 12, "2025-01-01"), ("Y", 20, "2025-01-01"),
+                                         ("Q", 40, "2025-10-01"), ("D", 730, "2025-12-31"),
+                                         ("W", 156, "2025-12-28")])
+def test_samples_end_at_a_fixed_reference_date(freq, n, last):
+    """UX-12: samples started at 2016-01-01 whatever the frequency, so `sample emerging --freq Y
+    --n 12` ran 2016 ~ 2027 ('가장 최근 값은 72.0(2027년)') and `--n 20` to 2035."""
+    from trendai.samples import breakout_date
+
+    s = sample("emerging", n=n, freq=freq)
+    assert len(s) == n and s.index[-1] == pd.Timestamp(last)
+    assert breakout_date(n, freq) == s.index[int(round(0.6 * (n - 1)))]
+    start = "2016-01-03" if freq == "W" else "2016-01-01"            # a Sunday for W-SUN
+    assert sample("emerging", n=n, freq=freq, start=start).index[0] == pd.Timestamp(start)
+    # the default monthly sample is unchanged: 2016-01 .. 2025-12
+    if (freq, n) == ("M", 120):
+        assert s.index[0] == pd.Timestamp("2016-01-01")
+
+
+def test_run_passes_the_random_walk_finding_to_the_forecast():
+    """F6 end to end: the driftless random walk of seed 2032 read 'up', p 0.95, +16.1 %."""
+    from trendai.forecast import _TREND_EXTRAPOLATORS
+
+    rng = np.random.default_rng(2032)
+    s = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.018, 730))),
+                  index=pd.date_range("2023-01-01", periods=730, freq="D"))
+    rep = pipeline.run(s)
+    assert not set(_TREND_EXTRAPOLATORS) & {ms.name for ms in rep.forecast.model_scores}
+    assert rep.outlook.direction == "flat" and 0.3 < rep.outlook.prob_increase < 0.7
+    # a trending series keeps its trend models
+    grow = pipeline.run(sample("growing"))
+    assert {"linear_trend", "holt"} & {ms.name for ms in grow.forecast.model_scores}

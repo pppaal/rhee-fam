@@ -9,7 +9,7 @@ This module turns a regular series (see :mod:`trendai.data`) into an
   and robust slope,
 * :func:`detect_changepoints` -- structural breaks via optimal piecewise-linear
   segmentation (dynamic programming + BIC-like penalty),
-* :func:`detect_anomalies` -- robust z-scores of the residual,
+* :func:`detect_anomalies` -- robust z-scores of the (studentised) residual,
 * :func:`compute_metrics` -- growth, momentum, strength, drawdown, ...,
 * :func:`lifecycle_phase` -- explainable rule-based lifecycle classification
   (emerging / growing / peaking / declining / stable / reviving / volatile),
@@ -156,6 +156,39 @@ def _heavy_ties(y: np.ndarray) -> bool:
     return top >= 0.3 * n and (n - top) >= max(5.0, 0.1 * n)
 
 
+_INTERMITTENT_ZEROS = 0.3   # share of exact zeros (overall and recently): intermittent demand
+
+
+def _is_intermittent(y: np.ndarray, m: int) -> bool:
+    """Intermittent demand: non-negative, ``>= 30 %`` exact zeros overall *and* recently.
+
+    The rule of ``forecast._is_intermittent`` on the same history (the last
+    ``max(400, 8 m)`` points; recently = the last ``max(m, 12)``; at least two
+    non-zero values), so that the analysis and the forecast agree on which
+    series are mostly zeros.  Such a series has no meaningful trend level: the
+    smoothed demand rate wanders between ~0 and a fraction of the typical order
+    size, so %-changes of it (+3,192 %), a CAGR, a drawdown "from the peak" and
+    residual z-scores of ordinary orders say nothing.
+    """
+    y = np.asarray(y, dtype=float)
+    y = y[-max(400, 8 * max(1, int(m))):]
+    if len(y) < 8 or not np.all(np.isfinite(y)) or np.any(y < 0):
+        return False
+    zero = y == 0
+    if int((~zero).sum()) < 2:
+        return False
+    k = min(len(y), max(int(m), 12))
+    return bool(zero.mean() >= _INTERMITTENT_ZEROS and zero[-k:].mean() >= _INTERMITTENT_ZEROS)
+
+
+def _season_of(series: pd.Series, dec: Optional[Decomposition] = None) -> int:
+    """Season length of ``series``' frequency (inferred from its index), else ``dec.period``."""
+    try:
+        return int(_data.season_length(_data.infer_freq(pd.DatetimeIndex(series.index))))
+    except Exception:  # not a datetime index, too short, ...
+        return max(1, int(dec.period)) if dec is not None else 1
+
+
 def _winsorized_sd(r: np.ndarray) -> float:
     """Std of ``r`` after clipping at +-3 robust SDs (robust yet efficient on small samples)."""
     r = np.asarray(r, dtype=float)
@@ -234,6 +267,12 @@ def _fmt_date(ts: pd.Timestamp, freq: str) -> str:
     if freq == "Y":
         return f"{ts.year}"
     return ts.strftime("%Y-%m-%d")
+
+
+def _when_ko(ts: pd.Timestamp, freq: str) -> str:
+    """Date for Korean prose before a particle: ``2024-03에``, but ``2016년에`` for yearly data."""
+    s = _fmt_date(ts, freq)
+    return s + "년" if freq == "Y" else s
 
 
 def _ramp(x: float, lo: float, hi: float) -> float:
@@ -1348,21 +1387,150 @@ def detect_changepoints(series: pd.Series, period: int = 1,
 # =========================================================================== anomalies
 
 
+def _trend_rows(w: np.ndarray, q: int) -> tuple[np.ndarray, np.ndarray]:
+    """``(L_ii, sum_{j != i} L_ij^2)`` of the trend LOESS (:func:`_loess`) rows.
+
+    ``L`` is the equivalent kernel of the local-linear fit with robustness
+    weights ``w`` over ``q`` points; near the ends it is blended with the
+    three times wider one-sided fit as :func:`_loess` does for a noise-driven
+    end hook (full shrinkage, the white-noise case).  As in :func:`_loess`
+    the rows are evaluated at every ``max(1, q // 10)``-th point only: the
+    own weight is ``w_i`` times a smooth factor and the other weights' sum of
+    squares is smooth, so both are interpolated in between.
+    """
+    n = len(w)
+    jump = max(1, q // 10)
+    at = np.arange(n) if jump == 1 else np.unique(np.r_[np.arange(0, n, jump), n - 1])
+    _, _, kern = _local_fit(np.zeros(n), w, at, q, want_weights=True)
+    idx, lw = kern  # type: ignore[misc]
+    own = np.take_along_axis(lw, (at - idx[:, 0])[:, None], axis=1)[:, 0]
+    ss = np.sum(lw * lw, axis=1)
+    q3 = int(min(n, 3 * q - 2))
+    if q3 > q and n >= 5:
+        hw = (q - 1) / 2.0
+        lo = np.clip(at - (q - 1) // 2, 0, n - q)
+        asym = np.clip(np.abs(at - (lo + hw)) / max(hw, 1.0), 0.0, 1.0)
+        edge = np.flatnonzero(asym > 1e-9)
+        if len(edge):
+            _, _, kern3 = _local_fit(np.zeros(n), w, at[edge], q3, want_weights=True)
+            idx3, lw3 = kern3  # type: ignore[misc]
+            lam = (1.0 - asym[edge])[:, None]
+            row = (1.0 - lam) * lw3
+            pos = np.clip(idx[edge] - idx3[:, :1], 0, q3 - 1)   # narrow window nested in the wide one
+            np.put_along_axis(row, pos, np.take_along_axis(row, pos, axis=1) + lam * lw[edge], axis=1)
+            own[edge] = np.take_along_axis(row, (at[edge] - idx3[:, 0])[:, None], axis=1)[:, 0]
+            ss[edge] = np.sum(row * row, axis=1)
+    factor = own / np.maximum(w[at], _TINY)
+    others = np.maximum(ss - own * own, 0.0)
+    if jump > 1:
+        grid = np.arange(n, dtype=float)
+        factor = np.interp(grid, at.astype(float), factor)
+        others = np.interp(grid, at.astype(float), others)
+    return w * factor, others
+
+
+def _resid_variance_factor(rn: np.ndarray, dn: np.ndarray, sn: np.ndarray, period: int,
+                           wide: bool, breaks: Optional[list[int]] = None) -> np.ndarray:
+    """Variance of each residual relative to the noise variance, ``F_i``.
+
+    The decomposition is (approximately) a linear smoother with the robustness
+    weights ``w``: fitted = ``L y`` with ``L`` = trend LOESS + per-phase
+    seasonal average (shrunk as in :func:`_seasonal_pattern`).  For white
+    noise the residual ``r_i`` then has variance ``F_i * s^2`` with
+    ``F_i = (1 - L_ii)^2 + sum_{j != i} L_ij^2``.  Ordinary points (weight ~1)
+    are partly absorbed by their own fit -- with 3 cycles a weekly phase mean
+    contains a third of each point, a 5-point trend window ~30 % -- so their
+    residuals shrink (``F < 1``), while a point the robust fit down-weights
+    keeps its full deviation plus the noise of the fit (``F > 1``).  Scaling
+    the z-scores by the median residual alone therefore over-states every
+    large deviation (pure noise: ~2.5 flags per weekly series of 3 years);
+    ``r_i / sqrt(F_i)`` puts all points on one scale (studentised residuals).
+
+    ``rn``: residual (log residual for a multiplicative fit), ``dn``: the
+    detrended values and ``sn``: the seasonal component in the same units.
+    """
+    n = len(rn)
+    w = _bisquare(rn - float(np.median(rn)), wide)
+    p = int(period)
+    window = _trend_window(n, p)
+    h_t, v_t = np.zeros(n), np.zeros(n)
+    for a, b in _segment_bounds(n, breaks):
+        h_t[a:b], v_t[a:b] = _trend_rows(w[a:b], int(max(2, min(window, b - a))))
+    h_s, v_s = np.zeros(n), np.zeros(n)
+    if p > 1 and n >= 2 * p:
+        ph = np.arange(n) % p
+        sw = np.bincount(ph, weights=w, minlength=p)
+        sw2 = np.bincount(ph, weights=w * w, minlength=p)
+        safe = np.maximum(sw, _TINY)
+        raw = np.bincount(ph, weights=w * dn, minlength=p) / safe
+        raw = raw - raw.mean()
+        pat = np.bincount(ph, weights=sn, minlength=p) / np.maximum(np.bincount(ph, minlength=p), 1)
+        pat = pat - pat.mean()
+        den = float(raw @ raw)
+        # how much of the weighted phase means the (shrunk) seasonal pattern kept
+        shrink = float(np.clip((pat @ raw) / den, 0.0, 1.0)) if den > _TINY else 0.0
+        h_s = shrink * w / safe[ph]
+        v_s = shrink * shrink * np.maximum(sw2[ph] - w * w, 0.0) / safe[ph] ** 2
+    h = h_t + h_s - h_t * h_s
+    f = (1.0 - h) ** 2 + v_t + v_s
+    return np.where(np.isfinite(f), np.clip(f, 1e-3, 4.0), 1.0)
+
+
+def _intermittent_anomalies(series: pd.Series, y: np.ndarray, threshold: float) -> list[Anomaly]:
+    """Unusually *large* demands of an intermittent series (see :func:`_is_intermittent`).
+
+    Every non-zero value of mostly-zero demand is far from the smoothed demand
+    rate, so residual z-scores flag ordinary orders (39 of 40 iid demand series
+    had "anomalies" of +1,000 %).  What can be unusual is the size of a
+    demand: the robust z-score of ``log(size)`` among the non-zero values
+    (``expected`` = their median, the typical demand size).  Only upward
+    deviations count (a small order, or a zero, is ordinary), and at least 5
+    non-zero values are needed.
+    """
+    nz = np.flatnonzero(y > 0)
+    if len(nz) < 5:
+        return []
+    lv = np.log(y[nz])
+    med = float(np.median(lv))
+    sd = _robust_sd(lv)
+    if sd <= 1e-9 * max(1.0, abs(med)):
+        return []
+    zs = (lv - med) / sd
+    typical = float(np.exp(med))
+    return [Anomaly(date=pd.Timestamp(series.index[i]), index=int(i), value=_finite(y[i]),
+                    expected=_finite(typical), zscore=_finite(z))
+            for i, z in zip(nz, zs) if z >= threshold]
+
+
 def detect_anomalies(series: pd.Series, decomposition: Decomposition,
-                     threshold: float = 3.5) -> list[Anomaly]:
+                     threshold: float = 3.5, breaks: Optional[list[int]] = None) -> list[Anomaly]:
     """Points whose residual has a robust z-score with ``|z| >= threshold``.
 
-    z = (resid - median) / robust scale, where the scale is the MAD-based SD.
+    z = (studentised resid - median) / robust scale, where the scale is the
+    MAD-based SD.  The residuals are first divided by ``sqrt(F_i)``, their
+    relative variance under pure noise (see :func:`_resid_variance_factor`):
+    with few seasonal cycles or a short trend window the fit absorbs part of
+    every ordinary point, which used to make the median residual -- and the
+    scale -- too small for the points the robust fit left out (white noise:
+    2.5 flags per weekly series of 156 points, 1.6 per 36 months).  ``breaks``
+    are the level shifts of a piecewise decomposition (the trend windows stop
+    there; see :func:`decompose`).
     For longer series (n >= 30) a *local* MAD (rolling window of
     ``max(25, 2 x trend window)`` points) is used, floored at a quarter of the
     global value, so that series whose noise grows with their level (page
     views, sales: multiplicative noise) do not flag every point of a busy
-    period.  The scale never collapses onto a point mass: it is at least
+    period.  The local value is shrunk towards the global one in log space
+    by its sampling noise (positive-part James-Stein with a 4x variance, as
+    the edge LOESS): a window's MAD of ~30 points is itself ±20 % noisy, which
+    otherwise added flags (and hid spikes) on homogeneous noise.  The scale
+    never collapses onto a point mass: it is at least
     ``0.5 * q90 / 1.645`` of the absolute deviations (the full ``q90 / 1.645``
     for heavily tied data such as zero-inflated counts, where otherwise every
     ordinary non-zero count would be flagged).  For a multiplicative
     decomposition (see :func:`decompose`) the residual is taken in log space,
-    ``log(value / expected)``, i.e. the z-scores are relative.  Sorted by date.
+    ``log(value / expected)``, i.e. the z-scores are relative.  Intermittent
+    demand (mostly zeros, :func:`_is_intermittent`) is judged by the size of
+    each demand instead (:func:`_intermittent_anomalies`).  Sorted by date.
     """
     y = _clean_values(series)
     r = decomposition.resid.to_numpy(dtype=float)
@@ -1370,22 +1538,33 @@ def detect_anomalies(series: pd.Series, decomposition: Decomposition,
     if n < 3:
         return []
     y, r = y[:n], r[:n]
+    if _is_intermittent(y, _season_of(series, decomposition)):
+        return _intermittent_anomalies(series, y, threshold)
     r = np.where(np.isfinite(r), r, 0.0)
-    expected = (decomposition.trend.to_numpy(dtype=float)[:n]
-                + decomposition.seasonal.to_numpy(dtype=float)[:n])
+    trend = decomposition.trend.to_numpy(dtype=float)[:n]
+    seasonal = decomposition.seasonal.to_numpy(dtype=float)[:n]
+    expected = trend + seasonal
     c = _unit(y, r)                       # scale-free tolerances
     rn = r / c
+    dn, sn = (y - trend) / c, seasonal / c
     if len(decomposition.trend) == n and _is_multiplicative(decomposition) and np.all(y > 0):
         with np.errstate(all="ignore"):
             rel = np.log(y / expected)
+            d_log, s_log = np.log(y / trend), np.log(expected / trend)
         if np.all(np.isfinite(rel)):
             rn = rel
+            if np.all(np.isfinite(d_log)) and np.all(np.isfinite(s_log)):
+                dn, sn = d_log, s_log
+    heavy = _heavy_ties(y)
+    if np.all(np.isfinite(dn)) and np.all(np.isfinite(sn)):
+        rn = (rn - float(np.median(rn))) / np.sqrt(
+            _resid_variance_factor(rn, dn, sn, int(decomposition.period), heavy, breaks))
     med = float(np.median(rn))
     sd = _robust_sd(rn)
     # point-mass guard (see _robust_sd): scale >= q_coef * q90(|dev|).  For
     # heavily tied data (zero-inflated counts) the full Gaussian-consistent
     # q90 / 1.645 is used, otherwise every ordinary non-zero count is flagged.
-    q_coef = 0.608 if _heavy_ties(y) else 0.304
+    q_coef = 0.608 if heavy else 0.304
     sd = max(sd, q_coef * float(np.quantile(np.abs(rn - med), 0.9)))
     if sd <= max(_TINY, 1e-9 * _scale(y / c)):
         return []
@@ -1397,8 +1576,13 @@ def detect_anomalies(series: pd.Series, decomposition: Decomposition,
         local = np.maximum(1.4826 * roll.median().to_numpy(dtype=float),
                            q_coef * roll.quantile(0.9).to_numpy(dtype=float))
         local = pd.Series(local).bfill().ffill().to_numpy(dtype=float)
-        local = np.where(np.isfinite(local), local, sd)
-        scale = np.maximum(local, 0.25 * sd)
+        local = np.where(np.isfinite(local) & (local > 0), local, sd)
+        # shrink log(local / global) by its sampling variance (~1.36 / m for a MAD of m points)
+        m = pd.Series(roll.count().to_numpy(dtype=float)).replace(0.0, np.nan).bfill().ffill()
+        se2 = 1.36 / np.maximum(m.fillna(float(win)).to_numpy(dtype=float), 1.0)
+        ell = np.log(local / sd)
+        g = np.clip(1.0 - _EDGE_SHRINK * se2 / np.maximum(ell * ell, 1e-300), 0.0, 1.0)
+        scale = np.maximum(sd * np.exp(g * ell), 0.25 * sd)
     zs = (rn - med) / scale
     out = []
     for i in np.flatnonzero(np.abs(zs) >= threshold):
@@ -1436,16 +1620,115 @@ def _winsorize(r: np.ndarray, k: float = 3.5) -> np.ndarray:
     return med + np.clip(r - med, -k * sd, k * sd)
 
 
-def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition) -> TrendMetrics:
+def _paulson_z(F: float, df1: float, df2: float) -> float:
+    """Normal approximation (Paulson 1942) of the upper tail of an ``F(df1, df2)`` statistic."""
+    a = 2.0 / (9.0 * df1)
+    b = 2.0 / (9.0 * df2)
+    f3 = F ** (1.0 / 3.0)
+    return ((1.0 - b) * f3 - (1.0 - a)) / math.sqrt(b * f3 * f3 + a)
+
+
+def _acf_at(x: np.ndarray, lag: int) -> float:
+    """Sample autocorrelation of ``x`` at ``lag`` (0 for a constant or too short series)."""
+    xc = x - float(np.mean(x))
+    den = float(np.sum(xc * xc))
+    if den <= 0 or lag >= len(x):
+        return 0.0
+    return float(np.sum(xc[lag:] * xc[:-lag])) / den
+
+
+def _seasonality_evidence(y: np.ndarray, p: int) -> float:
+    """How firmly the data show a repeating pattern of period ``p``: a factor in [0, 1].
+
+    The same test the forecasting models use to decide on seasonal adjustment
+    (``models._is_seasonal``), as a smooth score: with at least 2.5 seasons the
+    series is detrended by a centred (2x)p moving average and the remainder
+    must show between-phase differences (one-way ANOVA F, degrees of freedom
+    deflated for serial correlation of the within-phase residual, Paulson's
+    normal approximation ``z``) that repeat from one season to the next (lag-p
+    autocorrelation ``r_p`` of the remainder).  The score is
+    ``ramp(z, 1.645, 2.326) * ramp(r_p, 0, 0.1)``: 0 below the 95 % level, 1
+    from the 99 % level with ``r_p >= 0.1`` (``_is_seasonal``'s rule).  With 2
+    to 2.5 seasons (too short for the moving average) an ANCOVA F-test of the
+    phase effects given one common slope is used.  Pure noise with 3
+    cycles otherwise reads as a "clear" pattern (strength 0.67) about once in
+    four.
+    """
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if p <= 1 or n < 2 * p or not np.all(np.isfinite(y)):
+        return 0.0
+    ref = float(np.max(np.abs(y)))
+    if ref <= 0 or float(np.ptp(y)) <= 1e-12 * ref:
+        return 0.0
+    y = y / ref
+    if 2 * n >= 5 * p:
+        w = np.r_[0.5, np.ones(p - 1), 0.5] / p if p % 2 == 0 else np.ones(p) / p
+        ma = np.convolve(y, w, mode="valid")
+        off = len(w) // 2
+        x = y[off:off + len(ma)] - ma
+        ph = (np.arange(len(ma)) + off) % p
+        cnt = np.bincount(ph, minlength=p).astype(float)
+        k = int((cnt > 0).sum())
+        df1, df2 = k - 1, len(x) - k
+        if df1 < 1 or df2 < 2:
+            return 0.0
+        means = np.bincount(ph, weights=x, minlength=p) / np.maximum(cnt, 1.0)
+        ssb = float(np.sum(cnt * (means - float(np.mean(x))) ** 2))
+        e = x - means[ph]
+        ssw = float(np.sum(e * e))
+    else:
+        # 2-2.5 seasons: too short for the moving average (models._is_seasonal falls back to
+        # a lag-p autocorrelation test that misses even a clean sine here).  ANCOVA instead:
+        # phase means plus one common slope, F-test of the phase effects given the slope
+        # (a plain straight line would absorb part of the pattern over two cycles)
+        t = np.arange(n, dtype=float)
+        ph = np.arange(n) % p
+        cnt = np.bincount(ph, minlength=p).astype(float)
+        yw = y - (np.bincount(ph, weights=y, minlength=p) / cnt)[ph]
+        tw = t - (np.bincount(ph, weights=t, minlength=p) / cnt)[ph]
+        stt = float(np.sum(tw * tw))
+        b = float(np.sum(yw * tw)) / stt if stt > _TINY else 0.0
+        e = yw - b * tw
+        ssw = float(np.sum(e * e))
+        a0, b0 = _ols(y)
+        ssr = float(np.sum((y - a0 - b0 * t) ** 2))
+        ssb = max(ssr - ssw, 0.0)
+        df1, df2 = p - 1, n - p - 1
+        if df2 < 2:
+            return 0.0
+        x = y - b * t
+    if ssb <= 0:
+        return 0.0
+    if ssw <= 1e-12 * ssb:
+        z = math.inf
+    else:
+        r1 = min(max(float(np.sum(e[1:] * e[:-1])) / ssw, 0.0), 0.98)
+        kappa = (1.0 + r1 * r1) / (1.0 - r1 * r1)
+        z = _paulson_z((ssb / df1) / (ssw / df2), max(df1 / kappa, 1.0), max(df2 / kappa, 2.0))
+    return _ramp(z, 1.645, 2.326) * _ramp(_acf_at(x, p), 0.0, 0.1)
+
+
+def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition,
+                    anomalies: Optional[list[Anomaly]] = None) -> TrendMetrics:
     """Descriptive statistics of the past and present (see :class:`TrendMetrics`).
 
     Growth numbers use the trend component; ``None`` when the base is <= 0 or
-    ~0 (below 1% of the mean absolute level).  ``cagr_pct`` additionally
+    ~0 (below 1% of the mean absolute level), and for intermittent demand
+    (mostly zeros, :func:`_is_intermittent`).  ``cagr_pct`` additionally
     needs a span of about a year (>= 0.95 years).  ``momentum`` is the recent
-    trend slope (last ``max(3, min(season_length, n//4))`` periods) in % of the
-    mean level per period minus ``slope_pct``.  ``acceleration`` is the change of
-    that %-slope between the previous and the latest window.  ``slope``,
-    ``mk_*`` and ``direction`` are computed on the deseasonalised series.
+    trend slope (OLS over the last ``max(3, min(season_length, n//4))``
+    periods) minus the long-run Theil-Sen ``slope``, in % of the *recent* trend
+    level (mean ``|trend|`` over that window, at least a tenth of the mean
+    level) per period -- so it can be read against the current growth rate.
+    ``acceleration`` is the change of the recent slope between the previous and
+    the latest window, in % of the mean level.  ``slope``, ``mk_*`` and
+    ``direction`` are computed on the deseasonalised series.
+
+    * ``seasonal_strength`` is the usual ``1 - var(resid) / var(seasonal +
+      resid)``, scaled by how firmly a significance test of the repeating
+      pattern supports it (:func:`_seasonality_evidence`, 0 below the 95 %
+      level): with 2-3 cycles noise alone leaves a sizeable pattern.
 
     * ``mk_pvalue`` is corrected for serial dependence of the noise around the
       trend (AR(1) variance inflation, drift test near a unit root; see
@@ -1457,7 +1740,10 @@ def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition) 
       components (``log trend``, ``log(1 + seasonal / trend)``, log residual).
     * ``peak_value`` / ``peak_date`` / ``drawdown_pct`` ignore isolated upward
       spikes flagged by :func:`detect_anomalies` (a one-day spike is reported
-      as an anomaly, not as the level the series fell from).
+      as an anomaly, not as the level the series fell from) -- from 16
+      observations on, and never the first or last observation, which cannot
+      be confirmed as one-off.  ``anomalies``: the already detected anomalies
+      of ``series`` (detected here if omitted).
     """
     y_raw = _clean_values(series)
     n = len(y_raw)
@@ -1492,17 +1778,27 @@ def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition) 
     lag = 1 if freq == "Y" else _data.season_length(freq)
     lag = min(lag, n - 1)
     recent = _pct_change(trend[-1], trend[-1 - lag], abs_ref) if lag >= 1 else None
+    if _is_intermittent(y_raw, _data.season_length(freq)):
+        # mostly zeros: the trend is a demand rate near 0 that wanders with the timing of
+        # a few orders -- its %-changes (+3,192 %, CAGR +240 %) are meaningless
+        total = cagr = recent = None
 
     slope_n = theil_sen_slope(z)
     slope = slope_n * c
     slope_pct = slope_n / level * 100.0
 
     r = _recent_window(n, freq)
+    level_recent = level
     if n >= 2:
-        _, s_recent = _ols(trend[-(r + 1):])
+        seg_r = trend[-(r + 1):]
+        _, s_recent = _ols(seg_r)
+        # momentum is expressed against the *current* trend level: against the mean of
+        # the whole history a fast riser read "+15.7 %p per month" while its trend grew
+        # ~4 % a month.  Floored at a tenth of the mean level (a trend dying out to ~0).
+        level_recent = max(float(np.mean(np.abs(seg_r))), 0.1 * level)
     else:
         s_recent = 0.0
-    momentum = s_recent / level * 100.0 - slope_pct
+    momentum = (s_recent - slope_n) / level_recent * 100.0
     if n >= 2 * r + 1:
         _, s_prev = _ols(trend[-(2 * r + 1):-r])
         accel = (s_recent - s_prev) / level * 100.0
@@ -1519,12 +1815,19 @@ def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition) 
             lr = np.log(y / (trend + seas))
         if np.all(np.isfinite(lt)) and np.all(np.isfinite(ls)) and np.all(np.isfinite(lr)):
             tt, ss, rr = lt, ls, _winsorize(lr)
+    # the series the seasonality test sees: spikes winsorised like the strengths' residual
+    y_season = tt + ss + rr
     var_r = float(np.var(rr))
     var_tr = float(np.var(tt + rr))
     var_sr = float(np.var(ss + rr))
     t_strength = max(0.0, 1.0 - var_r / var_tr) if var_tr > _TINY else 0.0
     s_strength = (max(0.0, 1.0 - var_r / var_sr)
                   if (var_sr > _TINY and decomposition.period > 1) else 0.0)
+    if s_strength > 0.0:
+        # with few cycles noise leaves a sizeable "pattern" (strength 0.4-0.7 for a quarter
+        # of non-seasonal 36-month series): count it only as far as a significance test
+        # of the repeating pattern supports it (the forecasting models' own test)
+        s_strength *= _seasonality_evidence(y_season, int(decomposition.period))
 
     phi, _ = _noise_model(z, decomposition.period, resid)
     tau, p = _trend_test(z, phi)
@@ -1532,11 +1835,16 @@ def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition) 
     if p < 0.05:
         direction = "up" if tau > 0 else ("down" if tau < 0 else "flat")
 
-    # peak / drawdown on the observations, ignoring isolated upward spikes
+    # peak / drawdown on the observations, ignoring isolated upward spikes -- but only
+    # where a spike can be told from structure: not on short series (a 5-point trend
+    # window on 8-15 points cannot follow a real peak, which then looks like a spike),
+    # and never at the first or last observation (data on one side only: the latest
+    # value of an accelerating series may be a new level, not a one-off)
     cand = np.ones(n, dtype=bool)
-    if n >= 8:
-        spikes = [a.index for a in detect_anomalies(series, decomposition) if a.zscore > 0]
-        cand[[i for i in spikes if 0 <= i < n]] = False
+    if n >= 16:
+        found = detect_anomalies(series, decomposition) if anomalies is None else anomalies
+        spikes = [a.index for a in found if a.zscore > 0]
+        cand[[i for i in spikes if 0 < i < n - 1]] = False
         if not cand.any():
             cand[:] = True
     i_peak = int(np.flatnonzero(cand)[int(np.argmax(y[cand]))])
@@ -1561,6 +1869,32 @@ def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition) 
 
 
 # =========================================================================== lifecycle
+
+
+def _noise_reference(y: np.ndarray, z: np.ndarray) -> tuple[float, str]:
+    """``(scale, basis)``: what the noise level of a series is compared with.
+
+    For ratio-scale data (no negative values) the mean absolute deseasonalised
+    level ``mean|z|`` (basis ``'mean'``): noise of 20 around a level of 100 is
+    large, the classic coefficient of variation.  A level is meaningless for
+    interval-scale data or data that cross zero (temperatures, profits): the
+    same seasonal series would be 'volatile' at a mean of 0.3 and 'stable' at
+    12.5.  The scale is therefore at least a shift-invariant spread of the
+    observations, half their 5-95 % range (basis ``'spread'``), and only that
+    when the series has negative values.  For positive data the level almost
+    always exceeds the spread, so their verdicts do not change.
+    """
+    y = np.asarray(y, dtype=float)
+    lvl = float(np.mean(np.abs(z))) if len(z) else 0.0
+    spread = 0.0
+    if len(y) >= 2:
+        q05, q95 = np.quantile(y, [0.05, 0.95])
+        spread = 0.5 * float(q95 - q05)
+    if len(y) and float(np.min(y)) < 0.0:
+        lvl = 0.0
+    if spread > lvl:
+        return spread, "spread"
+    return lvl, "mean"
 
 
 def _phase_features(series: pd.Series, dec: Decomposition) -> dict:
@@ -1617,6 +1951,10 @@ def _phase_features(series: pd.Series, dec: Decomposition) -> dict:
         math.copysign(99.0, s_rec) if abs(s_rec) > _TINY else 0.0)
     chg_rec = s_rec * (h - 1)
     start_level = icpt
+    # the same window on the trend line (what the chart and the narrative show): the
+    # reasons quote this change -- the OLS fit above only drives the significance rules
+    # (its intercept sits far below the trend's start on a convex rise: +1,077% vs +293%)
+    t_rec0 = float(T[-1 - h]) if n > h else float(T[0])
 
     i_max = int(np.argmax(T))
     t_max = float(T[i_max])
@@ -1652,9 +1990,9 @@ def _phase_features(series: pd.Series, dec: Decomposition) -> dict:
     base = float(np.median(T[: max(1, int(math.ceil(0.6 * n)))]))
     multiple = t_last / base if (base > 0.01 * ref and t_last > 0) else 0.0
 
-    lvl = float(np.mean(np.abs(z)))
     # noise relative to the level ("coefficient of variation" of the noise);
     # for persistent noise its spread over the sample, not the one-step noise
+    lvl, basis = _noise_reference(y, z)
     cv = noise_eff / lvl if lvl > _TINY else (0.0 if noise_eff <= _TINY else 1e6)
 
     # variance ratio: trend variance vs. what smoothed noise would give
@@ -1670,13 +2008,13 @@ def _phase_features(series: pd.Series, dec: Decomposition) -> dict:
     return dict(
         unit=c, f_ratio=float(min(f_ratio, 1e6)), noise_sd=noise_sd, phi=phi, sig_e2=sig_e2,
         n=n, h=h, sigma=sigma, ref=ref, s_rec=s_rec, t_rec=float(t_rec), chg_rec=chg_rec,
-        rel_rec=chg_rec / ref, start_level=start_level,
+        rel_rec=chg_rec / ref, start_level=start_level, t_rec0=t_rec0,
         i_max=i_max, t_max=t_max, t_last=t_last, t_min=t_min, amp=amp,
         rel_amp=amp / ref, t_low=t_low,
         drop_from_peak=drop_from_peak, rise_to_peak=rise_to_peak,
         i_tr=i_tr, t_tr=t_tr, decline_before_trough=decline_before_trough, rebound=rebound,
         settled=settled, s_max_up=s_max_up, s_rec_t=s_rec_t, stall_ratio=stall_ratio,
-        avg_slope=avg_slope, base=base, multiple=multiple, cv=cv,
+        avg_slope=avg_slope, base=base, multiple=multiple, cv=cv, cv_basis=basis,
         g_tot=(t_last - float(T[0])) / ref,
     )
 
@@ -1690,8 +2028,44 @@ def _txt(x: float, spec: str) -> str:
 
 
 def _pct_txt(pct: float, decimals: int = 1) -> str:
-    """Signed percentage, e.g. ``+12.5%`` / ``\u221242.3%``."""
-    return _txt(pct, f"+.{decimals}f") + "%"
+    """Signed percentage with thousands separators, e.g. ``+12.5%`` / ``\u221242.3%`` / ``+1,076.8%``."""
+    return _txt(pct, f"+,.{decimals}f") + "%"
+
+
+_SUPERSCRIPT = str.maketrans("0123456789", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079")
+
+
+def _num_txt(x: float, signed: bool = False) -> str:
+    """A number for Korean prose, formatted like ``narrative.format_number``.
+
+    Thousands separators and a precision chosen from the magnitude
+    (``2,392,153`` / ``45.2`` / ``1.20`` / ``0.023``); below 1e-4 or from 1e15 up
+    ``1.05\u00d710\u207b\u2079`` notation -- never Python's ``2.392e+06``.  Typographic minus;
+    ``signed=True`` prefixes positive values with ``+``.
+    """
+    v = _finite(x)
+    a = abs(v)
+    sign = _MINUS if v < 0 else ("+" if signed and v > 0 else "")
+    if 0 < a < 1e-4 or a >= 1e15:
+        mant, exp = f"{a:.2e}".split("e")
+        mant = mant.rstrip("0").rstrip(".")
+        e = int(exp)
+        sup = ("\u207b" if e < 0 else "") + str(abs(e)).translate(_SUPERSCRIPT)
+        return sign + mant + "\u00d710" + sup
+    if a >= 1000:
+        body = f"{a:,.0f}"
+    elif a >= 10:
+        body = f"{a:,.1f}"
+    elif a >= 0.1:
+        body = f"{a:.2f}"
+    elif a == 0:
+        return "0"
+    else:   # two significant digits, trailing zeros removed
+        d = min(8, -int(math.floor(math.log10(a))) + 1)
+        body = f"{a:.{d}f}".rstrip("0").rstrip(".")
+    if body.strip("0.,") == "":
+        return "0"
+    return sign + body
 
 
 def _p_txt(p: float) -> str:
@@ -1741,8 +2115,8 @@ def _post_shift(series: pd.Series, dec: Decomposition, changepoints: list[Change
     pct = _pct_change(after, before, f["ref"])
     up = after >= before
     jump = (f" (약 {_pct_txt(pct)})" if pct is not None
-            else f" (약 {_txt((after - before) * c, '+,.4g')})")
-    when = _fmt_date(last.date, freq)
+            else f" (약 {_num_txt((after - before) * c, signed=True)})")
+    when = _when_ko(last.date, freq)
     return dict(
         p=float(p), length=int(length),
         shift_sentence=f"{when}에 수준이 한 단계 {'높아졌습니다' if up else '낮아졌습니다'}{jump}.",
@@ -1773,15 +2147,17 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
         lvl = float(np.mean(np.abs(yn))) if len(yn) else 0.0
         icpt, slope = _ols(yn)
         res = yn - (icpt + slope * np.arange(len(yn)))
-        noise_cv = float(np.sqrt(np.mean(res * res))) / lvl if lvl > _TINY else 0.0
+        ref, _ = _noise_reference(yn, yn)   # level, or the spread of data that cross zero
+        noise_cv = float(np.sqrt(np.mean(res * res))) / ref if ref > _TINY else 0.0
         label = "volatile" if noise_cv >= _VOLATILE_CV else "stable"
         reasons = [f"관측치가 {n}개뿐이라 추세를 판단하기에 데이터가 부족합니다."]
         pct = _pct_change(float(yn[-1]), float(yn[0]), lvl) if len(yn) >= 2 else None
         if pct is not None:
-            reasons.append(f"관측 기간 동안 값이 {_txt(y[0], ',.4g')}에서 {_txt(y[-1], ',.4g')}로 "
+            # "...에서 6까지": no particle whose form depends on how the number is read (6으로 / 5로)
+            reasons.append(f"관측 기간 동안 값이 {_num_txt(y[0])}에서 {_num_txt(y[-1])}까지 "
                            f"{_pct_txt(pct)} 변했습니다.")
         else:
-            reasons.append(f"현재 값은 {_txt(metrics.last_value, ',.4g')}입니다.")
+            reasons.append(f"현재 값은 {_num_txt(metrics.last_value)}입니다.")
         reasons.append(f"직선 추세 대비 잡음 비율은 {noise_cv * 100:.1f}%입니다.")
         return LifecyclePhase(label=label, confidence=float(min(0.3, 0.1 + 0.025 * n)),
                               reasons=reasons)
@@ -1797,19 +2173,23 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
     structured = (f["f_ratio"] >= 4.0 and f["rel_amp"] >= 0.05) or (
         metrics.mk_pvalue < 0.01 and abs(f["g_tot"]) >= 0.10)
 
-    peak_date = _fmt_date(idx[f["i_max"]], freq)
-    trough_date = _fmt_date(idx[f["i_tr"]], freq)
+    peak_date = _fmt_date(idx[f["i_max"]], freq)        # in brackets: "고점(2016)"
+    peak_when = _when_ko(idx[f["i_max"]], freq)          # before a particle: "2016년에"
+    trough_when = _when_ko(idx[f["i_tr"]], freq)
 
     def recent_sentence() -> str:
-        pct = _pct_change(f["start_level"] + f["chg_rec"], f["start_level"], f["ref"])
+        # measured on the trend line over the last h periods (T[-1-h] -> T[-1]), like
+        # TrendMetrics.recent_change_pct over its window -- not from the OLS intercept
+        pct = _pct_change(f["t_last"], f["t_rec0"], f["ref"])
         if pct is not None:
             return f"최근 {h}{unit} 동안 추세가 {_pct_txt(pct)} 변했습니다."
-        return f"최근 {h}{unit} 동안 추세 기울기는 {_txt(f['s_rec'] * f['unit'], '+.3g')}/{unit}입니다."
+        slope = (f["t_last"] - f["t_rec0"]) / max(h, 1) * f["unit"]
+        return f"최근 {h}{unit} 동안 추세 기울기는 {_num_txt(slope, signed=True)}/{unit}입니다."
 
     def peak_sentence() -> str:
         pct = _pct_change(f["t_last"], f["t_max"], f["ref"])
         if pct is not None:
-            return f"현재 추세는 고점({peak_date})보다 {abs(pct):.1f}% 낮은 수준입니다."
+            return f"현재 추세는 고점({peak_date})보다 {abs(pct):,.1f}% 낮은 수준입니다."
         return (f"추세 고점({peak_date}) 대비 현재 수준이 추세 규모(최대 절댓값)의 "
                 f"{f['drop_from_peak'] * 100:.1f}%만큼 낮습니다.")
 
@@ -1821,7 +2201,7 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
                 else f"저점 대비 추세 규모의 {f['rise_to_peak'] * 100:.0f}%만큼")
         if at_top:   # the maximum is the latest point: no peak has "formed" yet
             return f"추세는 {rise} 올라 현재 역대 최고 수준입니다."
-        return f"추세는 {rise} 오른 뒤 {peak_date}에 고점을 형성했습니다."
+        return f"추세는 {rise} 오른 뒤 {peak_when}에 고점을 형성했습니다."
 
     def mk_sentence() -> str:
         if metrics.mk_pvalue < 0.05:
@@ -1830,6 +2210,11 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
                     f"(τ = {_txt(metrics.mk_tau, '.2f')}, {_p_txt(metrics.mk_pvalue)}).")
         return (f"Mann-Kendall 검정에서 전체 기간의 뚜렷한 추세가 확인되지 않습니다 "
                 f"({_p_txt(metrics.mk_pvalue)}).")
+
+    def noise_sentence(tail: str) -> str:
+        """'잡음이 커서(...)' with what the noise is compared with (see _noise_reference)."""
+        ref_ko = "평균" if f["cv_basis"] == "mean" else "값의 변동 폭"
+        return f"잡음이 커서(추정 잡음 수준이 {ref_ko}의 {f['cv'] * 100:,.0f}%) {tail}"
 
     label: str
     strength: float
@@ -1853,18 +2238,21 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
             label = "volatile"
             strength = 0.5 * _ramp(f["cv"], _VOLATILE_CV, 2 * _VOLATILE_CV) + 0.5 * _ramp(
                 metrics.mk_pvalue, 0.01, 0.3)
-            reasons = [
-                f"잡음이 커서(추정 잡음 수준이 평균의 {f['cv'] * 100:.0f}%) 뚜렷한 방향성이 없습니다.",
-                mk_sentence(),
-            ]
+            reasons = [noise_sentence("뚜렷한 방향성이 없습니다."), mk_sentence()]
         else:
             label = "stable"
             strength = 0.5 * _ramp(metrics.mk_pvalue, 0.01, 0.3) + 0.5 * _ramp(
                 _VOLATILE_CV - f["cv"], 0.0, _VOLATILE_CV)
-            reasons = [mk_sentence(),
-                       f"추세의 변동 폭(최고-최저)이 최고 수준 대비 {f['rel_amp'] * 100:.1f}%에 그칩니다."]
+            reasons = [mk_sentence()]
+            if f["rel_amp"] < 0.3:
+                # "only x %" is evidence of stability only while x is small
+                reasons.append(f"추세의 변동 폭(최고-최저)이 최고 수준 대비 "
+                               f"{f['rel_amp'] * 100:.1f}%에 그칩니다.")
+            else:   # a sizeable range that the noise could have produced (f_ratio < 4)
+                reasons.append("추세선의 등락이 잡음으로 생길 수 있는 범위를 크게 넘지 않습니다.")
             if metrics.seasonal_strength >= 0.5:
-                reasons.append(f"계절성 강도가 {metrics.seasonal_strength:.2f}로 "
+                # no particle right after the number ("0.96로" would need to be "0.96으로")
+                reasons.append(f"계절성 강도({metrics.seasonal_strength:.2f})가 높아 "
                                f"주기적 변동이 뚜렷합니다.")
     elif (f["decline_before_trough"] >= 0.20 and f["i_tr"] <= n - 1 - max(2, h // 3)
           and f["rebound"] >= 0.10 and f["rebound"] >= 0.25 * f["decline_before_trough"]
@@ -1876,7 +2264,7 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
         reb_txt = (_pct_txt(reb_pct) if reb_pct is not None
                    else f"추세 규모의 {f['rebound'] * 100:.1f}%만큼")
         reasons = [
-            f"고점({peak_date}) 이후 하락해 {trough_date}에 저점을 찍은 뒤 {reb_txt} 반등했습니다.",
+            f"고점({peak_date}) 이후 하락해 {trough_when}에 저점을 찍은 뒤 {reb_txt} 반등했습니다.",
             recent_sentence(),
             peak_sentence(),
         ]
@@ -1924,7 +2312,10 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
             reasons = [recent_sentence()]
             if mk_up:
                 reasons.append(mk_sentence())
-            reasons.append(f"현재 수준은 추세 고점의 {100 * (1 - f['drop_from_peak']):.0f}% 수준입니다.")
+            share = 100 * (1 - f["drop_from_peak"])
+            # "추세 고점의 100% 수준" reads oddly: at (or within rounding of) the high, say so
+            reasons.append(f"현재 추세는 고점({peak_date}) 수준입니다." if share >= 99.5
+                           else f"현재 수준은 추세 고점의 {share:.0f}% 수준입니다.")
     elif (f["i_max"] >= 0.6 * (n - 1) and f["rise_to_peak"] >= 0.25
           and f["rise_to_peak"] * f["ref"] >= 3.0 * f["sigma"]
           and f["stall_ratio"] >= _STALL_RATIO and f["drop_from_peak"] < 0.05
@@ -1960,7 +2351,7 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
         strength = 0.2
         reasons = [mk_sentence(), recent_sentence()]
         if label == "volatile":
-            reasons.append(f"잡음이 커서(추정 잡음 수준이 평균의 {f['cv'] * 100:.0f}%) 방향성이 불분명합니다.")
+            reasons.append(noise_sentence("방향성이 불분명합니다."))
 
     if walk and label in ("volatile", "stable") and len(reasons) < 4:
         reasons.append(walk_sentence)
@@ -1968,10 +2359,10 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
     recent_cps = [c for c in changepoints if c.index >= n - max(h, 2 * _data.season_length(freq))]
     if recent_cps and len(reasons) < 4 and post is None:
         c = recent_cps[-1]
-        reasons.append(f"{_fmt_date(c.date, freq)}에 구조 변화({_KIND_KO.get(c.kind, c.kind)})가 감지되었습니다.")
+        reasons.append(f"{_when_ko(c.date, freq)}에 구조 변화({_KIND_KO.get(c.kind, c.kind)})가 감지되었습니다.")
     if walk and label not in ("volatile", "stable") and len(reasons) < 4:
         reasons.append(walk_sentence)
-    if len(reasons) < 2:
+    if len(reasons) < 2 and mk_sentence() not in reasons:
         reasons.append(mk_sentence())
     reasons = reasons[:4]
 
@@ -2035,6 +2426,7 @@ def analyze(series: pd.Series, freq: Optional[str] = None,
     z = (dec.trend + dec.resid).to_numpy(dtype=float)
     cps = _changepoints_from(z, pd.DatetimeIndex(s.index), sl, 5, None) if n >= 8 else []
     shifts = [c.index for c in cps if c.kind == "level_shift"]
+    kept: list[int] = []
     if shifts:
         # let the trend jump at level shifts (no smoothing across the step, which
         # would make the points next to it look like spikes/dips)
@@ -2050,8 +2442,8 @@ def analyze(series: pd.Series, freq: Optional[str] = None,
                     c.kind = "reversal_down"
                 else:
                     c.kind = "acceleration" if abs(s2) > abs(s1) else "deceleration"
-    anomalies = detect_anomalies(s, dec) if n >= 8 else []
-    metrics = compute_metrics(s, freq, dec)
+    anomalies = detect_anomalies(s, dec, breaks=kept) if n >= 8 else []
+    metrics = compute_metrics(s, freq, dec, anomalies=anomalies)
     phase = lifecycle_phase(s, freq, dec, metrics, cps)
     nm = name if name is not None else (str(s.name) if s.name is not None else "series")
     return AnalysisResult(name=nm, series=s, freq=freq, season_length=int(sl),

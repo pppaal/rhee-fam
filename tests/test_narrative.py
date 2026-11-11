@@ -584,11 +584,14 @@ def test_flat_direction_with_visible_change_is_explained(fake_report):
     rep = dataclasses.replace(fake_report, outlook=dataclasses.replace(
         fake_report.outlook, direction="flat", expected_change_pct=33.3))
     ko = rule_based_narrative(*_parts(rep))
-    assert "**+33.3%** 변화가 예상되지만 예측 불확실성에 비해 크지 않아 방향은 **보합**으로 봅니다" in ko
-    assert "변화(보합)" not in ko
-    assert "예측 불확실성 대비 크지 않아 **보합** 전망" in ko
+    # round 3 (UX-1): a +33 % change rated 'flat' only because of the forecast uncertainty is
+    # "방향 불확실", no longer "보합" (= roughly unchanged), which contradicted the number
+    assert "**+33.3%** 변화가 예상되지만 예측 불확실성이 그보다 커서 **방향은 불확실**합니다" in ko
+    assert "변화(보합)" not in ko and "보합" not in ko
+    assert "예측 불확실성이 이 변화보다 커서 **방향 불확실**, 예측 종료" in ko
     en = rule_based_narrative(*_parts(rep), lang="en")
-    assert "small relative to the forecast uncertainty" in en
+    assert "uncertainty is larger than that, so the **direction is uncertain**" in en
+    assert "the **direction is uncertain**; forecast to" in en
     small = dataclasses.replace(rep, outlook=dataclasses.replace(rep.outlook, expected_change_pct=1.0))
     assert "**+1.0%** 변화(보합)가 예상됩니다" in rule_based_narrative(*_parts(small))
 
@@ -1044,9 +1047,13 @@ def test_seasonal_low_is_not_framed_as_a_fall_from_the_peak():
     ko = rule_based_narrative(*_parts(rep))
     line = next(ln for ln in ko.splitlines() if ln.startswith("- 최고치는"))
     assert "계절적으로 낮은 시기" in line and "계절 요인을 뺀 추세선 기준으로는" in line
-    assert "여전히 고점 부근입니다" in line and "상당히 내려와" not in line
+    # round 3 (UX-21): this trend line ends at its maximum, so it says so instead of
+    # "고점 대비 0.0%로 여전히 고점 부근입니다" (a −x % trend gap keeps that wording, see
+    # test_seasonal_gap_names_its_actual_cause)
+    assert "추세선 기준으로는 지금이 고점입니다" in line and "상당히 내려와" not in line
+    assert "0.0%" not in line
     en = rule_based_narrative(*_parts(rep), lang="en")
-    assert "seasonal low" in en and "still close to the high" in en
+    assert "seasonal low" in en and "the level is at its high now" in en
     # the English evidence for 'stable' never argues with the distance from the peak
     evidence = [ln for ln in en.splitlines() if ln.startswith("- Evidence:")]
     assert evidence and not any("peak" in ln for ln in evidence)
@@ -1120,3 +1127,449 @@ def test_fallback_evidence_is_phase_aware_and_complete(fake_report):
         assert any("below the peak" in ln for ln in evidence) == has_peak
         assert any("Over the last 12 months the trend changed by +35.0%." in ln for ln in evidence)
         assert not HANGUL.search(en.replace(r.name, ""))
+
+
+# --------------------------------------------------------------------------- round-3 regressions
+# Each test failed before the round-3 fix (AN1-AN8).
+
+
+def _run(series, **kw):
+    pipeline = pytest.importorskip("trendai.pipeline")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return pipeline.run(series, **kw)
+
+
+def _intermittent_series() -> pd.Series:
+    rng = np.random.default_rng(3)
+    idx = pd.date_range("2020-01-01", periods=60, freq="MS")
+    return pd.Series(np.where(rng.random(60) < 0.25, rng.poisson(4, 60) + 1, 0).astype(float), index=idx)
+
+
+def _level_shift_series() -> pd.Series:
+    idx = pd.date_range("2021-01-03", periods=156, freq="W-SUN")
+    y = 200 + np.random.default_rng(0).normal(0, 6, 156)
+    y[100:] += 60
+    return pd.Series(y, index=idx)
+
+
+@pytest.mark.parametrize("ko,en", [
+    ("현재 추세는 고점(2025-05) 수준입니다.", "The trend is at its peak (2025-05)."),
+    ("현재 추세는 고점(2024년) 수준입니다.", "The trend is at its peak (2024)."),
+    ("2050년에 구조 변화(가속)가 감지되었습니다.", "A structural break (acceleration) was detected in 2050."),
+    ("2008년에 수준이 한 단계 높아졌습니다 (약 +31.9%).", "In 2008 the level stepped up (about +31.9%)."),
+    ("고점(2016) 이후 하락해 2042년에 저점을 찍은 뒤 +68.0% 반등했습니다.",
+     "After the peak (2016) it fell to a low in 2042, then rebounded +68.0%."),
+    ("추세는 저점 대비 +95% 오른 뒤 2019년에 고점을 형성했습니다.",
+     "The trend rose +95% from its low and peaked in 2019."),
+])
+def test_translate_reason_round3_templates(ko, en):
+    # AN1 / AN2: new analysis wording ("추세 고점 수준", yearly "2016년에") stays translatable
+    assert nv.translate_reason(ko) == en
+
+
+def test_real_engine_yearly_and_peak_reasons_translate():
+    analysis_mod = pytest.importorskip("trendai.analysis")
+    cases = [(sample(nm, n=40, freq="Y"), "Y") for nm in ("emerging", "reviving")] + [(sample("growing"), "M")]
+    idx = pd.date_range("1990-01-01", periods=30, freq="YS")
+    y = 100 + np.random.default_rng(0).normal(0, 2, 30)
+    y[18:] += 30
+    cases.append((pd.Series(y, index=idx), "Y"))
+    seen = []
+    for s, freq in cases:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            a = analysis_mod.analyze(s, freq=freq)
+        for r in a.phase.reasons:
+            t = nv.translate_reason(r)
+            assert t and "년" not in t and not HANGUL.search(t), r
+            seen.append(r)
+    joined = " ".join(seen)
+    assert "년에" in joined and re.search(r"현재 추세는 고점\(\d{4}-\d{2}\) 수준입니다\.", joined)
+
+
+@pytest.mark.parametrize("name", ["seasonal", "volatile"])
+def test_noise_dominated_momentum_is_not_narrated_as_a_trend(name):
+    # AN3: momentum of -0.12 %p/month on the stable seasonal sample was "최근에는 하락하고 있습니다"
+    rep = _run(sample(name), name=name)
+    assert rep.analysis.phase.label in ("stable", "volatile")
+    for lang in ("ko", "en"):
+        text = rule_based_narrative(*_parts(rep), lang=lang)
+        line = next(ln for ln in text.splitlines() if ln.startswith(("- 모멘텀", "- Momentum")))
+        for bad in ("최근에는 상승", "최근에는 하락", "(가속)", "(둔화)", "빠른 속도로", "둔화되고",
+                    "rising recently", "falling recently", "(accelerating)", "(decelerating)", "is slowing"):
+            assert bad not in line, (lang, line)
+        assert ("잡음 수준" in line) if lang == "ko" else ("within the noise" in line)
+
+
+def test_white_noise_and_directional_momentum_phrases():
+    # AN3: pure noise reads as noise; genuine trends keep their momentum wording
+    idx = pd.date_range("2015-01-01", periods=120, freq="MS")
+    trendy = 0
+    for seed in range(8):
+        s = pd.Series(100 + np.random.default_rng(seed).normal(0, 5, 120), index=idx)
+        pytest.importorskip("trendai.analysis")
+        from trendai.analysis import analyze
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            a = analyze(s)
+        f = ForecastResult(mean=pd.Series([100.0], index=future_index(idx[-1], "M", 1)), lower={}, upper={},
+                           horizon=1, levels=(), model_scores=[], method="naive")
+        o = Outlook(direction="flat", expected_change_pct=0.0, prob_increase=0.5, scenarios={},
+                    forecast_peak_date=None, future_phase=a.phase.label, confidence="low")
+        ko = nv._momentum_phrase(nv._Ctx(a, f, o, "ko"))[0]
+        trendy += any(w in ko for w in ("(가속)", "최근에는 상승", "최근에는 하락", "(둔화)", "빠른 속도로", "둔화되고"))
+    assert trendy == 0                                    # was 4 of 8
+    texts = {nm: rule_based_narrative(*_parts(_run(sample(nm), name=nm))) for nm in ("growing", "fad", "peaking")}
+    assert "장기 평균보다 빠른 속도로 성장하고 있습니다 (가속)" in texts["growing"]
+    assert "장기 흐름과 달리 최근에는 하락하고 있습니다" in texts["fad"]
+    assert "성장 속도가 장기 평균보다 느려지고 있습니다 (둔화)" in texts["peaking"]
+
+
+def test_peak_sentence_names_the_excluded_spike():
+    # AN4: metrics.peak_value leaves out flagged one-off spikes; the narrative must say so
+    s = sample("growing").copy()
+    s.iloc[60] += 150.0                                   # a one-month spike far above everything else
+    rep = _run(s, name="spiky")
+    m = rep.analysis.metrics
+    assert m.peak_value < float(s.max())
+    ko = rule_based_narrative(*_parts(rep))
+    line = next(ln for ln in ko.splitlines() if ln.startswith("- 최고치는"))
+    assert f"{format_number(m.peak_value)}(일회성 급등 제외)" in line
+    assert f"{format_date(s.index[60], 'M')}의 일시적 급등({format_number(float(s.max()))})" in line
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    line_en = next(ln for ln in en.splitlines() if ln.startswith("- The peak"))
+    assert "(excluding one-off spikes)" in line_en and f"spike to {format_number(float(s.max()), lang='en')}" in line_en
+    # no spike above the peak: plain sentence
+    plain = rule_based_narrative(*_parts(_run(sample("growing"), name="g")))
+    assert "일회성 급등 제외" not in plain
+
+
+def test_rise_from_a_level_shift_is_not_called_steady_growth():
+    # AN5: stable after a one-off step, but whole-period MK 'up' and CAGR > 0
+    rep = _run(_level_shift_series(), name="step")
+    a = rep.analysis
+    assert a.phase.label == "stable" and a.metrics.direction == "up" and a.metrics.cagr_pct > 0
+    ko = rule_based_narrative(*_parts(rep))
+    past = ko.split("## 현재")[0]
+    assert "다만 이 상승은 꾸준한 추세가 아니라 **2022-12-04**의 한 차례 수준 변화" in past
+    assert "꾸준한 성장으로 해석하면 안 됩니다" in past
+    mom = next(ln for ln in ko.splitlines() if ln.startswith("- 모멘텀"))
+    assert "한 차례의 수준 변화" in mom and "최근에는 하락하고" not in mom
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "came from a one-off step on **2022-12-04**" in en and "do not mean steady growth" in en
+    assert "On **2022-12-04** the level jumped up" in en          # a day takes "On", not "In"
+    # a step down reads the same way ("감소로", not "감소으로")
+    down = _level_shift_series()
+    down.iloc[100:] -= 120.0
+    ko_d = rule_based_narrative(*_parts(_run(down, name="drop")))
+    assert "다만 이 하락은 꾸준한 추세가 아니라" in ko_d and "꾸준한 감소로 해석하면 안 됩니다" in ko_d
+    # a genuinely growing series gets no such caveat
+    assert "한 차례 수준 변화" not in rule_based_narrative(*_parts(_run(sample("growing"), name="g")))
+
+
+def test_probability_describes_the_same_levels_as_the_expected_change():
+    # AN6: prob_increase = P(future season-mean > current season-mean), not P(end value > now)
+    for rep in (_run(sample("seasonal"), name="m"), _run(_level_shift_series(), name="w")):
+        ko = rule_based_narrative(*_parts(rep))
+        lines = ko.splitlines()
+        i = next(k for k, ln in enumerate(lines) if "변할 것으로 예상됩니다" in ln)
+        chg, prob, scen = lines[i], lines[i + 1], lines[i + 2]
+        assert "높아질 확률은" in prob and "시점 시나리오" in scen           # change -> probability -> scenarios
+        fut, cur = re.match(r"- (.+?)은 (.+?)보다 \*\*", chg).groups()
+        assert prob.startswith(f"- {fut}이 {cur}보다 높아질 확률은")
+        assert "현재 수준보다 높아질 확률" not in ko
+        assert "변화율·확률과 다를 수 있습니다" in scen                      # end values: another quantity
+        en = rule_based_narrative(*_parts(rep), lang="en")
+        assert "ending above the current level" not in en
+        assert re.search(r"- Probability that the (seasonally adjusted )?average forecast over the next \d+ \w+ "
+                         r"is higher than the average of the last \d+ \w+: ", en)
+        payload = build_llm_payload(*_parts(rep))
+        basis = payload["outlook"]["prob_increase_basis"]
+        assert "same two levels as expected_change_pct" in basis and "NOT the probability" in basis
+    assert "never as the chance that the value at the horizon" in SYSTEM_PROMPT.replace("\n", " ")
+
+
+def test_undefined_change_and_fallback_forecast_make_no_claims():
+    # AN7: intermittent demand -> expected_change_pct None; n = 4 yearly -> fallback (no scores, no skill)
+    inter = _run(_intermittent_series(), name="parts")
+    assert inter.outlook.expected_change_pct is None
+    tiny = _run(pd.Series([10.0, 12.0, 15.0, 14.0], index=pd.date_range("2020", periods=4, freq="YS")),
+                name="tiny")
+    assert tiny.forecast.model_scores == [] and tiny.forecast.skill is None
+    for rep in (inter, tiny):
+        for lang in ("ko", "en"):
+            text = rule_based_narrative(*_parts(rep), lang=lang)
+            assert not _BAD_TOKEN.search(text.replace(rep.name, ""))
+        payload = build_llm_payload(*_parts(rep))
+        json.dumps(payload, allow_nan=False)
+    ko = rule_based_narrative(*_parts(inter))
+    future = ko.split("## 미래 전망")[1].split("## 주의할 점")[0]
+    first, scen = future.splitlines()[1], next(ln for ln in future.splitlines() if "시점 시나리오" in ln)
+    assert "최근 12개월 중 절반 이상이 0이라 변화율은 계산하지 않음" in first and "0에 가까워" not in first
+    assert "%" not in first and "%" not in scen.split("95%")[0].replace("80% 예측구간", "")
+    en = rule_based_narrative(*_parts(inter), lang="en")
+    assert "at least half of the last 12 months are zero" in en
+    p_out = build_llm_payload(*_parts(inter))["outlook"]
+    assert p_out["expected_change_pct"] is None and "null here because at least half" in p_out["expected_change_basis"]
+    assert p_out["compared_levels"]["current"] == pytest.approx(0.5)
+    ko_t = rule_based_narrative(*_parts(tiny))
+    assert "백테스트로 정확도를 검증하지 못했습니다" in ko_t and "백테스트 상위 모델" not in ko_t
+    assert "단순 기준" not in ko_t.split("- 정확도:")[1].splitlines()[0]
+    pt = build_llm_payload(*_parts(tiny))
+    assert pt["model_leaderboard"] == [] and pt["forecast"]["skill"] is None
+
+
+@pytest.mark.parametrize("name,freq,n", [
+    ("seasonal", "M", 120), ("growing", "W", 156), ("fad", "Q", 40), ("emerging", "Y", 25),
+    ("seasonal", "D", 400), ("reviving", "M", 30), ("growing", "W", 60),
+])
+def test_outlook_windows_reproduce_compute_outlook(name, freq, n):
+    # AN8: the narrative's description of the compared levels is exactly compute_outlook's
+    forecast_mod = pytest.importorskip("trendai.forecast")
+    rep = _run(sample(name, n=n, freq=freq), name=name, freq=freq)
+    a, f, o = _parts(rep)
+    w = nv._outlook_windows(a, f)
+    m = a.season_length
+    assert (w.k_cur, w.k_fut) == (min(m, n), min(m, len(f.mean)))
+    assert w.current is not None and w.future is not None
+    if o.expected_change_pct is None:
+        assert w.undefined is not None
+    else:
+        assert w.undefined is None
+        assert (w.future - w.current) / abs(w.current) * 100 == pytest.approx(o.expected_change_pct, rel=1e-9,
+                                                                             abs=1e-9)
+    # the adjustment flags agree with compute_outlook's own seasonal component
+    seas, p = forecast_mod._seasonal_component(a)
+    assert w.adj_fut == (seas is not None and w.k_fut % p != 0)
+    assert w.adj_cur == (seas is not None and w.k_cur % p != 0)
+    if w.future != w.current:                             # same levels -> same sign as prob_increase
+        assert (w.future > w.current) == (o.prob_increase > 0.5)
+    payload = build_llm_payload(a, f, o)["outlook"]["compared_levels"]
+    assert payload == {"current": nv._r(w.current), "future": nv._r(w.future)}
+
+
+def test_outlook_windows_none_rule_matches_compute_outlook():
+    # AN8: the 'mostly zero' rule of compute_outlook (>= half of the current window exactly 0)
+    rep = _run(_intermittent_series(), name="parts")
+    w = nv._outlook_windows(*_parts(rep)[:2])
+    assert rep.outlook.expected_change_pct is None and w.undefined == "mostly_zero"
+    zeros = _run(pd.Series(np.r_[np.arange(1.0, 49.0), np.zeros(12)],
+                           index=pd.date_range("2018-01-01", periods=60, freq="MS")), name="z")
+    wz = nv._outlook_windows(*_parts(zeros)[:2])
+    assert zeros.outlook.expected_change_pct is None and wz.undefined == "zero"
+    assert "현재 수준이 0에 가까워" in rule_based_narrative(*_parts(zeros))
+
+
+# --------------------------------------------------------------------------- round 3 (final review)
+
+
+def _sample_run(name: str, freq: str = "M", n=None):
+    kw = {"freq": freq} if n is None else {"freq": freq, "n": n}
+    return _run(sample(name, **kw), name=name, freq=freq)
+
+
+def test_large_flat_change_is_uncertain_not_boap():
+    # UX-1: '+75.3% 변화가 예상되지만 … 방향은 보합' -- 보합 means roughly unchanged
+    assert nv.direction_label("flat", 75.3) == "방향 불확실"
+    assert nv.direction_label("flat", -2.1, "en") == "direction uncertain"
+    assert nv.direction_label("flat", 1.0) == "보합" and nv.direction_label("flat", None) == "보합"
+    assert nv.direction_label("up", 30.0) == "상승" and nv.direction_label("down", -9.0, "en") == "downward"
+    rep = _sample_run("emerging", "Y", 12)
+    assert rep.outlook.direction == "flat" and abs(rep.outlook.expected_change_pct) >= 2
+    ko = rep.narrative
+    assert "보합" not in ko and "방향은 불확실" in ko.splitlines()[0]
+    assert build_llm_payload(*_parts(rep))["outlook"]["direction_label"]["ko"] == "방향 불확실"
+    assert "direction_label" in SYSTEM_PROMPT
+
+
+def test_latest_value_is_not_called_a_one_off_spike():
+    # UX-5: '최고치는 2026년의 42.3(일회성 급등 제외)이며, 현재가 사실상 역대 최고 수준입니다.
+    # 2027년의 일시적 급등(72.0)은 이상치로 보아 제외했습니다.' -- 72.0 is the latest value
+    rep = _sample_run("emerging", "Y", 12)
+    ko = rep.narrative
+    last_year = f"{rep.analysis.series.index[-1].year}년"           # the latest observation
+    peak = next(ln for ln in ko.splitlines() if ln.startswith("- 최고치는"))
+    assert "일회성 급등 제외" not in peak and "일시적 급등(72.0)" not in peak
+    assert f"{last_year}의 72.0" in peak and "새로운 수준인지는 다음 관측으로 확인해야 합니다" in peak
+    an = next(ln for ln in ko.splitlines() if ln.strip().startswith(f"- {last_year}: 실제 72.0"))
+    assert "가장 최근 값이라 일시적 급등인지 새로운 수준인지는 아직 알 수 없습니다" in an
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "one-off or a new level" in en and "treated as an anomaly and left out" not in en
+
+
+def test_seasonal_gap_names_its_actual_cause():
+    # UX-7: the daily sample's last day is a Friday with seasonal effect +4.2 (above trend) but
+    # was described as "최근 시점이 계절적으로 낮은 시기"; the gap came from a Saturday peak (+7.9)
+    rep = _sample_run("seasonal", "D", 400)
+    dec, m = rep.analysis.decomposition, rep.analysis.metrics
+    assert float(dec.seasonal.iloc[-1]) > 0
+    line = next(ln for ln in rep.narrative.splitlines() if ln.startswith("- 최고치는"))
+    assert "최근 시점이 계절적으로 낮은 시기" not in line
+    assert f"고점이 계절적으로 높은 시기({nv._WEEKDAY_KO[m.peak_date.dayofweek]})에 찍힌 값이어서" in line
+    # a trend gap of a few % keeps "여전히 고점 부근" (only an exact high reads "지금이 고점")
+    assert re.search(r"고점 대비 −\d\.\d%로 여전히 고점 부근입니다", line), line
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "the latest period falls in a seasonal low" not in en and "the peak fell in a seasonal high" in en
+    # the latest point in a seasonal low is still said to be one
+    low = _seasonal_low_report()
+    ko = rule_based_narrative(*_parts(low))
+    assert "최근 값은 계절적으로 낮은 시기(12월)에" in ko
+
+
+def test_insignificant_mk_with_large_tau_is_explained():
+    # UX-10: "유의한 장기 추세는 확인되지 않습니다 (τ = 0.70, p = 0.140)" right after "+1,683 %"
+    rep = _sample_run("emerging", "Y", 12)
+    line = next(ln for ln in rep.narrative.splitlines() if ln.startswith("- Mann-Kendall"))
+    assert "자기상관 보정 p = " in line
+    assert "관측치가 12개로 적고 값의 움직임이 서로 이어져 있어(자기상관) 통계적으로는 확정하기 어렵습니다" in line
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "after correcting for autocorrelation" in en and "cannot be confirmed statistically" in en
+    # a significant trend or a small tau gets no such clause
+    for nm in ("growing", "volatile"):
+        assert "확정하기 어렵습니다" not in _sample_run(nm).narrative
+    assert nv._mk_classic_p(0.70, 12) < 0.01 < nv._mk_classic_p(0.2, 12)
+
+
+def test_method_is_described_in_plain_words():
+    # UX-11: 'ensemble(holt_damped 0.34, ar 0.33, holt_damped@log 0.33)' and bare
+    # 'logistic_growth' in Korean prose
+    rep = _sample_run("fad")
+    line = next(ln for ln in rep.narrative.splitlines() if ln.startswith("- 예측 방법:"))
+    prose = line.split("(모델 ID:")[0]
+    assert not re.search(r"[a-z]+_[a-z_@]+|ensemble\(", prose), line
+    assert "3개 모델 앙상블(감쇠 추세 Holt" in prose and "자기회귀(AR)" in prose and "(로그 공간)" in prose
+    assert "(모델 ID: holt_damped, " in line
+    single = next(ln for ln in _sample_run("emerging").narrative.splitlines() if ln.startswith("- 예측 방법:"))
+    assert single.startswith("- 예측 방법: 로지스틱 S-커브 단일 모델")
+    assert nv.model_label("holt_damped@log") == "감쇠 추세 Holt(로그 공간)"
+    assert nv.model_label("holt_winters@log", "en") == "Holt-Winters seasonal (log scale)"
+    assert nv.model_label("my_model") == "my_model"
+    fb = ForecastResult(mean=pd.Series([1.0], index=pd.date_range("2030", periods=1, freq="YS")), lower={},
+                        upper={}, horizon=1, levels=(), model_scores=[],
+                        method="fallback(drift 0.50, naive 0.50) [too short to backtest]")
+    assert nv.describe_method(fb) == ("데이터가 짧아 백테스트 없이 만든 기본 예측"
+                                      "(드리프트(평균 기울기) · 단순 예측(직전값) 동일 비중)")
+    # members are the weighted models, not the first MASE rows (intermittent: chosen by RMSE)
+    scores = [ModelScore("naive", 1, 1, 1, 0.5, 0.0), ModelScore("sba", 1, 1, 1, 0.9, 0.6),
+              ModelScore("ses", 1, 1, 1, 0.95, 0.4)]
+    ens = dataclasses.replace(fb, model_scores=scores, method="ensemble(sba 0.60, ses 0.40)")
+    assert nv.describe_method(ens) == "2개 모델 앙상블(간헐 수요 Croston(SBA 보정) 60% · 단순 지수평활 40%)"
+    payload = build_llm_payload(*_parts(rep))
+    assert payload["forecast"]["method_description"]["ko"].startswith("3개 모델 앙상블")
+
+
+def test_rising_phase_with_a_non_rising_forecast_is_reconciled():
+    # UX-19: reviving Q/40 ('최근에는 상승하고 있습니다', +30.4 % in 4 quarters) with a forecast
+    # that drops at once and goes flat -- nothing told the reader the models do not extend it
+    rep = _sample_run("reviving", "Q", 40)
+    assert rep.analysis.phase.label == "reviving" and rep.outlook.expected_change_pct < 2
+    ko = rep.narrative
+    future = ko.split("## 미래 전망")[1].split("## 주의할 점")[0]
+    assert "최근 반등세가 뚜렷하지만, 백테스트로 고른 예측 모델은 이 흐름이 이어진다고 보지 않고" in future
+    assert "현재 수준 부근에 머물 것으로 예측합니다" in future       # −2.1 %: not "오히려 낮아질"
+    assert "do not extend it" in rule_based_narrative(*_parts(rep), lang="en")
+    # a forecast that does continue the move gets no such sentence
+    assert "이 흐름이 이어진다고 보지 않고" not in _sample_run("growing").narrative
+
+
+def test_round3_wording_nits():
+    # UX-21: "보통 수준입니다 … 보통 3월에 높고", "expected to be −63.3% versus",
+    # "상당히 내려와" for a noise peak in a volatile series
+    peaking = _sample_run("peaking").narrative
+    assert "보통 3월에" not in peaking and "대체로 3월에 높고 10월에 낮은 패턴이 반복됩니다" in peaking
+    assert "고점 대비 0.0%" not in peaking and "추세선 기준으로는 지금이 고점입니다" in peaking
+    en = rule_based_narrative(*_parts(_sample_run("fad")), lang="en")
+    assert "is expected to be" not in en and "is expected to change by **−" in en
+    vol = _sample_run("volatile")
+    line = next(ln for ln in vol.narrative.splitlines() if ln.startswith("- 최고치는"))
+    assert "상당히 내려와" not in line and "최고치보다" in line and "일시적 등락" in line
+
+
+def test_weak_seasonality_names_no_months():
+    # UX-6: '계절성은 약한 편입니다 (강도 0.34). 보통 8월에 높고 9월에 낮은 패턴이 반복됩니다'
+    # on trend + white noise
+    idx = pd.date_range("2021-01-01", periods=36, freq="MS")
+    hits = 0
+    for seed in range(12):
+        y = 1200 + 25 * np.arange(36) + np.random.default_rng(seed).normal(0, 80, 36)
+        hits += "패턴이 반복됩니다" in _run(pd.Series(y, index=idx), name="x", freq="M").narrative
+    assert hits == 0
+    rep = _report_from_values(100 + np.random.default_rng(0).normal(0, 1, 36))
+    rep = _replace_metrics(rep, seasonal_strength=0.25)
+    rep = dataclasses.replace(rep, analysis=dataclasses.replace(rep.analysis, decomposition=dataclasses.replace(
+        rep.analysis.decomposition, period=12)))
+    assert "뚜렷한 반복 패턴은 확인되지 않습니다" in rule_based_narrative(*_parts(rep))
+
+
+def test_intermittent_demand_narrative_makes_no_percent_or_drawdown_claims():
+    # F2: '+3,192.4% … CAGR +239.9%', '최근 52주 동안 추세는 +231.3%', '고점의 1/10 이하로 급감',
+    # and ordinary orders listed as '+1,349.8%, z = +12.4' anomalies
+    rng = np.random.default_rng(9)
+    y = np.where(rng.random(150) < 0.15, rng.integers(1, 6, 150), 0).astype(float)
+    rep = _run(pd.Series(y, index=pd.date_range("2021-01-03", periods=150, freq="W-SUN")), name="주간 판매량")
+    ko = rep.narrative
+    past_now = ko.split("## 미래 전망")[0]
+    assert "급감" not in ko and "CAGR" not in ko and not re.search(r"[+−]\d[\d,]*\.\d%", past_now)
+    assert "간헐적 수요여서, 추세선(평균 수요율" in past_now and "고점 대비 하락률은 의미가 없습니다" in past_now
+    assert "최근 52주 변화율은 계산하지 않았습니다" in past_now
+    payload = build_llm_payload(*_parts(rep))
+    assert payload["series"]["intermittent"] is True and "intermittent" in payload["conventions"]
+    # a large order is told as such, not as "+1,350 %"
+    s = pd.Series(y, index=pd.date_range("2021-01-03", periods=150, freq="W-SUN"))
+    s.iloc[int(np.flatnonzero(y > 0)[10])] = 60.0
+    ko2 = _run(s, name="x").narrative
+    assert "평소보다 훨씬 큰 수요가 1건 있었습니다:" in ko2 and "평소 수요 규모(" in ko2
+    # an expected value near 0 gets no percentage in an ordinary anomaly line
+    an = Anomaly(date=pd.Timestamp("2018-07-01"), index=30, value=4.0, expected=0.01, zscore=9.0)
+    c = nv._Ctx(_report_from_values(np.r_[np.zeros(30), 4.0, np.zeros(5)] + 1.0).analysis, *_parts(
+        _report_from_values(np.ones(36)))[1:], "ko")
+    assert "%" not in nv._anomaly_line(c, an)
+
+
+def test_momentum_line_names_its_basis():
+    # UX-8: '+15.73 %p/월' read as acceleration against the whole-period mean
+    rep = _sample_run("emerging")
+    line = next(ln for ln in rep.narrative.splitlines() if ln.startswith("- 모멘텀"))
+    assert "현재 추세 수준 대비" in line
+    mom = float(re.search(r"([+−][\d.]+)%p/월", line).group(1).replace("−", "-"))
+    assert 0 < mom < 6                                     # was +15.73 while the trend grew ~4 %/month
+    assert "recent (current) trend level" in build_llm_payload(*_parts(rep))["conventions"]["momentum"]
+
+
+@pytest.mark.parametrize("ko,en", [
+    ("관측 기간 동안 값이 3.00에서 6.00까지 +100.0% 변했습니다.",
+     "Over the observed period the value moved from 3.00 to 6.00 (+100.0%)."),
+    ("계절성 강도(0.96)가 높아 주기적 변동이 뚜렷합니다.", "Seasonal strength is 0.96: a clear recurring cycle."),
+    ("잡음이 커서(추정 잡음 수준이 값의 변동 폭의 61%) 뚜렷한 방향성이 없습니다.",
+     "Noise is large (estimated at 61% of the typical spread of the values), so there is no clear direction."),
+    ("잡음이 커서(추정 잡음 수준이 평균의 1,250%) 방향성이 불분명합니다.",
+     "Noise is large (estimated at 1,250% of the mean), so there is no clear direction."),
+    ("추세선의 등락이 잡음으로 생길 수 있는 범위를 크게 넘지 않습니다.",
+     "The trend's ups and downs stay within what noise alone could produce."),
+    ("최근 4년 동안 추세가 +1,076.8% 변했습니다.", "Over the last 4 years the trend changed by +1,076.8%."),
+    ("2022-09에 수준이 한 단계 높아졌습니다 (약 +2,392,181).", "In 2022-09 the level stepped up (about +2,392,181)."),
+    ("최근 6개월 동안 추세 기울기는 +1.2×10⁻⁷/개월입니다.",
+     "Over the last 6 months the trend slope was +1.2×10⁻⁷ per month."),
+])
+def test_translate_round3_reasons(ko, en):
+    assert nv.translate_reason(ko) == en
+
+
+def test_round3_reasons_from_real_analyses_all_translate():
+    # every reason the analysis now produces has an English template
+    cases = (
+        sample("seasonal"), sample("volatile"), sample("emerging", freq="Y", n=12),
+        pd.Series(np.random.default_rng(0).normal(0, 1, 120), index=pd.date_range("2015-01-01", periods=120, freq="MS")),
+        pd.Series(np.r_[np.zeros(19), 1.0], index=pd.date_range("2020-01-01", periods=20, freq="MS")),
+        pd.Series(np.r_[np.zeros(20), 2_400_000 + np.random.default_rng(0).normal(0, 60_000, 28)].round(0),
+                  index=pd.date_range("2021-01-01", periods=48, freq="MS")),
+        pd.Series([3.0, 4.0, 4.5, 5.0, 6.0], index=pd.date_range("2020-01-01", periods=5, freq="MS")),
+    )
+    from trendai.analysis import analyze
+    for s in cases:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            a = analyze(s)
+        for r in a.phase.reasons:
+            assert nv.translate_reason(r), r

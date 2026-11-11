@@ -7,6 +7,13 @@ change, momentum) so that early, accelerating trends float to the top::
     score = 50 + 50 * (0.35·tanh(expected_ann/50%) + 0.25·(2·P(up) − 1)
                        + 0.20·tanh(recent_ann/50%) + 0.20·tanh(momentum_pm/2))
 
+The two backward-looking terms (recent change, momentum) count only where the
+analysis found a reliable recent trend: in a ``'stable'`` or ``'volatile'``
+phase its rules found the recent slope to be within the noise (the narrative
+calls such a difference "잡음 수준"), so both terms are 0 there and the score
+rests on the outlook alone -- a noise series cannot outrank a positive
+outlook on the strength of a random recent upswing.
+
 All inputs are put on a **common time basis** first, so a daily and a monthly
 file of the same process get about the same score:
 
@@ -18,8 +25,10 @@ file of the same process get about the same score:
   ``periods_per_year`` periods; annualised when the series is shorter),
 * ``momentum_pm`` – the analysis' momentum converted from % per period to
   % per month,
-* ``P(up)`` – the outlook's probability of a rise at the end of the forecast
-  horizon (used as is).
+* ``P(up)`` – the outlook's ``prob_increase``: the probability that the
+  future level (mean of the last season of the horizon) exceeds the current
+  level (mean of the last season), i.e. the same two levels as the expected
+  change (used as is).
 
 For monthly data with the default 12-month horizon the annualised numbers equal
 the per-report ones, so the score is unchanged there.  The raw per-report
@@ -44,6 +53,10 @@ RANK_COLUMNS = ["name", "phase", "phase_ko", "momentum", "recent_change_pct",
                 "freq", "momentum_per_month", "recent_change_ann_pct", "expected_change_ann_pct"]
 
 _MAX_LOG_GROWTH = math.log(101.0)  # cap annualised growth at +10,000 % (keeps every float finite)
+
+#: lifecycle phases in which the analysis found no reliable recent trend: the recent change
+#: and the momentum are noise there and do not enter the rising score
+NOISE_PHASES = ("stable", "volatile")
 
 
 def _f(x: Optional[float]) -> float:
@@ -131,13 +144,16 @@ def rising_score(report: TrendReport) -> float:
 
     Frequency-neutral: the change components are annualised and momentum is
     per month (see the module docstring), so daily, weekly, monthly and
-    quarterly series can be ranked together.
+    quarterly series can be ranked together.  In a ``'stable'`` /
+    ``'volatile'`` phase the recent change and momentum are noise and are
+    left out (the outlook alone decides).
     """
     o = report.outlook
     z = (0.35 * math.tanh(_f(expected_change_annualised(report)) / 50.0)
-         + 0.25 * (2.0 * min(1.0, max(0.0, _f(o.prob_increase))) - 1.0)
-         + 0.20 * math.tanh(_f(recent_change_annualised(report)) / 50.0)
-         + 0.20 * math.tanh(momentum_per_month(report) / 2.0))
+         + 0.25 * (2.0 * min(1.0, max(0.0, _f(o.prob_increase))) - 1.0))
+    if report.analysis.phase.label not in NOISE_PHASES:
+        z += (0.20 * math.tanh(_f(recent_change_annualised(report)) / 50.0)
+              + 0.20 * math.tanh(momentum_per_month(report) / 2.0))
     return float(min(100.0, max(0.0, 50.0 + 50.0 * z)))
 
 

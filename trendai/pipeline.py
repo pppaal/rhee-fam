@@ -10,14 +10,16 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import math
+import warnings
 from typing import Any, Iterable, Mapping, Optional
 
 import numpy as np
 import pandas as pd
+from pandas.errors import OutOfBoundsDatetime
 
 from .analysis import analyze
-from .data import DataError, prepare
-from .forecast import auto_forecast, compute_outlook
+from .data import DataError, DataWarning, future_index, prepare
+from .forecast import auto_forecast, compute_outlook, is_random_walk
 from .narrative import generate_narrative
 from .types import PHASE_KO, TrendReport
 
@@ -44,10 +46,16 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
         Ask Claude to write the interpretation (falls back to the rule-based
         narrative when the SDK/credentials are unavailable).
 
+    The forecast is told when the analysis found a driftless random walk
+    (:func:`trendai.forecast.is_random_walk`), so trend-extrapolating models
+    are not offered there.
+
     Raises :class:`trendai.data.DataError` (Korean message) when the input
-    cannot be used (no date index, fewer than 2 observations, ``horizon < 1``).
+    cannot be used (no date index, fewer than 2 observations, ``horizon < 1``,
+    ``horizon > MAX_HORIZON`` or forecast dates beyond pandas' datetime range).
     Data issues that were worked around (interpolated gaps, weekday-only data,
-    unreadable values) are reported as :class:`trendai.data.DataWarning`.
+    unreadable values) and a horizon of more than 5x the history are reported
+    as :class:`trendai.data.DataWarning`.
     """
     if horizon is not None:
         try:
@@ -56,17 +64,45 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
             raise DataError(f"예측 기간(horizon)은 정수여야 합니다: {horizon!r}") from None
         if h_int != horizon or h_int < 1:
             raise DataError(f"예측 기간(horizon)은 1 이상의 정수여야 합니다: {horizon!r}")
+        if h_int > MAX_HORIZON:
+            raise DataError(f"예측 기간(horizon)이 너무 깁니다: {h_int:,}기간 "
+                            f"(최대 {MAX_HORIZON:,}기간까지 지원합니다).")
         horizon = h_int
     s, f = prepare(series, freq=freq, name=name)
+    if horizon is not None:
+        _check_horizon(s, f, horizon)
     display_name = str(name if name is not None else (s.name if s.name is not None else "series"))
     analysis = analyze(s, freq=f, name=display_name)
     forecast = auto_forecast(analysis.series, horizon=horizon, freq=f, levels=tuple(levels),
-                             candidates=candidates)
+                             candidates=candidates, random_walk=is_random_walk(analysis))
     outlook = compute_outlook(analysis, forecast)
     text, source = generate_narrative(analysis, forecast, outlook, use_llm=use_llm, lang=lang,
                                       model=model, client=client)
     return TrendReport(name=display_name, analysis=analysis, forecast=forecast, outlook=outlook,
                        narrative=text, narrative_source=source)
+
+
+#: longest horizon run() accepts (forecasting time grows faster than linearly with it)
+MAX_HORIZON = 10_000
+#: a horizon longer than this many times the history gets a DataWarning
+_LONG_HORIZON_RATIO = 5
+
+
+def _check_horizon(s: pd.Series, freq: str, horizon: int) -> None:
+    """Korean DataError if the forecast dates leave pandas' datetime range; DataWarning if the
+    horizon is far longer than the history."""
+    try:
+        end = future_index(s.index[-1], freq, horizon)[-1]
+    except (OutOfBoundsDatetime, OverflowError, ValueError):
+        end = None
+    if end is None or pd.isna(end):
+        raise DataError(f"예측 기간(horizon) {horizon:,}기간은 날짜로 표현할 수 있는 범위를 넘습니다. "
+                        f"예측 기간을 줄여 주세요.")
+    n = len(s)
+    if horizon > _LONG_HORIZON_RATIO * n:
+        warnings.warn(f"예측 기간({horizon:,}기간)이 데이터 길이({n:,}개)의 {_LONG_HORIZON_RATIO}배를 "
+                      f"넘습니다. 이렇게 먼 미래는 과거 패턴만으로 추정하기 어려워 불확실성이 매우 큽니다.",
+                      DataWarning, stacklevel=3)
 
 
 class SeriesFailedWarning(UserWarning):
@@ -82,8 +118,6 @@ def run_many(series_map: Mapping[str, pd.Series], errors: Optional[dict[str, Exc
     dict as ``errors`` to also receive ``{name: exception}`` for the skipped
     series.  Keyword arguments are forwarded to :func:`run`.
     """
-    import warnings
-
     out: dict[str, TrendReport] = {}
     for nm, s in series_map.items():
         try:
@@ -102,8 +136,16 @@ def run_many(series_map: Mapping[str, pd.Series], errors: Optional[dict[str, Exc
 # --------------------------------------------------------------------------- JSON export
 
 
+#: significant digits of the floats in the JSON export
+_JSON_DIGITS = 12
+
+
 def _clean(obj: Any) -> Any:
-    """Recursively convert numpy/pandas objects into JSON-serialisable values."""
+    """Recursively convert numpy/pandas objects into JSON-serialisable values.
+
+    Floats keep 12 significant digits (relative precision, so values of any
+    magnitude survive); NaN / inf become ``None``.
+    """
     if isinstance(obj, dict):
         return {str(k): _clean(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, np.ndarray)):
@@ -116,7 +158,9 @@ def _clean(obj: Any) -> Any:
         return int(obj)
     if isinstance(obj, (np.floating, float)):
         f = float(obj)
-        return round(f, 6) if math.isfinite(f) else None
+        # significant digits, not decimals: round(f, 6) zeroed a 1e-7 series and merged the
+        # bands of a 1e-5 price; 12 digits keep every value while dropping float noise
+        return float(f"{f:.{_JSON_DIGITS}g}") if math.isfinite(f) else None
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
     return obj

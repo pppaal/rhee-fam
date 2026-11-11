@@ -37,6 +37,18 @@ def test_sample_all_compare(tmp_path, capsys):
     assert "순위" in out
     assert html.exists()
     assert len(list(tmp_path.glob("cmp_*.html"))) >= 5
+    # every card title and ranking name links to its own per-series page, and the links resolve
+    import re
+    from urllib.parse import unquote
+
+    page = html.read_text(encoding="utf-8")
+    hrefs = re.findall(r'<a href="([^"]+)">([^<]+)</a>', page)
+    names = {nm for _, nm in hrefs}
+    assert len(names) == 9 and len(hrefs) == 18
+    for href, nm in hrefs:
+        target = tmp_path / unquote(href)
+        assert target.exists(), href
+        assert f"<h1>{nm}</h1>" in target.read_text(encoding="utf-8")
 
 
 def test_unknown_sample(capsys):
@@ -227,3 +239,159 @@ def test_korean_formats_end_to_end(tmp_path, capsys):
     d = json.loads(js.read_text(encoding="utf-8"))
     assert d["name"] == "매출액" and d["freq"] == "M" and len(d["history"]) == 36
     assert d["history"][-1]["value"] == 1175000
+
+
+# --------------------------------------------------------------------------- round 3 regressions
+
+
+def test_ranking_probabilities_match_the_reports():
+    from trendai.cli import _fmt_prob, _format_ranking
+    from trendai.narrative import format_prob
+
+    df = pd.DataFrame([
+        {"name": "a", "phase": "growing", "phase_ko": "성장기", "expected_change_pct": 23.2,
+         "prob_increase": 1.0, "score": 90.0, "freq": "D"},
+        {"name": "b", "phase": "declining", "phase_ko": "쇠퇴기", "expected_change_pct": -50.0,
+         "prob_increase": 0.0, "score": 10.0, "freq": "D"},
+    ], index=[1, 2])
+    out = _format_ranking(df)
+    assert "100%" not in out and " 0%" not in out and "100.0%" not in out
+    assert ">99%" in out and "<1%" in out
+    for p in (1.0, 0.0, 0.997, 0.5, 0.003):
+        assert _fmt_prob(p) == format_prob(p)
+    assert _fmt_prob(None) == "—"
+
+
+def test_ranking_shows_each_change_with_its_horizon():
+    from trendai.cli import _format_ranking
+
+    rows = [{"name": "daily", "phase": "growing", "phase_ko": "성장기", "expected_change_pct": 23.2,
+             "expected_change_ann_pct": 1169.0, "prob_increase": 0.99, "score": 90.0, "freq": "D"},
+            {"name": "monthly", "phase": "stable", "phase_ko": "안정기", "expected_change_pct": 7.9,
+             "expected_change_ann_pct": 7.9, "prob_increase": 0.6, "score": 60.0, "freq": "M"},
+            {"name": "quarterly", "phase": "growing", "phase_ko": "성장기", "expected_change_pct": 18.0,
+             "expected_change_ann_pct": 8.6, "prob_increase": 0.8, "score": 55.0, "freq": "Q"}]
+    df = pd.DataFrame(rows, index=[1, 2, 3])
+    out = _format_ranking(df, horizons={"daily": 30, "monthly": 12, "quarterly": 8})
+    lines = out.splitlines()
+    assert "예측 변화" in lines[2] and "기간" in lines[2] and "연환산" not in out
+    assert "+23.2%  30일" in lines[3] and "+7.9%  12개월" in lines[4] and "+18.0%  8분기" in lines[5]
+    assert "1,169" not in out                                   # no extrapolated annual rate
+    assert len({_display_width(r.split("%")[0]) for r in lines[3:]}) == 1
+    en = _format_ranking(df, lang="en", horizons={"daily": 30, "monthly": 12, "quarterly": 8})
+    assert "Horizon" in en and "30 d" in en and "12 mo" in en
+    # a shared horizon goes to the header once
+    same = _format_ranking(df.iloc[1:2], horizons={"monthly": 12})
+    assert "예측 변화(12개월)" in same and "기간" not in same
+
+
+def test_mixed_frequency_ranking_end_to_end(tmp_path, capsys):
+    d, m = sample("growing", n=120, freq="D"), sample("seasonal")
+    pd.DataFrame({"date": d.index.strftime("%Y-%m-%d"), "daily": d.values}).to_csv(tmp_path / "d.csv", index=False)
+    pd.DataFrame({"date": m.index.strftime("%Y-%m-%d"), "monthly": m.values}).to_csv(tmp_path / "m.csv", index=False)
+    assert main(["compare", str(tmp_path / "d.csv"), str(tmp_path / "m.csv"), "-q"]) == 0
+    out = capsys.readouterr().out
+    assert "30일" in out and "12개월" in out and "주기가 다른 시계열" in out
+    assert "예측 변화와 상승확률은" in out
+
+
+def _run_into_closed_pipe(args, lines_to_read=0):
+    """Run the CLI in a subprocess and close its stdout after ``lines_to_read`` lines (like ``| head``)."""
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    proc = subprocess.Popen([sys.executable, "-m", "trendai", *args], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=env)
+    for _ in range(lines_to_read):
+        proc.stdout.readline()
+    proc.stdout.close()
+    err = proc.stderr.read().decode("utf-8", "replace")
+    proc.stderr.close()
+    return proc.wait(timeout=120), err
+
+
+@pytest.mark.parametrize("args,k", [
+    (["sample", "growing", "--freq", "Y", "--n", "8"], 4),
+    (["sample", "growing", "--freq", "Y", "--n", "8"], 0),
+    (["sample", "all", "-H", "3"], 3),
+])
+def test_real_broken_pipe_exits_quietly(args, k):
+    code, err = _run_into_closed_pipe(args, k)
+    assert code == 0, err
+    assert "Traceback" not in err and "BrokenPipe" not in err and "Exception ignored" not in err
+
+
+# --------------------------------------------------------------------------- final-round regressions
+
+
+def test_lang_en_column_notes_are_english(tmp_path, capsys, monkeypatch):
+    """UX-16: --lang en left the column-detection and first-column notes in Korean."""
+    import re
+
+    g, d = sample("growing"), sample("declining")
+    f = tmp_path / "kr.csv"
+    pd.DataFrame({"날짜": g.index.strftime("%Y.%m"), "검색량": g.values, "판매량(개)": d.values}
+                 ).to_csv(f, index=False)
+    assert main(["analyze", str(f), "--lang", "en", "-q", "-H", "3"]) == 0
+    err = capsys.readouterr().err
+    note = [ln for ln in err.splitlines() if "kr.csv" in ln]
+    assert note and note[0].startswith("Note: kr.csv — date column '날짜' (format: YYYY.MM), 2 value columns:")
+    assert not any(re.search(r"[가-힣]", re.sub(r"'[^']*'|: .*$", "", ln)) for ln in note)
+    # Korean stays the default
+    assert main(["analyze", str(f), "-q", "-H", "3"]) == 0
+    assert "안내: kr.csv — 날짜 열 '날짜'" in capsys.readouterr().err
+    # ask: the "first column only" note and the Claude error follow --lang as well
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert main(["ask", str(f), "why?", "--lang", "en", "-H", "3"]) == 1
+    err = capsys.readouterr().err
+    assert "Note: using only the first column '검색량'" in err and "Error: cannot ask Claude" in err
+    assert "안내:" not in err and "오류:" not in err
+
+
+def test_korean_rank_title_has_no_english():
+    from trendai.cli import _format_ranking
+
+    df = pd.DataFrame([{"name": "a", "phase": "growing", "phase_ko": "성장기", "expected_change_pct": 3.0,
+                        "prob_increase": 0.7, "score": 60.0, "freq": "M"}], index=[1])
+    out = _format_ranking(df, horizons={"a": 12})
+    assert "■ 상승 트렌드 순위 (상승 점수: 50=중립, 높을수록 강한 상승 전망)" in out
+    assert "rising" not in out
+    assert "Rising-trend ranking (rising score" in _format_ranking(df, lang="en", horizons={"a": 12})
+
+
+def test_lang_en_errors_are_english(tmp_path, capsys):
+    assert main(["sample", "nope", "--lang", "en"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("Error: unknown sample 'nope'") and "오류" not in err
+    assert main(["analyze", str(tmp_path / "missing.csv"), "--lang", "en"]) == 2
+    assert capsys.readouterr().err.startswith("Data error: ")       # the data module's own text follows
+
+
+def test_huge_values_end_to_end(tmp_path, capsys):
+    """F8: |y| > 1e300 crashed the chart (math domain error), the CLI exited 1 and lost --json."""
+    import numpy as np
+
+    idx = pd.date_range("2020-01-01", periods=48, freq="MS")
+    base = 100 + 10 * np.sin(np.arange(48) / 3) + np.arange(48)
+    f = tmp_path / "huge.csv"
+    pd.DataFrame({"date": idx.strftime("%Y-%m-%d"), "v": base * 1e300}).to_csv(f, index=False)
+    js, html = tmp_path / "huge.json", tmp_path / "huge.html"
+    assert main(["analyze", str(f), "-q", "--json", str(js), "--html", str(html)]) == 0
+    assert json.loads(js.read_text(encoding="utf-8"))["name"] == "v"
+    assert html.read_text(encoding="utf-8").lstrip().lower().startswith("<!doctype html")
+
+
+def test_json_is_kept_when_the_html_report_fails(tmp_path, capsys, monkeypatch):
+    import trendai.report as report
+
+    def boom(*a, **k):
+        raise ValueError("render failed")
+
+    monkeypatch.setattr(report, "render_html", boom)
+    js, html = tmp_path / "r.json", tmp_path / "r.html"
+    assert main(["sample", "growing", "-q", "-H", "3", "--json", str(js), "--html", str(html)]) == 1
+    assert json.loads(js.read_text(encoding="utf-8"))["name"] == "growing"
+    assert not html.exists()
+    assert "render failed" in capsys.readouterr().err

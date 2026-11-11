@@ -173,9 +173,9 @@ def regularize(series: pd.Series, freq: Optional[str] = None, how: str = "mean")
     * leading / trailing missing periods are dropped,
     * weekly data keeps the weekday it was recorded on (``W-MON``...).
     """
-    s = _clean(series)
+    s, dates = _clean_with_dates(series)
     if freq is None:
-        freq = infer_freq(s.index)
+        freq = _infer_freq_with_gaps(s.index, dates)
     alias = _alias_for(freq, s.index)
     if how not in ("mean", "sum"):
         raise DataError("how 는 'mean' 또는 'sum' 이어야 합니다.")
@@ -665,6 +665,15 @@ def _coerce_index(index: pd.Index) -> pd.DatetimeIndex:
 
 
 def _clean(series: pd.Series) -> pd.Series:
+    return _clean_with_dates(series)[0]
+
+
+def _clean_with_dates(series: pd.Series) -> tuple[pd.Series, pd.DatetimeIndex]:
+    """``(finite values sorted by date, dates of every row with a valid date)``.
+
+    The second element keeps the dates of rows whose value is missing: a
+    monthly date column with many empty cells still says the data is monthly.
+    """
     if not isinstance(series, pd.Series):
         raise DataError("pandas Series(날짜 인덱스 + 숫자 값)가 필요합니다. "
                         "숫자 목록이라면 trendai.from_values(...)를 쓰세요.")
@@ -681,12 +690,38 @@ def _clean(series: pd.Series) -> pd.Series:
     n_inf = int(np.isinf(arr).sum())
     if n_inf:
         _warn(f"{_label(series)}무한대(inf) 값 {n_inf}개를 제외했습니다.")
+    dates = pd.DatetimeIndex(s.index[~s.index.isna()]).sort_values()
     s = s[np.isfinite(arr)]
     s = s[~s.index.isna()]
     s = s.sort_index(kind="mergesort")
     if s.empty:
         raise DataError(f"{_label(series)}유효한 숫자 값이 하나도 없습니다.")
-    return s
+    return s, dates
+
+
+def _infer_freq_with_gaps(observed: pd.DatetimeIndex, dates: pd.DatetimeIndex) -> str:
+    """Frequency of a series whose date column may have rows without a value.
+
+    The spacing of the observed values alone turns a monthly table with many
+    empty cells into a coarser one (36 monthly rows with 9 values read as
+    quarterly averages).  So the frequency of the full date column is used,
+    unless the observed values form a complete series at their own, coarser
+    frequency (e.g. month-start values in a daily calendar: every month has
+    a value), which is then kept.
+    """
+    f_obs = infer_freq(observed)
+    if len(dates) <= len(observed) or len(pd.DatetimeIndex(dates).unique()) < 2:
+        return f_obs
+    try:
+        f_all = infer_freq(dates)
+    except DataError:
+        return f_obs
+    if f_all == f_obs:
+        return f_obs
+    counts = pd.Series(1.0, index=observed).resample(_alias_for(f_obs, observed)).count()
+    if bool((counts > 0).all()):
+        return f_obs
+    return f_all
 
 
 def _label(series: pd.Series) -> str:
@@ -733,16 +768,17 @@ def prepare(series: pd.Series, freq: Optional[str] = None, name: Optional[str] =
 
     Accepts a DatetimeIndex (tz-aware ok), PeriodIndex, integer years
     (1000..2200) or date strings as the index, and numbers or number strings
-    (``'1,234'``) as values.  When the frequency is inferred, a
-    :class:`DataWarning` reports weekday-only data, large interpolated gaps or
-    merged duplicate periods.
+    (``'1,234'``) as values.  The frequency is inferred from every dated row,
+    including rows whose value is missing (see :func:`_infer_freq_with_gaps`).
+    When the frequency is inferred, a :class:`DataWarning` reports
+    weekday-only data, large interpolated gaps or merged duplicate periods.
     """
-    s = _clean(series)
+    s, dates = _clean_with_dates(series)
     if len(s) < 2:
         raise DataError(f"{_label(series)}관측치가 2개 이상 필요합니다 (유효한 값 {len(s)}개).")
     inferred = freq is None
     if freq is None:
-        freq = infer_freq(s.index)
+        freq = _infer_freq_with_gaps(s.index, dates)
     out = regularize(s, freq, how=how)
     if inferred:
         _report_regularisation(s, out, freq, how)

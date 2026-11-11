@@ -430,3 +430,28 @@ def test_xlsx_roundtrip(tmp_path):
     pd.DataFrame({"날짜": g.index, "검색량": g.values}).to_excel(f, index=False)
     p, freq = _prep(load_table(f)["검색량"])
     assert freq == "M" and len(p) == 120
+
+
+def test_frequency_is_inferred_from_every_dated_row():
+    """F13: a complete monthly date column with 27 of 36 values missing was read as quarterly
+    averages ('분기 단위 12개'); its spacing says monthly."""
+    import warnings
+
+    from trendai.data import DataWarning, prepare
+
+    idx = pd.date_range("2021-01-01", periods=36, freq="MS")
+    keep = [1, 2, 9, 13, 14, 16, 21, 31, 35]
+    v = pd.Series(np.nan, index=idx)
+    v.iloc[keep] = 100 + np.arange(9.0)
+    with pytest.warns(DataWarning, match="월 단위 격자"):
+        s, freq = prepare(v)
+    assert freq == "M" and len(s) == 35 and s.index[0] == idx[1]
+    # values that form a complete coarser series keep their own frequency (month starts in a
+    # daily calendar are monthly data, not 97 % interpolated daily data)
+    d = pd.date_range("2020-01-01", "2022-12-31", freq="D")
+    cal = pd.Series(np.nan, index=d)
+    cal[d[d.day == 1]] = np.arange(36.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        s2, f2 = prepare(cal)
+    assert f2 == "M" and len(s2) == 36

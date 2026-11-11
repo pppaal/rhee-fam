@@ -996,3 +996,257 @@ def test_noisy_series_edges_do_not_drive_growth_numbers():
         y = 50 + 0.1 * np.arange(120) + np.random.default_rng(seed).normal(0, 5, 120)
         errs.append(A.decompose(from_values(y), 1).trend.iloc[-1] - (50 + 0.1 * 119))
     assert np.std(errs) < 2.4                                 # was ~3.0 (sd of the noise: 5)
+
+
+# =========================================================================== fixer regressions (round 3)
+# Each test failed before the round-3 fix (AN1, AN2, AN9).
+
+
+def test_reason_at_the_trend_peak_does_not_say_100_percent():
+    # AN1: "현재 수준은 추세 고점의 100% 수준입니다" read oddly for a series at its high
+    for seed in range(3):
+        r = A.analyze(samples.sample("growing", seed=seed))
+        assert r.phase.label == "growing"
+        assert any(re.fullmatch(r"현재 추세는 고점\(\d{4}-\d{2}\) 수준입니다\.", x) for x in r.phase.reasons), \
+            r.phase.reasons
+        assert not any(re.search(r"고점의 (99\.5|99\.[6-9]|100)\d*% 수준", x) for x in r.phase.reasons)
+
+
+def test_yearly_reasons_write_the_year_counter():
+    # AN2: "2050에 구조 변화", "2042에 저점" -> "2050년에", "2042년에" (bracketed years stay bare)
+    reasons = []
+    for name in ("emerging", "reviving"):
+        reasons += A.analyze(samples.sample(name, n=40, freq="Y"), freq="Y").phase.reasons
+    idx = pd.date_range("1990-01-01", periods=30, freq="YS")
+    y = 100 + np.random.default_rng(0).normal(0, 2, 30)
+    y[18:] += 30
+    reasons += A.analyze(pd.Series(y, index=idx), freq="Y").phase.reasons
+    text = " ".join(reasons)
+    assert re.search(r"\d{4}년에 구조 변화", text)
+    assert re.search(r"\d{4}년에 저점을 찍은 뒤", text)
+    assert "2008년에 수준이 한 단계 높아졌습니다" in text
+    assert not re.search(r"\d{4}에 ", text), text
+    assert re.search(r"고점\(\d{4}\)", text)                 # in brackets: no counter needed
+    # monthly dates are unchanged
+    m = " ".join(A.analyze(samples.sample("reviving")).phase.reasons)
+    assert re.search(r"\d{4}-\d{2}에 저점을 찍은 뒤", m)
+
+
+def _white_noise_flags(freq: str, n: int, seeds) -> int:
+    idx = pd.date_range("2015-01-04", periods=n, freq={"W": "W-SUN", "Q": "QS", "M": "MS"}[freq])
+    return sum(len(A.analyze(pd.Series(100 + np.random.default_rng(s).normal(0, 5, n), index=idx),
+                             freq=freq).anomalies) for s in seeds)
+
+
+def test_few_cycle_seasonal_noise_is_not_flagged_as_anomalies():
+    # AN9: with 3 weekly cycles (p = 52) the seasonal means absorb a third of every ordinary
+    # point (and a 5-point trend window ~30 %), so the median residual understated the scale of
+    # the points the robust fit leaves out: ~2.5 flags per pure-noise series at W156 (now ~0.45),
+    # 1.6 at M36 (~0.5), 1.0 at Q40 (~0.4); over 20 seeds: 42 / 18 / 13 before
+    seeds = range(20)
+    assert _white_noise_flags("W", 156, seeds) <= 15
+    assert _white_noise_flags("M", 36, seeds) <= 10
+    assert _white_noise_flags("Q", 40, seeds) <= 10
+    assert _white_noise_flags("M", 120, seeds) <= 8
+
+
+def test_studentised_anomalies_still_find_real_spikes():
+    # AN9: the correction must not hide genuine spikes: an 8-sigma one-off spike is found at
+    # any position (edges included), and the leverage estimate matches the decomposition's
+    for freq, n, pf in (("W", 156, "W-SUN"), ("M", 120, "MS"), ("D", 365, "D")):
+        idx = pd.date_range("2015-01-04", periods=n, freq=pf)
+        for seed, pos in ((0, 0), (1, n // 3), (2, n - 2), (3, n - 1)):
+            y = 100 + np.random.default_rng(seed).normal(0, 5, n)
+            y[pos] += (-1) ** seed * 40
+            s = pd.Series(y, index=idx)
+            found = A.detect_anomalies(s, A.decompose(s, season_length(freq)))
+            assert pos in [a.index for a in found], (freq, seed, pos)
+    # the relative residual variance follows the decomposition's actual leverage
+    idx = pd.date_range("2015-01-04", periods=156, freq="W-SUN")
+    y = 100 + np.random.default_rng(3).normal(0, 5, 156)
+    dec = A.decompose(pd.Series(y, index=idx), 52)
+    r0 = dec.resid.to_numpy()
+    lev = []
+    for i in range(0, 156, 13):
+        y2 = y.copy()
+        y2[i] += 0.01
+        lev.append(1 - (A.decompose(pd.Series(y2, index=idx), 52).resid.to_numpy()[i] - r0[i]) / 0.01)
+    rn = r0 / A._unit(y, r0)
+    f = A._resid_variance_factor(rn, (y - dec.trend.to_numpy()) / A._unit(y, r0),
+                                 dec.seasonal.to_numpy() / A._unit(y, r0), 52, False)
+    est = 1 - np.sqrt(np.clip(f[::13], 0, 1))           # F ~ (1 - h)^2 for ordinary points
+    assert abs(np.median(lev) - np.median(est)) < 0.12, (np.median(lev), np.median(est))
+    assert 0.15 < np.median(lev) < 0.45                   # the fit absorbs a lot of each point
+
+
+# --------------------------------------------------------------------------- round 3 (final review)
+
+
+def _quiet_analyze(series, **kw):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return A.analyze(series, **kw)
+
+
+def test_recent_reason_quotes_the_trend_line_change():
+    # UX-3: the reason divided the OLS change by the OLS intercept of the last h points:
+    # emerging Y/12 read '+1076.8%' while the trend line rose +293 % over that stretch, and the
+    # peaking sample '+0.2 %' over 18 months next to '+2.0 %' over the last 12
+    for nm, freq, n in (("emerging", "Y", 12), ("peaking", "M", 120), ("fad", "M", 120),
+                        ("declining", "M", 120)):
+        a = _quiet_analyze(samples.sample(nm, freq=freq, n=n), freq=freq)
+        T = a.decomposition.trend.to_numpy()
+        found = 0
+        for r in a.phase.reasons:
+            mt = re.search(r"최근 ([\d,]+)\S+ 동안 추세가 ([+−][\d,]+\.\d)% 변했습니다", r)
+            if mt:
+                h = int(mt.group(1).replace(",", ""))
+                quoted = float(mt.group(2).replace("−", "-").replace(",", ""))
+                assert quoted == pytest.approx((T[-1] / T[-1 - h] - 1) * 100, abs=0.06), (nm, r)
+                found += 1
+        assert found, (nm, a.phase.reasons)
+        if nm == "peaking":       # consistent with the 12-month change on the same trend line
+            assert quoted == pytest.approx(a.metrics.recent_change_pct, abs=1.0)
+    # thousands separators like everywhere else ("+1,076.8%", not "+1076.8%")
+    assert A._pct_txt(1076.84) == "+1,076.8%" and A._pct_txt(-12.5) == "−12.5%"
+
+
+def test_reason_numbers_take_no_reading_dependent_particle():
+    # UX-14: '계절성 강도가 0.96로' (read "...구육" -> must be "0.96으로"); the n < 8 path had
+    # '3에서 6로'.  The reasons now put no particle right after a number.
+    a = _quiet_analyze(samples.sample("seasonal"))
+    assert any("계절성 강도(0.96)가 높아 주기적 변동이 뚜렷합니다." == r for r in a.phase.reasons), a.phase.reasons
+    s = pd.Series([3.0, 4.0, 4.5, 5.0, 6.0], index=pd.date_range("2020-01-01", periods=5, freq="MS"))
+    short = _quiet_analyze(s)
+    assert "관측 기간 동안 값이 3.00에서 6.00까지 +100.0% 변했습니다." in short.phase.reasons
+    for r in a.phase.reasons + short.phase.reasons:
+        assert not re.search(r"\d(?:로|으로)\b", r), r
+
+
+def test_level_shift_from_zero_reason_has_no_python_float_format():
+    # F11: revenue 0 before a launch, then ~2.4M a month: '(약 +2.392e+06)'
+    y = np.r_[np.zeros(20), 2_400_000 + np.random.default_rng(0).normal(0, 60_000, 28)].round(0)
+    a = _quiet_analyze(pd.Series(y, index=pd.date_range("2021-01-01", periods=48, freq="MS")))
+    shift = next(r for r in a.phase.reasons if "수준이 한 단계" in r)
+    assert "e+" not in shift and re.search(r"\(약 \+2,\d{3},\d{3}\)", shift), shift
+    assert A._num_txt(1e9, signed=True) == "+1,000,000,000"
+    assert A._num_txt(2.5e16) == "2.5×10¹⁶" and A._num_txt(-3.2e-7) == "−3.2×10⁻⁷"
+
+
+def test_stable_reason_does_not_call_a_full_range_small():
+    # F15: zeros then a single 1 -> 'stable' with "변동 폭이 최고 수준 대비 100.0%에 그칩니다"
+    a = _quiet_analyze(pd.Series(np.r_[np.zeros(19), 1.0],
+                                 index=pd.date_range("2020-01-01", periods=20, freq="MS")))
+    joined = " ".join(a.phase.reasons)
+    assert not re.search(r"(?:[3-9]\d|100)\.\d%에 그칩니다", joined), a.phase.reasons
+    assert len(set(a.phase.reasons)) == len(a.phase.reasons)          # no duplicated reason
+    # a genuinely flat series keeps the "only x %" evidence
+    flat = _quiet_analyze(pd.Series(100 + np.random.default_rng(1).normal(0, 1, 60),
+                                    index=pd.date_range("2020-01-01", periods=60, freq="MS")))
+    if flat.phase.label == "stable":
+        assert any("에 그칩니다" in r for r in flat.phase.reasons) or any("잡음" in r for r in flat.phase.reasons)
+
+
+def test_phase_does_not_depend_on_where_zero_sits():
+    # F3: the same seasonal series (±15 swing, noise 1.5) was 'volatile' 19/20 at a mean of
+    # 0.3 or 5 (noise / mean|z| = 125 %) and 'stable' 20/20 at 12.5
+    t = np.arange(120)
+    idx = pd.date_range("2015-01-01", periods=120, freq="MS")
+    for seed in range(6):
+        noise = np.random.default_rng(seed).normal(0, 1.5, 120)
+        labels = {off: _quiet_analyze(pd.Series(off + 15 * np.sin(2 * np.pi * (t - 3) / 12) + noise,
+                                                index=idx)).phase.label for off in (0.3, 5.0, 12.5)}
+        assert len(set(labels.values())) == 1 and "volatile" not in labels.values(), (seed, labels)
+    # the reason names its basis when the data cross zero
+    y = np.random.default_rng(0).normal(0, 1, 120)
+    a = _quiet_analyze(pd.Series(y, index=idx))
+    assert a.phase.label == "volatile"
+    assert any("값의 변동 폭의" in r for r in a.phase.reasons), a.phase.reasons
+    # positive ratio-scale data keep the classic noise / level ratio
+    pos = _quiet_analyze(pd.Series(100 + 30 * np.random.default_rng(2).normal(0, 1, 120), index=idx))
+    assert pos.phase.label == "volatile" and any("평균의" in r for r in pos.phase.reasons)
+
+
+def test_noise_is_not_reported_as_seasonal():
+    # UX-6: linear trend + white noise, 36 months: 11 of 40 had seasonal strength >= 0.3
+    # ("계절성은 뚜렷합니다 (강도 0.67)"); the strength is now discounted by a significance test
+    idx = pd.date_range("2021-01-01", periods=36, freq="MS")
+    strengths = []
+    for seed in range(40):
+        y = 1200 + 25 * np.arange(36) + np.random.default_rng(seed).normal(0, 80, 36)
+        strengths.append(_quiet_analyze(pd.Series(y, index=idx)).metrics.seasonal_strength)
+    assert max(strengths) < 0.3, sorted(strengths)[-5:]
+    # genuine seasonality keeps its strength, also with only 2 to 3 cycles
+    for n in (24, 28, 36, 120):
+        m = _quiet_analyze(samples.sample("seasonal", n=n)).metrics
+        assert m.seasonal_strength > 0.8, (n, m.seasonal_strength)
+    w = _quiet_analyze(samples.sample("seasonal", freq="W", n=156), freq="W").metrics
+    assert w.seasonal_strength > 0.8
+    # the evidence factor itself: 0 for noise, 1 for a clean pattern
+    rng = np.random.default_rng(5)
+    assert A._seasonality_evidence(rng.normal(0, 1, 36), 12) < 1.0
+    assert A._seasonality_evidence(np.sin(2 * np.pi * np.arange(24) / 12) + 0.1 * rng.normal(0, 1, 24), 12) == 1.0
+    assert A._seasonality_evidence(np.ones(36), 12) == 0.0
+
+
+def test_momentum_is_relative_to_the_current_level():
+    # UX-8: momentum was normalised by the whole-period mean: emerging '+15.73 %p/월' while its
+    # trend grew ~4.4 % a month (yearly: +88.6 %p/년 vs +37.9 % in the last year)
+    m = _quiet_analyze(samples.sample("emerging")).metrics
+    monthly = ((1 + m.recent_change_pct / 100) ** (1 / 12) - 1) * 100
+    assert 0 < m.momentum <= 1.2 * monthly, (m.momentum, monthly)
+    y = _quiet_analyze(samples.sample("emerging", freq="Y", n=12), freq="Y").metrics
+    assert 0 < y.momentum <= 1.2 * y.recent_change_pct, (y.momentum, y.recent_change_pct)
+    # signs are unchanged: convex growth accelerates, a fad's collapse decelerates
+    assert _quiet_analyze(samples.sample("fad")).metrics.momentum < 0
+    assert _quiet_analyze(samples.sample("peaking")).metrics.momentum < 0
+
+
+def _iid_demand(seed: int, n: int = 150) -> pd.Series:
+    rng = np.random.default_rng(seed)
+    y = np.where(rng.random(n) < 0.15, rng.integers(1, 6, n), 0).astype(float)
+    return pd.Series(y, index=pd.date_range("2021-01-03", periods=n, freq="W-SUN"))
+
+
+def test_intermittent_demand_gets_no_percent_changes_or_order_anomalies():
+    # F2: iid demand (15 % non-zero, sizes 1..5, no trend): total change +3,192 %, CAGR +240 %,
+    # '최근 52주 +231 %', and 39 of 40 series had "anomalies" (+1,350 %, z = +12.4) -- ordinary orders
+    flagged = 0
+    for seed in range(40):
+        a = _quiet_analyze(_iid_demand(seed))
+        m = a.metrics
+        assert m.total_change_pct is None and m.cagr_pct is None and m.recent_change_pct is None, seed
+        flagged += bool(a.anomalies)
+    assert flagged <= 4, flagged
+    # an unusually large order still is one: judged by its size among the non-zero demands
+    s = _iid_demand(9)
+    big = int(np.flatnonzero(s.to_numpy() > 0)[10])
+    s.iloc[big] = 60.0
+    a = _quiet_analyze(s)
+    assert [an.index for an in a.anomalies] == [big]
+    assert a.anomalies[0].expected == pytest.approx(np.exp(np.median(np.log(s[s > 0]))))
+    assert A._is_intermittent(s.to_numpy(), 52)
+    # the rule is the forecast's: a series that was 0 before a launch is not intermittent
+    launch = np.r_[np.zeros(40), np.linspace(5, 50, 60)]
+    assert not A._is_intermittent(launch, 12)
+    from trendai import forecast as F
+    for y in (s.to_numpy(), launch, _iid_demand(3).to_numpy()):
+        assert A._is_intermittent(y, 52) == F._is_intermittent(y[-max(400, 8 * 52):], 52)
+
+
+def test_edge_and_short_series_peaks_are_not_excluded_as_spikes():
+    # UX-5 / report note: the latest value of an accelerating series (emerging Y/12: 72.0) was
+    # flagged and left out of the peak ("최고치는 42.3(일회성 급등 제외)" while 72.0 is the
+    # current value); on 8-point yearly series real peaks and starts were excluded too
+    a = _quiet_analyze(samples.sample("emerging", freq="Y", n=12), freq="Y")
+    assert a.metrics.peak_value == pytest.approx(float(a.series.iloc[-1]))
+    assert a.metrics.drawdown_pct == 0.0
+    for nm in ("emerging", "fad", "declining"):
+        s = samples.sample(nm, freq="Y", n=8)
+        m = _quiet_analyze(s, freq="Y").metrics
+        assert m.peak_value == pytest.approx(float(s.max())), nm
+    # a one-off spike inside a long series is still left out (AN4 behaviour kept)
+    s = samples.sample("growing").copy()
+    s.iloc[60] += 150.0
+    m = _quiet_analyze(s).metrics
+    assert m.peak_value < float(s.max())

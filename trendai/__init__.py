@@ -34,6 +34,8 @@ _LAZY = {
     "analyze": ("analysis", "analyze"),
     "auto_forecast": ("forecast", "auto_forecast"),
     "compute_outlook": ("forecast", "compute_outlook"),
+    "outlook_levels": ("forecast", "outlook_levels"),
+    "is_random_walk": ("forecast", "is_random_walk"),
     "generate_narrative": ("narrative", "generate_narrative"),
     "ask": ("narrative", "ask"),
     "rank_trends": ("compare", "rank_trends"),
