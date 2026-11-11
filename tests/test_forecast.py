@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
 import time
 import warnings
 
@@ -1169,6 +1170,7 @@ def test_intermittent_demand_is_not_anchored_on_the_last_observation():
     on MAE and the 26-week total was ~6 when the last week was 0 and ~28 when it was not
     (truth 11.7); the 95 % band excluded 0 and the outlook claimed +969 %."""
     totals = {True: [], False: []}
+    flat = 0
     for seed in range(12):
         rng = np.random.default_rng(seed)
         y = np.where(rng.random(150) < 0.15, rng.integers(1, 6, 150), 0).astype(float)
@@ -1179,7 +1181,18 @@ def test_intermittent_demand_is_not_anchored_on_the_last_observation():
         assert fc.lower[95].iloc[0] == 0.0
         assert not any(nm in fc.method for nm in ("naive", "drift", "analog_knn"))
         o = F.compute_outlook(_make_analysis(s, "W", "stable"), fc)
-        assert o.expected_change_pct is None and o.direction == "flat"
+        # Changed expectation (round 6, K2): this pinned direction 'flat' for all 12 histories, which the
+        # normal approximation guaranteed (its probability never left 40-60 % for intermittent demand).
+        # The direction now follows the compound-Bernoulli probability with odds of 2:1: seed 8 (the
+        # last year 0.385 a week, a forecast of 0.279) reads 'down' at P(rise) = 28 %.  The intent -- no
+        # claimed move on stationary demand unless it is likely -- is kept, and most stay 'flat'.
+        assert o.expected_change_pct is None
+        if o.direction == "flat":
+            flat += 1
+        else:
+            assert (o.direction == "down" and o.prob_increase < 1 / 3) or (
+                o.direction == "up" and o.prob_increase > 2 / 3)
+    assert flat >= 10
     for zero_last, tot in totals.items():
         if tot:
             assert 4.0 <= float(np.median(tot)) <= 25.0, (zero_last, tot)
@@ -1204,7 +1217,15 @@ def test_is_intermittent_and_clean_spikes_helpers():
     assert F._clean_spikes(last, 12)[1] == 0
     shift = np.r_[base[:40], base[40:] + 40]
     assert F._clean_spikes(shift, 12)[1] == 0
-    assert F._clean_spikes(spiky[:30], 12)[1] == 0             # < 3 seasons: peaks look like spikes
+    # final round (U1): with two to three seasons a spike that does not come back a season away (at a
+    # comparable size) is one-off and replaced -- one promotion week in 104 widened the band 3.5x; a peak
+    # that recurs every season stays, and with fewer than two seasons nothing is replaced
+    two, k_two = F._clean_spikes(spiky[:30], 12)
+    assert k_two == 1 and abs(two[20] - base[20]) < 6
+    recurring = base[:30].copy()
+    recurring[[8, 20]] *= 1.8
+    assert F._clean_spikes(recurring, 12)[1] == 0
+    assert F._clean_spikes(spiky[:23], 12)[1] == 0
 
 
 def test_one_off_spikes_are_not_projected_as_seasonality():
@@ -1825,3 +1846,288 @@ def test_outlook_at_the_zero_floor_has_no_percentage():
     aq, fq = analyze(q, freq="Q"), F.auto_forecast(q, horizon=8, freq="Q")
     assert F.outlook_levels(aq, fq).undefined == "floor"
     assert F.compute_outlook(aq, fq).expected_change_pct is None
+
+
+# --------------------------------------------------------------------------- round 6: P(up) of intermittent demand
+
+
+def _discontinued_weekly() -> pd.Series:
+    """Weekly demand (35 % of weeks, sizes 1 + Poisson(2)) that stopped for the last 34 weeks."""
+    r = np.random.default_rng(57)
+    n = 104
+    z = (r.poisson(2, n) + 1) * (r.random(n) < 0.35)
+    z[-(n // 3):] = 0
+    return pd.Series(z.astype(float), index=pd.date_range("2024-01-07", periods=n, freq="W-SUN"))
+
+
+def _normal_prob(fc, lv) -> float:
+    """The normal approximation compute_outlook used for every series (and still uses for ordinary ones)."""
+    lvl = F.interval_level(fc, 80)
+    z = F._level_z(lvl)
+    fm, lo, hi = (fc.mean.to_numpy(), fc.lower[lvl].to_numpy(), fc.upper[lvl].to_numpy())
+    sig = max(hi[-1] - fm[-1], fm[-1] - lo[-1], 0.0) / z
+    d = lv.future - lv.current
+    return F.norm_cdf(d / sig) if sig > 0 else (1.0 if d > 0 else 0.0 if d < 0 else 0.5)
+
+
+def test_stopped_product_has_a_low_probability_of_a_rise():
+    """K2: the stopped product (forecast rate 0.0048 a week against 0.15) read 'about 46 %' and
+    '방향 불확실': the normal approximation used one week's band (an order of ~3 or nothing) for a
+    26-week mean.  The compound-Bernoulli model gives a low probability and the direction follows it."""
+    from trendai.analysis import analyze
+
+    s = _discontinued_weekly()
+    a = analyze(s, freq="W")
+    fc = F.auto_forecast(a.series, freq="W", random_walk=F.is_random_walk(a))
+    lv = F.outlook_levels(a, fc)
+    assert lv.future < 0.01 < 0.15 < lv.current < 0.16
+    assert _normal_prob(fc, lv) > 0.4                      # what it read before
+    o = F.compute_outlook(a, fc)
+    assert o.prob_increase < 0.2 and o.direction == "down"
+
+
+def test_intermittent_probability_is_better_calibrated_than_the_normal_one():
+    """K2: Brier score of prob_increase against the realised outcome (mean of the future window above
+    the current level; 100 futures per history) on simulated intermittent demand -- stable Bernoulli x
+    size, lumpy and stopping processes, weekly and monthly.  The normal approximation scored about the
+    climatology (almost every series 40-60 %); the compound-Bernoulli probability must beat it."""
+    from trendai.analysis import analyze
+
+    rows = []
+    for i in range(90):
+        r = np.random.default_rng(7 + i)
+        kind = ("stable", "stopping", "lumpy")[i % 3]
+        freq, n, start, pf = (("W", 104, "2022-01-02", "W-SUN"), ("M", 60, "2018-01-01", "MS"))[(i // 3) % 2]
+        H = 26 if freq == "W" else 12
+        sched = np.full(n + H, r.uniform(0.15, 0.5))
+        if kind == "stopping":
+            sched[int(r.uniform(0.6 * n, n + 0.5 * H)):] = 0.0
+        if kind == "lumpy":
+            sched[:] = r.uniform(0.05, 0.25)
+            size = lambda sh, r=r: np.round(np.exp(r.normal(0, 1.2, sh)) * 3 + 1)
+        else:
+            lam = r.uniform(0.5, 4)
+            size = lambda sh, r=r, lam=lam: r.poisson(lam, sh) + 1.0
+        hist = (r.random(n) < sched[:n]) * size(n)
+        fut = (r.random((100, H)) < sched[n:]) * size((100, H))
+        s = pd.Series(hist.astype(float), index=pd.date_range(start, periods=n, freq=pf))
+        a = analyze(s, freq=freq)
+        fc = F.auto_forecast(a.series, freq=freq)
+        lv = F.outlook_levels(a, fc)
+        y = a.series.to_numpy(dtype=float)
+        if not F._is_intermittent(F.fit_history(y, a.season_length), a.season_length) or not np.any(y[-lv.k_cur:]):
+            continue        # not intermittent, or a current level of 0 (no probability is shown)
+        q = float(np.mean(fut[:, -lv.k_fut:].mean(axis=1) > lv.current))
+        rows.append((_normal_prob(fc, lv), F.compute_outlook(a, fc).prob_increase, q))
+    p_old, p_new, q = (np.array(c) for c in zip(*rows))
+    assert len(q) >= 70
+    brier_old = float(np.mean((p_old - q) ** 2 + q * (1 - q)))
+    brier_new = float(np.mean((p_new - q) ** 2 + q * (1 - q)))
+    assert brier_new < brier_old - 0.005, (brier_old, brier_new)
+    # it uses the range: the old one put nearly everything in 0.4-0.6
+    assert np.mean((p_new < 0.3) | (p_new > 0.7)) > 0.2 > np.mean((p_old < 0.3) | (p_old > 0.7))
+
+
+def test_intermittent_probability_helper_is_an_exact_compound_bernoulli_mixture():
+    """K2: _intermittent_prob_increase = sum_j BetaBinomial(k)(j) * P(sum of j sizes > k * current),
+    checked against a direct implementation (no FFT) on a small case; strict on ties; monotone."""
+    from math import lgamma
+
+    y = np.array([0, 1, 0, 2, 0, 0, 1, 0, 2, 1, 0, 0] * 4, dtype=float)
+    k, cur, fut = 3, 2.0 / 3.0, 0.6
+    got = F._intermittent_prob_increase(y, cur, fut, k)
+    # the same parameters, recomputed by hand
+    sizes = y[y > 0]
+    mu = sizes.mean()
+    p = fut / mu
+    kw = min(k, len(y) // 2)
+    roll = np.convolve(y, np.ones(kw) / kw, mode="valid")
+    v_noise = (y.mean() / mu * np.mean(sizes ** 2) - y.mean() ** 2) / kw
+    cv2 = max(np.var(roll) - v_noise, 0.0) / y.mean() ** 2
+    w_eff = max(k, len(y) / 4)
+    kappa = max((1 - p) / (p * cv2 + (1 - p) / w_eff) - 1, 1.0)
+    a, b = p * kappa + 0.5, (1 - p) * kappa + 0.5
+    beta = lambda x, z: lgamma(x) + lgamma(z) - lgamma(x + z)
+    w = [math.comb(k, j) * math.exp(beta(j + a, k - j + b) - beta(a, b)) for j in range(k + 1)]
+    pmf = np.bincount(sizes.astype(int)) / len(sizes)
+    want, conv = 0.0, np.array([1.0])
+    for j in range(k + 1):
+        if j:
+            conv = np.convolve(conv, pmf)
+        want += w[j] * conv[np.arange(len(conv)) > k * cur + 1e-9].sum()
+    assert got == pytest.approx(want, abs=1e-12)
+    # a tie (the same total demand as now, 2 in 3 periods) is no rise: just below the current level the
+    # total of 2 counts, at it it does not
+    assert F._intermittent_prob_increase(y, 1.99 / 3, fut, k) > got + 0.05
+    assert F._intermittent_prob_increase(y, 2.01 / 3, fut, k) == pytest.approx(got, abs=1e-12)
+    # above every window of the sizes seen (current >= the largest size): only a record demand can do
+    # it -- each of k demands with a record among them, P(N = k) / (n + 1) for exchangeable demands
+    assert F._intermittent_prob_increase(y, 2.0, fut, k) == pytest.approx(w[k] / (len(sizes) + 1), abs=1e-12)
+    probs = [F._intermittent_prob_increase(y, c, fut, k) for c in (0.1, 0.4, 0.7, 1.0, 1.5)]
+    assert all(x >= y_ for x, y_ in zip(probs, probs[1:])) and probs[0] > probs[-1]
+    rates = [F._intermittent_prob_increase(y, cur, f, k) for f in (0.0, 0.3, 0.6, 1.2)]
+    assert all(x <= y_ for x, y_ in zip(rates, rates[1:])) and 0.0 < rates[0] < rates[-1] < 1.0
+    assert F._intermittent_prob_increase(np.zeros(20), 0.0, 0.0, 3) is None
+    # float sizes go through the 512-cell grid and agree with the integer computation when scaled
+    assert F._intermittent_prob_increase(y * 1.37, cur * 1.37, fut * 1.37, k) == pytest.approx(got, abs=0.02)
+
+
+def test_ordinary_series_keep_the_normal_probability():
+    """K2 must not touch non-intermittent outlooks: prob_increase is still Phi(diff / sigma_H)."""
+    from trendai.analysis import analyze
+
+    for name, freq in (("growing", "M"), ("seasonal", "W"), ("fad", "D")):
+        s = sample(name, n=120, freq=freq)
+        a = analyze(s, freq=freq)
+        fc = F.auto_forecast(a.series, freq=freq)
+        assert F.compute_outlook(a, fc).prob_increase == _normal_prob(fc, F.outlook_levels(a, fc))
+
+
+# --------------------------------------------------------------------------- final round: K2 follow-ups
+
+
+def _weekly(values, start="2025-01-05") -> pd.Series:
+    return pd.Series(np.asarray(values, dtype=float),
+                     index=pd.date_range(start, periods=len(values), freq="W-SUN"))
+
+
+def test_intermittent_probability_does_not_take_the_forecast_rate_as_known():
+    """R6-SW-3: 26 weeks of stationary demand (P(order) 0.5, size 1 + Poisson(3); true P(rise) 0.61) were
+    forecast at 3.51 against 1.85 and read '상승 확률 >99%'; a lumpy series ending on orders of 50 and 80
+    (forecast 60.9 a week against a best half-year of ~5) read '>99%' too.  The rate is now capped at the
+    busiest window seen and its certainty at the number of demands."""
+    from trendai import run
+    from trendai.report import render_text
+
+    r = np.random.default_rng(56)
+    size = r.poisson(3, 26) + 1
+    stationary = _weekly((size * (r.random(26) < 0.5)).astype(float))
+    lumpy = _weekly([3, 50, 2, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                     0, 0, 2, 1, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 1, 3, 0, 0, 0, 50, 80])
+    for s, cap in ((stationary, 0.9), (lumpy, 0.75)):
+        rep = run(s, name="part")
+        assert rep.outlook.prob_increase < cap, rep.outlook.prob_increase
+        assert ">99%" not in rep.narrative and ">99%" not in render_text(rep)
+    # the lumpy one: a 16x forecast does not make a rise "likely" from two orders
+    rep = run(lumpy, name="part")
+    assert rep.outlook.direction == "flat"
+
+
+def test_one_bulk_order_does_not_turn_the_probability_against_the_forecast():
+    """R6-REV-2: one order of 2,000 among sizes of 1-3 set the mean size, so a forecast of +1,132.9 %
+    read '높아질 확률은 약 13%로, 하락 쪽이 우세합니다'.  Sizes are outlier-clipped and the occurrence is
+    capped at the busiest window: the probability no longer leans against a rise of more than 10x."""
+    from trendai import run
+
+    for seed in (0, 1):
+        rng = np.random.default_rng(seed)
+        y = (rng.random(60) < 0.4) * rng.integers(1, 4, 60).astype(float)
+        y[30] = 2000.0
+        rep = run(pd.Series(y, index=pd.date_range(end="2025-12-01", periods=60, freq="MS")), name="bulk")
+        lv = F.outlook_levels(rep.analysis, rep.forecast)
+        assert lv.future > 10 * lv.current
+        assert rep.outlook.prob_increase >= 0.45, (seed, rep.outlook.prob_increase)
+        assert "하락 쪽이" not in rep.narrative
+        assert rep.outlook.prob_increase < 0.99           # nor ">99 %" from one order
+
+
+def test_zero_current_window_direction_does_not_rest_on_a_hidden_probability():
+    """R6-SW-4: an item without demand for 16 months (an order every 4.3 months before) and a fad at 0 for
+    12 quarters read '전망은 상승' on every surface from an intermittent probability of 85 % / 74 % that
+    every surface withholds ('zero_current').  The direction now follows the level rule there."""
+    from trendai import narrative as nv
+    from trendai import run
+    from trendai.report import render_text
+
+    z = np.array([0, 0, 0, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0,
+                  0, 4, 1, 0, 0, 3, 0, 0, 4, 0, 0, 0, 3] + [0] * 16, dtype=float)
+    item = pd.Series(z, index=pd.date_range("2021-01-01", periods=len(z), freq="MS"))
+    t = np.arange(24)
+    r = np.random.default_rng(81)
+    fad = np.clip(80 * np.exp(-0.5 * ((t - 8) / 2.4) ** 2) + r.normal(0, 1, 24), 0, None)
+    fad[-12:] = 0.0
+    fad_s = pd.Series(fad, index=pd.date_range(end="2025-10-01", periods=24, freq="QS"))
+    for s in (item, fad_s):
+        rep = run(s, name="stopped")
+        assert nv.prob_undefined(rep.analysis) == "zero_current"
+        assert rep.outlook.direction == "flat"
+        assert "**상승**" not in rep.narrative and "전망 ▲" not in render_text(rep)
+
+
+def test_forecast_means_at_a_sliver_of_the_current_level_are_the_floor():
+    """R6-REV-1 (B): a weekly product that stopped 6 weeks ago was forecast at 1.08e-4 a week against a
+    current level of 61.5: the floor rule counted only means <= 0, so the outlook read '향후 26주 동안
+    **−100.0%** 변화(하락)'.  A mean of at most 0.05 % of the current level is at the floor too."""
+    from trendai import run
+    from trendai.report import render_html, render_text
+
+    r = np.random.default_rng(0)
+    r.normal(0, 5, 276)
+    y = np.r_[70 + r.normal(0, 4, 70), np.zeros(6)]
+    rep = run(pd.Series(y, index=pd.date_range(end="2025-11-30", periods=len(y), freq="W-SUN")), name="stopped")
+    lv = F.outlook_levels(rep.analysis, rep.forecast)
+    assert 0.0 <= lv.future <= 5e-4 * lv.current and lv.undefined == "floor"
+    assert rep.outlook.expected_change_pct is None
+    for text in (rep.narrative, render_text(rep), render_html(rep)):
+        assert not re.search(r"[−-]100\.0\s?%", text)
+
+
+def test_a_one_off_spike_in_the_current_window_does_not_move_the_outlook():
+    """U4: 156 weeks of trend + noise with one x2.6 promotion inside the last 52 weeks: the forecast was the
+    same (the models pre-correct the spike) but the current level included it -- '+0.8 %, 보합' against
+    '+3.5 %, 상승' without the promotion.  The current level now counts the spike the analysis flagged at
+    its expected value, and every surface names it '일시적 급등을 뺀 최근 52주 평균'."""
+    from trendai import run
+    from trendai.narrative import build_llm_payload
+    from trendai.report import render_text
+
+    out = {}
+    for spike in (False, True):
+        rng = np.random.default_rng(3)
+        y = 500 + 1.5 * np.arange(156) + rng.normal(0, 25, 156)
+        if spike:
+            y[112] *= 2.6
+        rep = run(pd.Series(y, pd.date_range("2022-01-03", periods=156, freq="W-MON"), name="s"))
+        out[spike] = rep
+    assert abs(out[True].outlook.expected_change_pct - out[False].outlook.expected_change_pct) < 0.5
+    assert out[True].outlook.direction == out[False].outlook.direction == "up"
+    lv = F.outlook_levels(out[True].analysis, out[True].forecast)
+    assert lv.spike_adj and not F.outlook_levels(out[False].analysis, out[False].forecast).spike_adj
+    assert "일시적 급등을 뺀 최근 52주 평균보다" in out[True].narrative
+    assert "일시적 급등을 뺀 최근 52주 평균 대비" in render_text(out[True])
+    pay = build_llm_payload(out[True].analysis, out[True].forecast, out[True].outlook)
+    assert "one-off upward spikes inside the current window" in pay["outlook"]["expected_change_basis"]
+
+
+def test_intermittent_probability_grid_is_fine_enough_with_one_huge_size():
+    """R6-REV-9: with sizes of 1-3 and one of 5000.5 the 512-cell grid had a step of ~9.8, splitting a size
+    of 2 between 0 and 9.8 (formula 0.090 against a Monte Carlo 0.029).  Sizes are outlier-clipped first,
+    so the grid follows the bulk of the sizes: the closed form agrees with a simulation of the same model."""
+    from trendai.analysis import _clip_outliers
+
+    rng = np.random.default_rng(1)
+    rng.random(60), rng.poisson(4, 60), rng.random(60), rng.uniform(0.5, 2.5, 60)
+    y = (rng.random(60) < 0.3) * rng.uniform(1, 3, 60)
+    y[10] = 5000.5
+    k, cur, fut = 12, 0.6, 0.6
+    got = F._intermittent_prob_increase(y, cur, fut, k)
+    # the model, simulated
+    sizes = _clip_outliers(y[y > 0])
+    assert sizes.max() < 100                      # the bulk order no longer sets the grid
+    yc = np.where(y > 0, np.minimum(y, sizes.max()), 0.0)
+    mu, m2, n = sizes.mean(), (sizes ** 2).mean(), len(y)
+    kw = min(k, n // 2)
+    roll = np.convolve(yc, np.ones(kw) / kw, mode="valid")
+    cv2 = max(np.var(roll) - (yc.mean() / mu * m2 - yc.mean() ** 2) / kw, 0) / yc.mean() ** 2
+    occ = np.convolve((y > 0).astype(float), np.ones(kw) / kw, mode="valid")
+    p = min(1.0, min(fut, roll.max()) / mu, occ.max())
+    w = max(k, n / 4)
+    kappa = max(min((1 - p) / (p * cv2 + (1 - p) / w) - 1, len(sizes)), 1.0)
+    sim = np.random.default_rng(0)
+    R = 60000
+    N = sim.binomial(k, sim.beta(p * kappa + 0.5, (1 - p) * kappa + 0.5, R))
+    tot = np.zeros(R)
+    for j in range(1, k + 1):
+        idx = N >= j
+        tot[idx] += sim.choice(sizes, idx.sum())
+    assert got == pytest.approx(float(np.mean(tot > k * cur)), abs=0.01)

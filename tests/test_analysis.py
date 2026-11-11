@@ -1632,3 +1632,263 @@ def test_a_small_move_of_the_demand_rate_is_no_move():
     assert A._against_recent_move("declining", {"t_rec0": 0.15, "t_last": 0.34})
     assert A._against_recent_move("growing", {"t_rec0": 0.34, "t_last": 0.15})
     assert A.phase_window(48) == 7 and A.phase_window(156) == 23
+
+
+# --------------------------------------------------------------------------- round 6: a trend that fell to 0
+
+
+def _fell_to_zero_daily() -> pd.Series:
+    """Rises from 5 to 50 over 100 days, then 0 for 450 days (the round-5 'zero_tail' series)."""
+    y = np.r_[np.linspace(5, 50, 100), np.zeros(450)]
+    return pd.Series(y, index=pd.date_range("2020-01-01", periods=len(y), freq="D"))
+
+
+def test_float_noise_of_a_zero_run_is_exactly_zero_in_the_decomposition():
+    """K1: the local-linear trend of a run of zeros ended at 5.33e-18 (and the seasonal pattern of
+    data without one was +-3e-16), so the trend line read '5.00에서 5.33×10⁻¹⁸까지 −100.0%' and the
+    Theil-Sen slope '−5.52×10⁻¹⁹/일'.  Values within 1e-12 of the scale are exactly 0."""
+    s = _fell_to_zero_daily()
+    dec = A.decompose(s, 7)
+    tail = slice(-400, None)
+    assert np.all(dec.trend.to_numpy()[tail] == 0.0)
+    assert np.all(dec.seasonal.to_numpy() == 0.0)
+    assert np.array_equal((dec.trend + dec.seasonal + dec.resid).to_numpy(), s.to_numpy())
+    a = A.analyze(s)
+    assert a.decomposition.trend.iloc[-1] == 0.0
+    assert a.metrics.slope == 0.0
+    # a real (non-noise) small trend is left alone
+    tiny = pd.Series(np.full(60, 3e-9) + np.linspace(0, 1e-9, 60), index=pd.date_range("2020-01-01", periods=60, freq="D"))
+    assert np.all(A.decompose(tiny, 7).trend.to_numpy() > 0)
+
+
+def test_pct_rule_names_a_fall_to_zero_at_zero():
+    """K1: one rule (pct_change_undefined) for every '% change to 0' of a series that cannot go below
+    0: 'at_zero' -- also the drawdown's reason, so the narrative's own mirror of it is gone."""
+    y = np.array([0.0, 2.0, 5.0, 8.0, 3.0, 0.0])
+    assert A.pct_change_undefined(5.0, 0.0, y) == "at_zero"
+    assert A.pct_change_undefined(5.0, 4e-16, y) == "at_zero"           # float noise of 0
+    assert A.pct_change_undefined(5.0, 0.01, y) is None                  # a real level keeps its %
+    assert A.pct_change_undefined(0.0, 0.0, y) == "zero"                 # base ~0 wins
+    assert A.pct_change_undefined(5.0, 0.0, y - 1.0) != "at_zero"       # interval-scale data: 0 is no floor
+    assert A.pct_change_undefined(5.0, 0.0, np.r_[y, -1.0]) is None
+
+
+def test_trend_that_fell_to_zero_has_no_minus_100_percent():
+    """K1: total_change_pct read −100.0 % for a trend that fell to 0 (zero_tail), and the level-shift
+    reason '(약 −100.0%)'.  The growth metrics are None ('at_zero') and the reasons say it fell to 0."""
+    a = A.analyze(_fell_to_zero_daily())
+    m = a.metrics
+    assert m.total_change_pct is None and m.cagr_pct is None
+    tr = a.decomposition.trend.to_numpy()
+    assert A.pct_change_undefined(tr[0], tr[-1], a.series) == "at_zero"
+    assert a.phase.reasons[0] == "2020-04-10에 수준이 0까지 한 번에 떨어졌습니다."
+    assert not any("100.0%" in r or "×10" in r for r in a.phase.reasons)
+
+    # a monthly product that faded to 0: the peak and the recent window say "0까지" / "0 수준"
+    y = np.r_[np.linspace(10, 40, 30), np.linspace(40, 0, 15), np.zeros(15)]
+    fm = A.analyze(pd.Series(y, index=pd.date_range("2018-01-01", periods=len(y), freq="MS")))
+    assert fm.metrics.total_change_pct is None and fm.metrics.recent_change_pct is None
+    assert "추세는 고점(2020-04, 37.9) 이후 0까지 떨어졌습니다." in fm.phase.reasons
+    assert "최근 9개월 동안 추세는 0 수준에 머물렀습니다." in fm.phase.reasons
+    assert not any("100.0%" in r for r in fm.phase.reasons)
+
+    # the recent window itself ends at 0: recent_change_pct is None too
+    w = np.r_[np.full(60, 20.0) + np.sin(np.arange(60)), np.linspace(20, 0, 20), np.zeros(20)]
+    wa = A.analyze(pd.Series(w, index=pd.date_range("2021-01-03", periods=len(w), freq="W-SUN")))
+    tw = wa.decomposition.trend.to_numpy()
+    assert wa.metrics.recent_change_pct is None
+    assert A.pct_change_undefined(tw[-53], tw[-1], wa.series) == "at_zero"
+
+    # too short for a phase: the observed values' move says "0까지 떨어졌습니다", no "−100.0%"
+    sh = A.analyze(pd.Series([5.0, 4, 3, 2, 0], index=pd.date_range("2020-01-01", periods=5, freq="YS")))
+    assert "관측 기간 동안 값이 5.00에서 0까지 떨어졌습니다." in sh.phase.reasons
+
+
+def test_fall_to_zero_reasons_are_translated():
+    """K1: every new reason has an English template (no Hangul, none dropped)."""
+    from trendai.narrative import translate_reason
+
+    for ko, en in (
+        ("2020-04-10에 수준이 0까지 한 번에 떨어졌습니다.", "On 2020-04-10 the level dropped to 0 in one step."),
+        ("2016년에 수준이 0까지 한 번에 떨어졌습니다.", "In 2016 the level dropped to 0 in one step."),
+        ("추세는 고점(2020-04, 37.9) 이후 0까지 떨어졌습니다.", "The trend has fallen to 0 since its peak (2020-04, 37.9)."),
+        ("최근 7일 동안 추세가 12.0에서 0까지 떨어졌습니다.", "Over the last 7 days the trend fell from 12.0 to 0."),
+        ("관측 기간 동안 값이 5.00에서 0까지 떨어졌습니다.", "Over the observed period the value fell from 5.00 to 0."),
+    ):
+        assert translate_reason(ko) == en
+
+
+# --------------------------------------------------------------------------- final round: K1 follow-ups
+
+
+_NOISE_OR_100 = re.compile(r"[−-]100\.0\s?%|100\.0% (?:낮|below)|×10⁻")
+
+
+def _surfaces(s: pd.Series) -> list[str]:
+    """Narrative ko/en, terminal ko/en and the HTML page of ``s``."""
+    from trendai import run
+    from trendai.report import render_html, render_text
+
+    out = []
+    for lang in ("ko", "en"):
+        rep = run(s, name="x", lang=lang)
+        out += [rep.narrative, render_text(rep, lang=lang)]
+        if lang == "ko":
+            out.append(render_html(rep))
+    return out
+
+
+@pytest.mark.parametrize("freq,pf,lead,tail", [("D", "D", 300, 500), ("D", "D", 200, 450),
+                                                ("D", "D", 60, 30), ("M", "MS", 60, 30)])
+def test_a_run_of_zeros_has_a_trend_of_exactly_zero(freq, pf, lead, tail):
+    """R6-SW-1: a fall from 80 to 3 followed by exact zeros kept smoother residue of 1e-11..1e-6 of the
+    scale over the zeros (trend end 4.22e-9 for 300+500) above the 1e-12 snap: '80.0에서 4.22×10⁻⁹까지
+    −100.0%', '기울기 −0.26 → −2.71×10⁻¹¹/일', '현재 5.14×10⁻⁶', '추세 7.61×10⁻⁵'.  Where the trend window
+    holds only zeros the trend (and the seasonal part) is exactly 0, and next to it no sliver is left."""
+    y = np.r_[np.linspace(80, 3, lead), np.zeros(tail)]
+    s = pd.Series(y, index=pd.date_range(end="2025-12-28", periods=len(y), freq=pf))
+    dec = A.analyze(s, freq=freq).decomposition
+    assert float(dec.trend.iloc[-1]) == 0.0
+    assert np.all(dec.trend.to_numpy()[-tail // 2:] == 0.0) and np.all(dec.seasonal.to_numpy()[-tail // 2:] == 0.0)
+    for text in _surfaces(s):
+        assert not _NOISE_OR_100.search(text), _NOISE_OR_100.search(text).group(0)
+
+
+def test_a_fall_that_rounds_to_minus_100_percent_is_at_zero():
+    """R6-SW-5 / R6-REV-1: a wind-down whose trend ends at 0.019 of 49.9 (−99.96 %) printed '−100.0%' and
+    '100.0% 낮은 수준' on every surface; the % rule now names any fall of a non-negative level to at most
+    0.05 % of its base 'at_zero' and the surfaces state the two levels instead."""
+    from trendai import run
+    from trendai.pipeline import report_to_dict
+
+    r = np.random.default_rng(71)
+    t = np.arange(400)
+    r.poisson(30 * 0.9 ** (t * 60 / 400))
+    y = np.clip(np.linspace(50, 0, 400) + r.normal(0, 1.5, 400), 0, None)
+    y[-1] = 0.0
+    s = pd.Series(y, index=pd.date_range("2024-11-27", periods=400, freq="D"))
+    a = A.analyze(s, freq="D")
+    t0, t1 = float(a.decomposition.trend.iloc[0]), float(a.decomposition.trend.iloc[-1])
+    assert 0.0 < t1 <= 5e-4 * t0                      # a real level, not float noise
+    assert A.pct_change_undefined(t0, t1, y) == "at_zero" and a.metrics.total_change_pct is None
+    assert A.pct_change_undefined(100.0, 0.06, [100.0, 50.0, 0.0]) is None     # −99.94 % still prints
+    for text in _surfaces(s):
+        assert not _NOISE_OR_100.search(text), _NOISE_OR_100.search(text).group(0)
+    rep = run(s, name="x")
+    assert "- 추세선 기준으로 49.9에서 0.019까지 떨어졌습니다." in rep.narrative
+    assert report_to_dict(rep)["metrics"]["pct_undefined"]["total_change_pct"] == "at_zero"
+    # a hand-made negative level of a non-negative series stays a zero crossing, not 'at_zero'
+    assert A.pct_change_undefined(50.0, -10.0, [50.0, 20.0, 0.0]) == "sign_change"
+
+
+def test_constant_series_has_no_trend_and_count_slopes_are_exact():
+    """R6-SW-2: 156 weekly values of exactly 100.0 read 'Mann-Kendall … 통계적으로 유의한 **하락** 추세
+    (τ = −0.04, p = 0.004)': the deseasonalised series was trend + resid, whose rounding noise
+    (99.99999999999997..100.00000000000003) the test ranked.  It is y − seasonal now, exactly; counts whose
+    median pairwise slope is 0 no longer print slopes of −1.7×10⁻¹⁸/일."""
+    from trendai import run
+
+    for n, freq, pf in ((156, "W", "W-SUN"), (120, "M", "MS"), (400, "D", "D")):
+        s = pd.Series(np.full(n, 100.0), index=pd.date_range(end="2025-12-28", periods=n, freq=pf))
+        m = A.analyze(s, freq=freq).metrics
+        assert m.mk_tau == 0.0 and m.mk_pvalue == 1.0 and m.direction == "flat" and m.slope == 0.0
+        assert "유의한 장기 추세는 확인되지 않습니다" in run(s, name="c").narrative
+    for freq, n, pf, end in (("D", 400, "D", "2025-12-31"), ("Q", 40, "QS", "2025-10-01")):
+        r = np.random.default_rng(1)
+        for i in range(3):
+            r.normal(0, 4 if i < 2 else 10, n)
+        cnt = (r.poisson(2.0, n) * (r.random(n) < 0.4)).astype(float)
+        s = pd.Series(cnt, index=pd.date_range(end=end, periods=n, freq=pf))
+        assert A.analyze(s, freq=freq).metrics.slope == 0.0
+        for lang in ("ko", "en"):
+            text = run(s, name="parts", lang=lang).narrative
+            assert not re.search(r"×10⁻(?:[¹²³⁴⁵⁶⁷⁸⁹][⁰¹²³⁴⁵⁶⁷⁸⁹]?)", text)
+            if freq == "D":   # 65 % zeros (the quarterly one has exactly half: its plain "0/분기" is true)
+                assert ("관측치의 절반 이상이 0이라 0" in text) if lang == "ko" else ("only because more than half" in text)
+
+
+def test_a_discontinued_seasonal_product_has_no_seasonal_swing_over_its_zeros():
+    """R6-REV-4: 72 months of a ±20 seasonal pattern, then 24 zeros: the pattern carried on over the zeros
+    and the trend 'rebounded' from 0 to 21.2 ('최근 12개월 동안 추세는 +3,941.6%', phase reviving for 12
+    zeros).  A terminal zero run of at least a season has no seasonal component."""
+    for nz, pf, n, m, freq in ((24, "MS", 96, 12, "M"), (12, "MS", 72, 12, "M"), (60, "W-SUN", 260, 52, "W")):
+        t = np.arange(n - nz)
+        y = np.r_[50 + 20 * np.sin(2 * np.pi * t / m) + np.random.default_rng(0).normal(0, 2, n - nz), np.zeros(nz)]
+        s = pd.Series(y, index=pd.date_range(end="2025-12-01", periods=n, freq=pf))
+        a = A.analyze(s, freq=freq)
+        assert np.all(a.decomposition.trend.to_numpy()[-nz:] == 0.0)
+        assert np.all(a.decomposition.seasonal.to_numpy()[-nz:] == 0.0)
+        assert a.metrics.recent_change_pct is None and a.metrics.total_change_pct is None
+        assert a.phase.label not in ("reviving", "growing", "emerging")
+        # the active stretch keeps its seasonal pattern
+        assert float(np.ptp(a.decomposition.seasonal.to_numpy()[:n - nz])) > 20
+
+
+def test_level_rate_rule_does_not_overflow():
+    """R6-SW-8: the mean of values ~1e306 overflowed in level_rate_undefined (RuntimeWarning)."""
+    for big in (1e306, -1.1e306):
+        y = big * (1.0 + 0.1 * np.sin(np.arange(400.0)))   # a sum of ~4e308 overflows
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert A.level_rate_undefined(y, 12) in (None, "negative")
+
+
+def test_momentum_of_a_trend_at_zero_is_undefined():
+    """R6-SW-7 / R6-REV-5: 'momentum relative to the current trend level' was printed (+13.09%p/월,
+    +133%p/분기) after the trend fell to 0 -- a share of the 0.1 x mean-level floor."""
+    y = np.r_[np.linspace(40, 2, 20), np.zeros(8)]
+    s = pd.Series(y, index=pd.date_range(end="2025-10-01", periods=28, freq="QS"))
+    a = A.analyze(s, freq="Q")
+    assert float(a.decomposition.trend.iloc[-1]) == 0.0
+    assert A.momentum_undefined(y, 4, a.decomposition.trend.to_numpy()) == "at_zero"
+    assert A.level_rate_undefined(y, 4) is None          # slope_pct / volatility stay
+    grow = np.linspace(10, 40, 28)
+    assert A.momentum_undefined(grow, 4, grow) is None
+
+
+def test_one_spike_in_two_cycles_invents_no_seasonality():
+    """U1: 104 weeks (or 24 months) of trend + noise with one x2.6 promotion read '계절성은 매우 뚜렷합니다
+    (강도 0.86)', an anomaly mirrored a year before the spike and an 80 % band 3.5x wider: with two cycles
+    half the spike went into the seasonal pattern.  One-off spikes are fitted around, in the analysis and
+    in the forecast; a peak that recurs every cycle stays seasonal."""
+    from trendai import run
+
+    for freq, n, sp, start, m in (("W-MON", 104, 60, "2022-01-03", 52), ("MS", 24, 15, "2021-01-01", 12)):
+        rng = np.random.default_rng(3)
+        idx = pd.date_range(start, periods=n, freq=freq)
+        y = 500 + 1.5 * np.arange(n) + rng.normal(0, 25, n)
+        clean = run(pd.Series(y.copy(), idx, name="s"))
+        y[sp] *= 2.6
+        rep = run(pd.Series(y, idx, name="s"))
+        a = rep.analysis
+        assert a.metrics.seasonal_strength < 0.3
+        assert sp - m not in [x.index for x in a.anomalies] and sp in [x.index for x in a.anomalies]
+        hw = lambda r: float(r.forecast.upper[80].iloc[-1] - r.forecast.lower[80].iloc[-1]) / 2
+        assert hw(rep) <= 1.3 * hw(clean)
+    # a holiday week that comes back every year is seasonality, not a spike
+    t = np.arange(104)
+    y = 500 + 1.5 * t + np.random.default_rng(5).normal(0, 10, 104)
+    y[[47, 99]] *= 2.0
+    assert A.analyze(pd.Series(y, pd.date_range("2022-01-03", periods=104, freq="W-MON"))).metrics.seasonal_strength > 0.3
+
+
+def test_four_years_of_proportional_seasonality_use_the_log_decomposition():
+    """U2: 48 months with a seasonal swing proportional to the level (Dec x1.45, Jul x0.80) chose the additive
+    decomposition in 34 of 40 runs (interaction t ~ 2 < 3.5); ending in December the trend hooked into the
+    peak: recent change +4.4 pp too high on average and a false '가속' in half of the runs.  With 3-6 cycles
+    a t of 2 and a log fit that removes a tenth of the remainder suffice; additive data stay additive."""
+    season = np.array([1.15, 0.95, 0.9, 0.92, 0.95, 0.85, 0.8, 0.82, 0.95, 1.05, 1.2, 1.45])
+    idx = pd.period_range(end="2024-12", periods=48, freq="M").to_timestamp()
+    tr = 120 + 2.2 * np.arange(48)
+    err, mom, mult, add = [], [], 0, 0
+    for seed in range(40):
+        y = tr * season[idx.month - 1] * np.random.default_rng(seed).normal(1, 0.04, 48)
+        a = A.analyze(pd.Series(y, idx, name="x"))
+        err.append(a.metrics.recent_change_pct - (tr[-1] / tr[-13] - 1) * 100)
+        mom.append(a.metrics.momentum)
+        mult += A._is_multiplicative(a.decomposition)
+        y_add = tr + 100 * (season[idx.month - 1] - 1) + np.random.default_rng(seed).normal(0, 5, 48)
+        add += A._is_multiplicative(A.analyze(pd.Series(y_add, idx, name="x")).decomposition)
+    assert mult >= 20 and add <= 2
+    assert abs(float(np.mean(err))) < 2.0
+    assert float(np.mean(np.array(mom) > 0.3)) <= 0.3

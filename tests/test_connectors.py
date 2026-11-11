@@ -140,8 +140,11 @@ def test_fetch_daily_and_skips_malformed_items():
 
 def test_404_means_article_not_found():
     session = FakeSession(FakeResponse(404, {"type": "not_found"}))
-    with pytest.raises(ConnectorError, match="article not found"):
+    # final round (U13): the Korean text no longer carries an English parenthetical; the English
+    # text (exc.text('en')) still says "article not found"
+    with pytest.raises(ConnectorError, match="위키백과 문서를 찾을 수 없습니다") as ei:
         fetch_wikipedia_pageviews("없는문서제목xyz", start="2020-01-01", end="2020-12-31", session=session)
+    assert "article not found" in ei.value.text("en")
 
 
 @pytest.mark.parametrize("status", [400, 429, 500, 503])
@@ -153,8 +156,15 @@ def test_other_http_errors(status):
 
 def test_network_error():
     session = FakeSession(exc=ConnectionError("connection reset"))
-    with pytest.raises(ConnectorError, match="network error"):
+    # final round (U13): Korean advice instead of "(network error)"; the English text keeps the words
+    with pytest.raises(ConnectorError, match="연결하지 못했습니다. 인터넷 연결") as ei:
         fetch_wikipedia_pageviews("Python", lang="en", start="2020-01-01", end="2020-12-31", session=session)
+    assert "network error" in ei.value.text("en") and "ConnectionError: connection reset" in str(ei.value)
+    long = FakeSession(exc=ConnectionError("HTTPSConnectionPool(host='wikimedia.org', port=443): Max retries "
+                                           "exceeded with url: /api/rest_v1/metrics/pageviews/" + "x" * 300))
+    with pytest.raises(ConnectorError) as ei:
+        fetch_wikipedia_pageviews("Python", lang="en", start="2020-01-01", end="2020-12-31", session=long)
+    assert len(str(ei.value)) < 260 and "x" * 200 not in str(ei.value)
 
 
 @pytest.mark.parametrize("payload", [{"items": []}, {}, [], None])

@@ -2168,3 +2168,44 @@ def test_current_value_tile_of_a_count_at_zero_names_the_peak():
     rep = _run_quiet(pd.Series(y, index=pd.date_range("2021-01-01", periods=60, freq="MS")), name="count")
     _, sub = _kpi_tile(R.render_html(rep), "현재 값")
     assert "−100" not in sub and re.search(r"최고 [\d.,]+ \(\d{4}-\d{2}", sub), sub
+
+
+# --------------------------------------------------------------------------- final round
+
+
+def test_compare_page_explains_its_dashes():
+    """V2-8: the comparison page's 'recent change' and momentum cells were a bare '<span>—</span>' for an
+    intermittent series and a product whose trend fell to 0 -- no tooltip, no note."""
+    from trendai import run
+    from trendai.compare import rank_trends
+
+    r = np.random.default_rng(4)
+    inter = run(pd.Series((r.random(80) < 0.4) * (r.poisson(3, 80) + 1.0),
+                          index=pd.date_range("2024-01-07", periods=80, freq="W-SUN")), name="parts")
+    dead = run(pd.Series(np.r_[np.linspace(40, 2, 20), np.zeros(8)],
+                         index=pd.date_range(end="2025-10-01", periods=28, freq="QS")), name="dead")
+    page = R.render_compare_html([inter, dead], rank_trends([inter, dead]))
+    assert '<span title="간헐적 수요여서 %로 나타내지 않음">—</span><span class="dl">' in page
+    assert '<span title="추세가 0 수준까지 떨어져 %로 나타내지 않음">—</span>' in page
+    assert '<span title="간헐 수요라 계산하지 않음">—</span>' in page
+
+
+def test_long_terminal_reasons_wrap_instead_of_being_cut():
+    """R5-REV2-3: '※ Momentum, Volatility: the mean level is close to zero relative to the sprea…'."""
+    from trendai import run
+
+    r = np.random.default_rng(3)
+    y = r.normal(0, 10, 60) + np.linspace(-2, 2, 60)
+    rep = run(pd.Series(y, index=pd.date_range("2021-01-01", periods=60, freq="MS")), name="pnl", lang="en")
+    text = R.render_text(rep, lang="en", width=78)
+    assert "relative to the spread" in text and "sprea…" not in text
+    assert "  of the values, so not given in %" in text
+
+
+def test_model_table_explains_when_its_two_orders_differ():
+    """U8: the leaderboard is sorted by recency-weighted MASE while '단순 대비' is a plain error ratio, so a row
+    could read +40 % above a row reading +30 %, unexplained."""
+    from trendai import run
+
+    page = R.render_html(run(sample("volatile", freq="W", n=104), name="v"))
+    assert "순위는 최근 구간에 가중을 둔 MASE 기준이고, ‘단순 대비’는 백테스트 전체 구간의 평균 절대 오차 기준" in page

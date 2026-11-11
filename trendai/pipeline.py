@@ -21,7 +21,8 @@ from .analysis import analyze
 from .data import DataError, DataWarning, default_horizon, future_index, prepare
 from .forecast import auto_forecast, compute_outlook, is_random_walk, outlook_levels
 from .messages import Localised, Msg, msg
-from .narrative import direction_label, generate_narrative, prob_undefined
+from .narrative import direction_label, generate_narrative, is_synthetic, metric_pct_undefined, prob_undefined
+from .samples import SYNTHETIC_ATTR, is_synthetic_series
 from .types import PHASE_KO, TrendReport
 
 DEFAULT_LLM_MODEL = "claude-opus-5-5"
@@ -77,6 +78,8 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
     _check_horizon(s, f, horizon)
     display_name = str(name if name is not None else (s.name if s.name is not None else "series"))
     analysis = analyze(s, freq=f, name=display_name)
+    if is_synthetic_series(series):   # a built-in sample: every surface says it is synthetic
+        analysis.series.attrs[SYNTHETIC_ATTR] = True
     forecast = auto_forecast(analysis.series, horizon=horizon, freq=f, levels=tuple(levels),
                              candidates=candidates, random_walk=is_random_walk(analysis))
     outlook = compute_outlook(analysis, forecast)
@@ -237,8 +240,47 @@ def _outlook_extras(report: TrendReport) -> dict[str, Any]:
     return extras
 
 
-def report_to_dict(report: TrendReport) -> dict[str, Any]:
+def _metrics_dict(report: TrendReport) -> dict[str, Any]:
+    """The ``TrendMetrics`` fields plus ``pct_undefined``: why a percentage metric is null or no
+    percentage (:func:`narrative.metric_pct_undefined`, the rule of the LLM payload too, e.g.
+    ``'at_zero'`` for a trend or a latest value that fell to 0).  The metrics it names are ``null``
+    here, as every human surface leaves them out (the ``TrendMetrics`` object keeps its raw numbers,
+    e.g. ``drawdown_pct = -100.0`` for a count at 0)."""
+    m = report.analysis.metrics
+    out: dict[str, Any] = {k: getattr(m, k) for k in m.__dataclass_fields__}
+    try:
+        why = metric_pct_undefined(report.analysis)
+    except (AttributeError, TypeError, ValueError):   # hand-made or partial report
+        why = {}
+    for key in why:
+        if key in out:
+            out[key] = None
+    out["pct_undefined"] = why
+    return out
+
+
+def _phase_dict(report: TrendReport, lang: str) -> dict[str, Any]:
+    """The lifecycle phase for the export: label, Korean label and confidence, and the reasons in
+    ``lang`` -- for ``'en'`` translated by :func:`narrative.translate_reason` (the narrative's own
+    translation; ``reasons_ko`` keeps the originals), so an English export carries no Korean."""
+    from .narrative import PHASE_EN, translate_reason
+
+    ph = report.analysis.phase
+    out: dict[str, Any] = {"label": ph.label, "label_ko": PHASE_KO.get(ph.label, ph.label),
+                           "confidence": ph.confidence, "reasons": list(ph.reasons)}
+    if lang == "en":
+        out["label_en"] = PHASE_EN.get(ph.label, ph.label)
+        out["reasons_ko"] = list(ph.reasons)
+        out["reasons"] = [translate_reason(r) or r for r in ph.reasons]
+    return out
+
+
+def report_to_dict(report: TrendReport, lang: str = "ko") -> dict[str, Any]:
     """Full machine-readable export of a report (history, trend, forecast, findings).
+
+    ``lang='en'`` gives the phase reasons in English (``phase.reasons``; the Korean
+    originals in ``phase.reasons_ko``) and adds ``phase.label_en``; the narrative is the
+    report's own (in the language it was generated in).
 
     ``outlook`` holds the :class:`~trendai.types.Outlook` fields plus
     ``direction_label`` (``{'ko', 'en'}``: the word every human surface shows,
@@ -247,9 +289,11 @@ def report_to_dict(report: TrendReport) -> dict[str, Any]:
     ``None``), ``compared_levels`` (``{'current', 'future'}``, see
     :func:`trendai.forecast.outlook_levels`) and ``prob_increase_undefined`` (why
     ``prob_increase`` is ``null``: :func:`trendai.narrative.prob_undefined`).
+    ``metrics`` holds the :class:`~trendai.types.TrendMetrics` fields plus
+    ``pct_undefined`` (:func:`trendai.narrative.metric_pct_undefined`); the
+    percentage metrics it names are ``null`` (see :func:`_metrics_dict`).
     """
     a, fc, o = report.analysis, report.forecast, report.outlook
-    m = a.metrics
     fc_frame = fc.to_frame()
     forecast_rows = []
     for d, row in fc_frame.iterrows():
@@ -258,13 +302,14 @@ def report_to_dict(report: TrendReport) -> dict[str, Any]:
         forecast_rows.append(rec)
     payload = {
         "name": report.name,
+        # a built-in synthetic sample (samples.sample), not real data
+        "synthetic": bool(is_synthetic(a)),
         "freq": a.freq,
         "season_length": a.season_length,
         "history": _series_records(a.series),
         "trend": _series_records(a.decomposition.trend),
-        "metrics": {k: getattr(m, k) for k in m.__dataclass_fields__},
-        "phase": {"label": a.phase.label, "label_ko": PHASE_KO.get(a.phase.label, a.phase.label),
-                  "confidence": a.phase.confidence, "reasons": list(a.phase.reasons)},
+        "metrics": _metrics_dict(report),
+        "phase": _phase_dict(report, "en" if str(lang).lower().startswith("en") else "ko"),
         "changepoints": [cp.__dict__ for cp in a.changepoints],
         "anomalies": [an.__dict__ for an in a.anomalies],
         "forecast": {
@@ -284,11 +329,11 @@ def report_to_dict(report: TrendReport) -> dict[str, Any]:
     return _clean(payload)
 
 
-def report_to_json(report: TrendReport, indent: int = 2) -> str:
+def report_to_json(report: TrendReport, indent: int = 2, lang: str = "ko") -> str:
     """:func:`report_to_dict` as a UTF-8-friendly JSON string (NaN/inf become ``null``)."""
-    return json.dumps(report_to_dict(report), ensure_ascii=False, indent=indent)
+    return json.dumps(report_to_dict(report, lang=lang), ensure_ascii=False, indent=indent)
 
 
-def reports_to_json(reports: Iterable[TrendReport], indent: int = 2) -> str:
+def reports_to_json(reports: Iterable[TrendReport], indent: int = 2, lang: str = "ko") -> str:
     """A JSON array of :func:`report_to_dict` for several reports."""
-    return json.dumps([report_to_dict(r) for r in reports], ensure_ascii=False, indent=indent)
+    return json.dumps([report_to_dict(r, lang=lang) for r in reports], ensure_ascii=False, indent=indent)

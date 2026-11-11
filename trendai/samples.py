@@ -15,6 +15,9 @@ import pandas as pd
 
 from .data import PANDAS_FREQ, season_length
 
+#: ``Series.attrs`` key that marks a series made by :func:`sample` (synthetic data)
+SYNTHETIC_ATTR = "trendai_synthetic"
+
 DESCRIPTIONS: dict[str, str] = {
     "emerging": "낮은 기반에서 가속 성장 중인 신흥 트렌드 (S-커브 초입)",
     "growing": "꾸준한 성장 + 계절성",
@@ -121,7 +124,16 @@ def sample(name: str, n: int = 120, freq: str = "M", start: Optional[str] = None
     idx = _sample_index(n, freq, start)
     s = pd.Series(y.astype(float), index=idx, name=name)
     s.index.name = "date"
+    # marked as synthetic: pipeline.run carries the mark to the report, whose HTML page, JSON export
+    # and CLI output say so (narrative.is_synthetic) -- realistic dates must not pass for real data
+    s.attrs[SYNTHETIC_ATTR] = True
     return s
+
+
+def is_synthetic_series(series: object) -> bool:
+    """Was ``series`` made by :func:`sample` (``series.attrs[SYNTHETIC_ATTR]``)?"""
+    attrs = getattr(series, "attrs", None)
+    return bool(attrs.get(SYNTHETIC_ATTR)) if isinstance(attrs, dict) else False
 
 
 def breakout_date(n: int = 120, freq: str = "M", start: Optional[str] = None) -> pd.Timestamp:

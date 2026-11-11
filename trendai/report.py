@@ -40,11 +40,8 @@ from urllib.parse import quote, urlsplit
 import numpy as np
 import pandas as pd
 
-from .analysis import CAGR_MIN_YEARS as _CAGR_MIN_YEARS
 from .analysis import changepoint_label as _changepoint_label
-from .analysis import pct_change_undefined as _pct_change_undefined
 from .data import FREQ_KO
-from .data import periods_per_year as _periods_per_year
 from .data import season_length as _season_length
 from .narrative import MODEL_KO as _NARRATIVE_MODEL_KO
 from .narrative import PHASE_EN as _PHASE_EN
@@ -64,7 +61,9 @@ from .narrative import period_unit as _period_unit
 from .narrative import phase_is_tentative as _phase_is_tentative
 from .narrative import prob_reason as _narrative_prob_reason
 from .narrative import prob_undefined as _narrative_prob_undefined
-from .narrative import rate_pct_undefined as _narrative_rate_pct_undefined
+from .narrative import momentum_pct_undefined as _narrative_momentum_pct_undefined
+from .narrative import metric_pct_undefined as _metric_pct_undefined
+from .narrative import is_synthetic as _narrative_is_synthetic
 from .narrative import rate_reason_clause as _rate_reason_clause
 from .narrative import volatility_undefined as _narrative_volatility_undefined
 from .narrative import zero_level_reason as _zero_level_reason
@@ -626,7 +625,14 @@ def _change_basis(report: TrendReport, d: "_ChartData") -> tuple[str, str]:
         cur = f"최근 {k_cur:,}{unit} 평균"
     if demand:
         fut, cur = (fut if k_fut <= 1 else fut + " 수요량"), (cur if k_cur <= 1 else cur + " 수요량")
+    if _spike_adj(report, d):   # the narrative's "일시적 급등을 뺀 최근 52주 평균"
+        cur = "일시적 급등을 뺀 " + cur
     return (_ADJ_KO + fut if adj_fut else fut), (_ADJ_KO + cur if adj_cur else cur)
+
+
+def _spike_adj(report: TrendReport, d: "_ChartData") -> bool:
+    """``OutlookLevels.spike_adj``: the current level leaves out one-off spikes (as the models do)."""
+    return bool(getattr(_outlook_levels(report, d), "spike_adj", False))
 
 
 def _change_basis_en(report: TrendReport, d: "_ChartData") -> tuple[str, str]:
@@ -646,6 +652,8 @@ def _change_basis_en(report: TrendReport, d: "_ChartData") -> tuple[str, str]:
     else:
         cur = f"last {_span_adj_en(k_cur, d.freq)} avg{' demand' if demand else ''}"
     adj = "seasonally adj. "
+    if _spike_adj(report, d):
+        cur += " excl. one-off spikes"
     return (adj + fut if adj_fut else fut), (adj + cur if adj_cur else cur)
 
 
@@ -771,10 +779,11 @@ def _zero_reason(report: TrendReport, current: Optional[float], lang: str) -> An
         return _zero_level_reason(None, None, lang)
 
 
-def _rate_undefined(report: TrendReport) -> Optional[str]:
-    """:func:`narrative.rate_pct_undefined`: why momentum (%p) and the slope in % of the level mean nothing."""
+def _mom_undefined(report: TrendReport) -> Optional[str]:
+    """:func:`narrative.momentum_pct_undefined`: why the momentum (%p of the current trend level)
+    means nothing -- :func:`narrative.rate_pct_undefined`'s reasons, or a trend that fell to about 0."""
     try:
-        return _narrative_rate_pct_undefined(report.analysis)
+        return _narrative_momentum_pct_undefined(report.analysis)
     except Exception:  # noqa: BLE001 - hand-made / partial analyses
         return None
 
@@ -938,15 +947,16 @@ def _drawdown_sub(report: TrendReport, d: "_ChartData") -> str:
     return f"최고점 대비 {_fmt_pct(dd)}{spike}"
 
 
-#: why a growth metric is None, as a short tile / terminal phrase (analysis.pct_change_undefined codes,
-#: plus 'intermittent', 'short_span' and 'all_zero'); {base} is 시작 수준 for the whole-period change and the CAGR,
-#: 기준 수준 for the recent change -- the narrative's subjects
+#: why a growth metric is None, as a short tile / terminal phrase (analysis.pct_change_undefined codes --
+#: 'at_zero': the trend fell to 0 --, plus 'intermittent', 'short_span' and 'all_zero'); {base} is
+#: 시작 수준 for the whole-period change and the CAGR, 기준 수준 for the recent change -- the narrative's subjects
 _PCT_WHY: dict[str, dict[str, str]] = {
     "ko": {
         "sign_change": "0을 지나 음수로 바뀌어 변화율 없음",
         "negative": "{base}이 음수라 변화율 없음",
         "near_zero": "{base}이 0에 가까워 변화율 없음",
         "zero": "{base}이 0에 가까워 변화율 없음",
+        "at_zero": "추세가 0 수준까지 떨어져 변화율 없음",
         "intermittent": "간헐 수요라 계산하지 않음",
         "short_span": "기간이 1년 미만이라 연 환산하지 않음",
         "all_zero": "관측값이 모두 0이라 변화율 없음",
@@ -957,6 +967,7 @@ _PCT_WHY: dict[str, dict[str, str]] = {
         "negative": "the {base} is negative, so no % change",
         "near_zero": "the {base} is near zero, so no % change",
         "zero": "the {base} is near zero, so no % change",
+        "at_zero": "the trend fell to about 0, so no % change",
         "intermittent": "intermittent demand, not computed",
         "short_span": "less than a year of data, not annualised",
         "all_zero": "every observation is 0, so no % change",
@@ -977,39 +988,20 @@ def _pct_why(code: Optional[str], key: str, lang: str = "ko") -> str:
 def _metric_undefined(report: TrendReport, d: "_ChartData", key: str) -> Optional[str]:
     """Why the growth metric ``key`` (``total_change_pct``, ``cagr_pct``, ``recent_change_pct``) is ``None``.
 
-    ``'intermittent'`` for mostly-zero demand (the analysis computes no growth
-    rates for it); ``'short_span'`` for a CAGR over less than a year (the analysis
-    annualises only spans of at least 0.95 years: ``(n - 1) / periods_per_year``);
-    else :func:`analysis.pct_change_undefined` of the trend from the metric's base
-    to the latest trend value (``'sign_change'``, ``'negative'``, ``'near_zero'``,
-    ``'zero'``) -- the rule of the metrics themselves and of the narrative.
-    ``None`` when the metric is a number or no reason applies, so a ``—`` is
-    explained wherever the analysis' own rule can say why.
+    :func:`narrative.metric_pct_undefined` -- the one rule of the JSON export and the LLM
+    payload as well (``'all_zero'``, ``'intermittent'``, ``'short_span'`` for a CAGR over
+    less than a year, else :func:`analysis.pct_change_undefined` of the trend from the
+    metric's base to its end: ``'sign_change'``, ``'negative'``, ``'near_zero'``, ``'zero'``,
+    ``'at_zero'``).  ``None`` when the metric is a number or no reason applies (and for a
+    hand-made report the rule cannot read), so a ``—`` is explained wherever the analysis'
+    own rule can say why.  ``d`` is unused (kept for the callers' signature).
     """
     if _finite(getattr(report.analysis.metrics, key, None)) is not None:
         return None
-    if _all_zero(report):
-        return "all_zero"
-    if _intermittent(report):
-        return "intermittent"
-    if key == "cagr_pct":
-        try:
-            years = (len(d.hist_y) - 1) / _periods_per_year(d.freq)
-        except (ValueError, KeyError, ZeroDivisionError):
-            years = None
-        if years is not None and years < _CAGR_MIN_YEARS:
-            return "short_span"
-    tr = d.trend_y[np.isfinite(d.trend_y)]
-    if tr.size < 2:
+    try:
+        return _metric_pct_undefined(report.analysis).get(key)
+    except Exception:  # noqa: BLE001 - hand-made / partial analyses
         return None
-    if key == "recent_change_pct":
-        lag = _recent_lag(report, len(d.hist_y))
-        if tr.size <= lag:
-            return None
-        base = float(tr[-1 - lag])
-    else:
-        base = float(tr[0])
-    return _pct_change_undefined(base, float(tr[-1]), d.hist_y)
 
 
 def _nonnegative(report: TrendReport) -> bool:
@@ -2374,7 +2366,7 @@ def render_text(report: TrendReport, width: int = 78, lang: str = "ko") -> str:
 
     # momentum (%p) and volatility (a CV) of a level near 0, a negative level, a demand rate or
     # an all-zero history mean nothing (narrative.rate_pct_undefined): "—" with the reason below
-    rate_why, vol_why = _rate_undefined(report), _vol_undefined(report)
+    rate_why, vol_why = _mom_undefined(report), _vol_undefined(report)
     vol = None if vol_why else _finite(m.volatility)
     mom = None if rate_why else _finite(m.momentum)
     metrics = [
@@ -2400,7 +2392,9 @@ def render_text(report: TrendReport, width: int = 78, lang: str = "ko") -> str:
         if text:
             why.setdefault(text, []).append(label)
     for text, labels in why.items():
-        lines += _wrap_segments([f"※ {tx['why_sep'].join(labels)}: {text}"], width)
+        # a reason longer than the line is wrapped at spaces, not cut ("…relative to the sprea…")
+        lines += _wrap_segments(f"※ {tx['why_sep'].join(labels)}: {text}".split(" "), width, sep=" ",
+                                cont="  ")
     lines.append(light)
 
     # sparkline: history │ forecast on a shared scale
@@ -2584,6 +2578,7 @@ h1{font-size:clamp(24px,3.6vw,34px);line-height:1.25;margin:0 0 14px;font-weight
 .meta{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .chip{display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:999px;background:var(--surface);
 border:1px solid var(--border);font-size:13px;color:var(--ink-2);white-space:nowrap}
+.chip.synth{background:var(--neg-soft);border-color:var(--neg);color:var(--ink);font-weight:600;white-space:normal}
 .badge{display:inline-flex;align-items:center;gap:7px;padding:4px 12px;border-radius:999px;font-size:13px;font-weight:600;
 color:var(--ink);white-space:nowrap}
 .badge .dot{width:8px;height:8px;border-radius:50%;flex:none}
@@ -2878,6 +2873,8 @@ def _header_html(report: TrendReport, d: _ChartData) -> str:
         f'<span class="chip">{_esc(UNIT_KO.get(freq, FREQ_KO.get(freq, freq)))} 단위 · 관측 {len(d.hist_y):,}개</span>',
         f'<span class="chip">예측 {int(report.forecast.horizon):,}{_esc(PERIOD_KO.get(freq, "기간"))}</span>',
     ]
+    if _synthetic(report):   # a built-in sample: realistic dates must not pass for real data
+        chips.insert(0, f'<span class="chip synth" title="{_esc(_SYNTH_TIP)}">{_esc(_SYNTH_LABEL)}</span>')
     return (
         '<header class="hero">'
         '<div class="eyebrow"><span class="logo" aria-hidden="true"></span>TrendAI 트렌드 리포트 · 과거 → 현재 → 미래</div>'
@@ -2887,6 +2884,19 @@ def _header_html(report: TrendReport, d: _ChartData) -> str:
         f'{_esc(src)}</p>'
         "</header>"
     )
+
+
+#: the label of a built-in synthetic sample on the HTML pages (narrative.is_synthetic)
+_SYNTH_LABEL = "합성(가상) 샘플 데이터"
+_SYNTH_TIP = "trendai에 내장된 합성 샘플로, 실제 데이터가 아닙니다."
+
+
+def _synthetic(report: TrendReport) -> bool:
+    """:func:`narrative.is_synthetic` (``False`` for a hand-made / partial report)."""
+    try:
+        return bool(_narrative_is_synthetic(report.analysis))
+    except Exception:  # noqa: BLE001 - hand-made / partial analyses
+        return False
 
 
 def _kpis_html(report: TrendReport, d: _ChartData) -> str:
@@ -3120,7 +3130,7 @@ def _diagnosis_card(report: TrendReport, d: _ChartData) -> str:
         desc = ("수명주기 단계와 주요 지표 · 판단 근거는 ‘AI 트렌드 해석’의 현재 항목에 있습니다" if not shown
                 else "수명주기 단계와 판단 근거 · 나머지 근거는 ‘AI 트렌드 해석’에 있습니다")
     # momentum (%p) and the volatility (a CV) where a % of the level means nothing: "—" and the reason
-    rate_why, vol_why = _rate_undefined(report), _vol_undefined(report)
+    rate_why, vol_why = _mom_undefined(report), _vol_undefined(report)
     vol = None if vol_why else _finite(m.volatility)
     mom = _DASH if rate_why else _fmt_num(m.momentum, 2, signed=True)
     peak_html = _esc(f"{_fmt_short(m.peak_value)} ({_fmt_date(m.peak_date, freq)})")
@@ -3215,6 +3225,7 @@ def _models_card(report: TrendReport) -> str:
         no_bench = ('<span class="muted" title="단순 기준 예측이 비교 후보에 없어 모델별로는 비교하지 않았습니다">'
                     f"{_DASH}</span>")
         rows = []
+        shown: list[float] = []   # the 'single vs naive' ratios in row (MASE) order
         for i, s in enumerate(scores, 1):
             w = _finite(s.weight) or 0.0
             desc = _model_desc(s.name)
@@ -3226,8 +3237,10 @@ def _models_card(report: TrendReport) -> str:
                 rel_html = _DASH
             elif str(s.name) == naive_name:
                 rel_html = '<span class="muted">기준</span>'
+                shown.append(1.0)
             elif naive_err > 0:
                 ratio = err / naive_err
+                shown.append(ratio)
                 rel_cls = _rel_error_class(ratio)
                 rel_txt = _esc(_rel_error_text(ratio))
                 rel_html = f'<span class="{rel_cls}">{rel_txt}</span>' if rel_cls else rel_txt
@@ -3250,6 +3263,11 @@ def _models_card(report: TrendReport) -> str:
                  f'<th class="num"><abbr title="{_esc(rel_tip)}">단순 대비</abbr></th>'
                  '<th class="num hide-sm">sMAPE</th><th><span class="hide-sm">앙상블 </span>가중치</th></tr></thead>'
                  f'<tbody>{"".join(rows)}</tbody></table></div>')
+        if any(b_ < a_ - 0.005 for a_, b_ in zip(shown, shown[1:])):
+            # the rows follow the recency-weighted MASE, the column the plain error over all windows: say
+            # why a lower row can show a smaller error (ses "+40%" above drift "+30%")
+            table += (f'<p class="desc" style="margin:8px 0 0">순위는 최근 구간에 가중을 둔 MASE 기준이고, '
+                      f"‘단순 대비’는 백테스트 전체 구간의 {_esc(metric_ko)} 기준이라 두 순서가 다를 수 있습니다.</p>")
         if naive_name is None:
             # no benchmark rows (intermittent demand offers level models only; explicit candidates):
             # say why the column is empty instead of leaving a bare "—"
@@ -3398,6 +3416,11 @@ def render_html(report: TrendReport, path: Optional[PathLike] = None) -> str:
 # --------------------------------------------------------------------------- compare page
 
 
+def _why_dash(reason: str) -> str:
+    """A ``—`` table cell with its reason as a tooltip and a small note under it."""
+    return f'<span title="{_esc(reason)}">{_DASH}</span><span class="dl">{_esc(reason)}</span>'
+
+
 def _cell(row: Any, key: str) -> Any:
     try:
         v = row[key]
@@ -3535,6 +3558,11 @@ def render_compare_html(reports: list[TrendReport], ranking: pd.DataFrame,
         r_freq = str(getattr(getattr(by_name.get(nm), "analysis", None), "freq", ""))
         mom_unit = f"%p{_PER_UNIT.get(r_freq, '')}" if mom_txt != _DASH else ""
         rc = _cell(row, "recent_change_pct")
+        # a "—" is never left unexplained (as on the report page): the reason as a tooltip and a note
+        r_row = by_name.get(nm)
+        mom_why = (_rate_why(r_row, _mom_undefined(r_row)) if r_row is not None and mom is None else "")
+        rc_why = (_pct_why(_metric_undefined(r_row, None, "recent_change_pct"), "recent_change_pct")  # type: ignore[arg-type]
+                  if r_row is not None and rc is None else "")
         ec = _cell(row, "expected_change_pct")
         pi = _cell(row, "prob_increase")
         sw = min(100.0, max(0.0, score)) if score is not None else 0.0
@@ -3546,9 +3574,10 @@ def render_compare_html(reports: list[TrendReport], ranking: pd.DataFrame,
         rows_html.append(
             f'<tr><td class="num" style="text-align:left"><strong>{pos}</strong></td>'
             f'<td><span class="sname">{_link(_esc(nm), links.get(nm))}</span></td><td class="hide-sm">{badge}</td>'
-            f'<td class="num hide-sm">{_signed_html(mom, mom_txt)}'
+            f'<td class="num hide-sm">{_why_dash(mom_why) if mom_why else _signed_html(mom, mom_txt)}'
             f'{f"<span class=unit>{_esc(mom_unit)}</span>" if mom_unit else ""}</td>'
-            f'<td class="num hide-sm">{_signed_html(rc, _fmt_pct(rc))}{"" if rc_shared else hz(rc_sp)}</td>'
+            f'<td class="num hide-sm">{_why_dash(rc_why) if rc_why else _signed_html(rc, _fmt_pct(rc))}'
+            f'{"" if rc_shared else hz(rc_sp)}</td>'
             f'<td class="num">{ec_html}{"" if fc_shared else hz(fc_sp)}{ec_note}</td>'
             f'<td class="num hide-sm">{_esc(_fmt_prob(pi))}</td>'
             f'<td class="score-cell"><div class="wbar" title="{_esc(_SCORE_TIP)}"><div class="track"><div class="fill" style="width:{sw:.1f}%"></div>'
@@ -3615,12 +3644,17 @@ def render_compare_html(reports: list[TrendReport], ranking: pd.DataFrame,
     if links:
         rank_desc += " 이름을 누르면 시리즈별 상세 리포트가 열립니다."
     from . import __version__
+    # built-in synthetic samples among the series (compare --samples): named in the header
+    synth_names = [str(r.name) for r in ordered if _synthetic(r)]
     body = "\n".join([
         '<header class="hero"><div class="eyebrow"><span class="logo" aria-hidden="true"></span>'
         'TrendAI 비교 리포트 · 어떤 트렌드가 뜨고 있나</div>'
         f"<h1>트렌드 비교 · {n}개 시리즈</h1>"
         '<div class="meta"><span class="chip">상승 점수 0–100 (50 = 중립)</span>'
-        '<span class="chip">전망(예측 변화 · 상승 확률) + 최근 기세(최근 변화 · 모멘텀)</span></div>'
+        '<span class="chip">전망(예측 변화 · 상승 확률) + 최근 기세(최근 변화 · 모멘텀)</span>'
+        + (f'<span class="chip synth" title="{_esc(_SYNTH_TIP)}">{_esc(_SYNTH_LABEL)}: '
+           f'{_esc(", ".join(synth_names))}</span>' if synth_names else "")
+        + '</div>'
         f'<p class="gen">TrendAI {_esc(__version__)} 버전으로 생성</p></header>',
         f'<section class="card"><h2>상승 순위</h2><p class="desc">{_esc(rank_desc)}</p>{table}</section>',
         '<section><h2 style="font-size:17px;margin:4px 0 12px">시리즈별 요약</h2>'

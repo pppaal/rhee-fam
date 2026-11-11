@@ -323,12 +323,6 @@ def _seasonal_indices(trend: np.ndarray, seg: np.ndarray, ph: np.ndarray, m: int
     return _phase_means(seg - trend, ph, m)
 
 
-def _classical_seasonal(y: np.ndarray, m: int, multiplicative: bool) -> np.ndarray:
-    """Seasonal indices (length ``m``, by phase ``t % m``) from classical decomposition."""
-    trend, seg, ph = _centred_ma(y, m)
-    return _seasonal_indices(trend, seg, ph, m, multiplicative)
-
-
 def _paulson_z(F: float, df1: float, df2: float) -> float:
     """Normal approximation (Paulson 1942) of the upper tail of an F(df1, df2) statistic.
 

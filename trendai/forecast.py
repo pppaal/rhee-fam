@@ -46,7 +46,8 @@ import pandas as pd
 
 from . import models as _models
 from .analysis import _is_intermittent as _analysis_is_intermittent
-from .analysis import _is_multiplicative, _pct_reference, pct_change_undefined
+from .analysis import (_AT_ZERO_SHARE, _ZERO_SLIVER, _clip_outliers, _is_multiplicative, _one_off_spikes,
+                       _pct_reference, pct_change_undefined)
 from .data import default_horizon, future_index, prepare
 from .data import season_length as _freq_season_length
 from .types import AnalysisResult, ForecastResult, ModelScore, Outlook
@@ -481,8 +482,11 @@ def _clean_spikes(y: np.ndarray, m: int) -> tuple[np.ndarray, int]:
     ``m > 1``, the per-phase median of the remainder -- which needs at least
     three seasons (a median of two values is their mean, so a spike or a
     late level shift would leak into the seasonal pattern); with ``m > 1``
-    and fewer than three seasons nothing is replaced, because a genuine
-    seasonal peak cannot be told from a spike there.  Strictly positive
+    and two to three seasons the per-phase rule cannot tell a genuine seasonal
+    peak from a spike, so only spikes that do not recur at the same phase of
+    another season at a comparable size are replaced
+    (:func:`analysis._one_off_spikes`; never the last observation), and with
+    fewer than two seasons nothing is.  Strictly positive
     series are examined in log space (spikes and seasonality are
     multiplicative there).  A point is a spike when its robust residual
     ``|z| >= 5`` (MAD scale) and it lies in a burst of at most two
@@ -496,8 +500,19 @@ def _clean_spikes(y: np.ndarray, m: int) -> tuple[np.ndarray, int]:
     """
     y = np.asarray(y, dtype=float)
     n = len(y)
-    if n < 12 or (m > 1 and n < 3 * m):
+    if n < 12 or (m > 1 and n < 2 * m):
         return y, 0
+    if m > 1 and n < 3 * m:
+        # two seasons: a per-phase median is the mean of two values, so the rule below cannot tell a
+        # seasonal peak from a spike -- the analysis' rule can: a peak that does not come back at the same
+        # phase of the other season, at a comparable size, is one-off (analysis._one_off_spikes; one
+        # promotion week in 104 widened the 80 % band 3.5x).  The last observation is never replaced.
+        out = np.array(_one_off_spikes(y, m), dtype=float)   # a copy (the input may be read-only)
+        out[-1] = y[-1]
+        k = int(np.sum(out != y))
+        if k == 0 or k > max(2, int(_SPIKE_MAX_SHARE * n)):
+            return y, 0
+        return out, k
     log = bool(np.all(y > 0))
     x = np.log(y) if log else y
     w = max(5, m + 1 if m % 2 == 0 else m + 2) if m > 1 else 5
@@ -1020,12 +1035,18 @@ def _level_adjust(errors: np.ndarray, y: np.ndarray, origins: Sequence[int], m: 
 
 
 def _bands(mean: np.ndarray, sigma: np.ndarray, levels: Sequence[int], nonnegative: bool,
-           index: pd.DatetimeIndex, dof: float = math.inf
+           index: pd.DatetimeIndex, dof: float = math.inf, zero_tol: float = 0.0
            ) -> tuple[pd.Series, dict[int, pd.Series], dict[int, pd.Series]]:
-    """Bands ``mean ± q·σ`` (Student-t ``q`` on ``dof``), clipped at 0 if ``nonnegative``."""
+    """Bands ``mean ± q·σ`` (Student-t ``q`` on ``dof``), clipped at 0 if ``nonnegative``.
+
+    For a ``nonnegative`` forecast, means and bounds below ``zero_tol`` (a millionth of the
+    history's typical level, :func:`_zero_tol`) are exactly 0: what a model decays or a combination
+    rounds to 3.81e-16 is no demand ("향후 12개월 평균 수요량은 3.81×10⁻¹⁶").
+    """
     mean = np.asarray(mean, dtype=float)
     if nonnegative:
         mean = np.maximum(mean, 0.0)
+        mean = np.where(mean < zero_tol, 0.0, mean)
     lower: dict[int, pd.Series] = {}
     upper: dict[int, pd.Series] = {}
     for lv in levels:
@@ -1035,9 +1056,21 @@ def _bands(mean: np.ndarray, sigma: np.ndarray, levels: Sequence[int], nonnegati
         if nonnegative:
             lo = np.maximum(lo, 0.0)
             hi = np.maximum(hi, 0.0)
+            lo = np.where(lo < zero_tol, 0.0, lo)
+            hi = np.where(hi < zero_tol, 0.0, hi)
         lower[lv] = pd.Series(lo, index=index, name=f"lo{lv}")
         upper[lv] = pd.Series(hi, index=index, name=f"hi{lv}")
     return pd.Series(mean, index=index, name="mean"), lower, upper
+
+
+def _zero_tol(y: np.ndarray, nonnegative: bool) -> float:
+    """Forecast values of a ``nonnegative`` forecast below this are 0 (:func:`_bands`): a millionth
+    of the history's typical level (the % rule's spike-robust reference) -- the analysis' tolerance
+    for a trend at a zero observation (``analysis._ZERO_SLIVER``)."""
+    if not nonnegative:
+        return 0.0
+    ref = _pct_reference(np.asarray(y, dtype=float))[0]
+    return _ZERO_SLIVER * ref if math.isfinite(ref) else 0.0
 
 
 # --------------------------------------------------------------------------- argument checks
@@ -1177,7 +1210,10 @@ def is_random_walk(analysis: AnalysisResult) -> bool:
         c = _unit(np.asarray(analysis.series.to_numpy(dtype=float)))
         T = np.asarray(pd.Series(dec.trend).to_numpy(dtype=float)) / c
         R = np.asarray(pd.Series(dec.resid).to_numpy(dtype=float)) / c
-        z = T + R
+        # the deseasonalised series exactly as compute_metrics takes it (y - seasonal, no rounding
+        # noise of trend + resid), so its noise-model cache is reused
+        z = (np.asarray(analysis.series.to_numpy(dtype=float)) / c
+             - np.asarray(pd.Series(dec.seasonal).to_numpy(dtype=float)) / c)
         if len(z) < 12 or len(T) != len(R) or not np.all(np.isfinite(z)):
             return False
         phi = float(_noise_model(z, int(dec.period), R)[0])
@@ -1331,7 +1367,8 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
         mean, sigma, _, method = _fallback_forecast(y, m, H, reason)
         if no_scale:
             sigma = np.zeros_like(sigma)
-        mean_s, lower, upper = _bands(mean, sigma, lvls, nonnegative, index)
+        mean_s, lower, upper = _bands(mean, sigma, lvls, nonnegative, index,
+                                      zero_tol=_zero_tol(y_full, nonnegative))
         return ForecastResult(mean=mean_s, lower=lower, upper=upper, horizon=H, levels=lvls,
                               model_scores=[], method=method, backtest_mase=None,
                               nonnegative=nonnegative, skill=None)
@@ -1493,7 +1530,8 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
     sigma = np.maximum.accumulate(sigma)
     if no_scale:
         sigma = np.zeros_like(sigma)
-    mean_s, lower, upper = _bands(mean, sigma, lvls, nonnegative, index, dof)
+    mean_s, lower, upper = _bands(mean, sigma, lvls, nonnegative, index, dof,
+                                  zero_tol=_zero_tol(y_full, nonnegative))
 
     # reported best (lowest MASE) first, whatever metric selected the models
     model_scores = [
@@ -1797,8 +1835,15 @@ def _pct_undefined(y: np.ndarray, current: float, future: float, k_cur: int,
         return why
     if len(y) and bool(np.all(y >= 0)) and np.mean(y[-k_cur:] == 0) >= 0.5:
         return "mostly_zero"
+    # a mean at most 0.05 % of the current level is at the floor as well (analysis._AT_ZERO_SHARE: its
+    # change prints as "−100.0%" -- forecast means of 1.08e-4 against 61.5 read "−100.0% 변화(하락)")
     if (nonnegative and current > 0.0 and fut_window is not None and len(fut_window)
-            and float(np.mean(np.asarray(fut_window, dtype=float) <= 0.0)) >= _FLOOR_SHARE):
+            and float(np.mean(np.asarray(fut_window, dtype=float) <= _AT_ZERO_SHARE * current))
+            >= _FLOOR_SHARE):
+        return "floor"
+    if why == "at_zero":
+        # the analysis' name for a level of a non-negative series that fell to 0: for a forecast
+        # level that is the 0 floor ('floor' and its wording on every surface)
         return "floor"
     if why in ("negative", "near_zero") and current < 0.0 < future:
         return "sign_change"
@@ -1849,6 +1894,32 @@ class OutlookLevels(NamedTuple):
     scale: float = 0.0       # typical absolute level of the history (the reference of the % rule,
                              # analysis._pct_reference): what a move of a level at or near 0 is
                              # measured against where no % applies (narrative.direction_label)
+    spike_adj: bool = False  # the current window held one-off upward spikes (analysis anomalies that the
+                             # models were fitted without): they count at their corrected values
+
+
+def _current_spikes(analysis: AnalysisResult, n: int, k_cur: int) -> dict[int, float]:
+    """``{position: value the models saw}`` of the one-off upward spikes inside the current window:
+    flagged by the analysis (``analysis.anomalies`` with ``zscore > 0`` -- not the first or last
+    observation, from 16 observations on, the rule by which ``compute_metrics`` leaves them out of
+    the peak) *and* pre-corrected for the forecast (:func:`_clean_spikes` on :func:`fit_history`),
+    so the current level is compared like with like.  Never for intermittent demand (whose
+    "anomalies" are large orders)."""
+    y = np.asarray(analysis.series, dtype=float)
+    m = max(1, int(analysis.season_length))
+    if n < 16 or _analysis_is_intermittent(y, m):
+        return {}
+    flagged = {int(an.index) for an in (getattr(analysis, "anomalies", None) or [])
+               if float(an.zscore) > 0 and n - k_cur <= int(an.index) < n - 1 and int(an.index) > 0}
+    if not flagged:
+        return {}
+    y_fit = fit_history(y, m)
+    cleaned, k = _clean_spikes(y_fit, m)
+    if not k:
+        return {}
+    off = n - len(y_fit)                 # fit_history keeps the last observations
+    return {i: float(cleaned[i - off]) for i in sorted(flagged)
+            if i >= off and cleaned[i - off] != y_fit[i - off]}
 
 
 def _levels(analysis: AnalysisResult, forecast: ForecastResult
@@ -1865,6 +1936,17 @@ def _levels(analysis: AnalysisResult, forecast: ForecastResult
         raise ValueError("analysis series and forecast must be non-empty")
     k_cur, k_fut = min(m, n), min(m, H)
     current = float(np.mean(y[-k_cur:]))
+    # like with like: the models are fitted with one-off spikes pre-corrected, so a promotion week the
+    # analysis flagged as a one-off upward spike inside the current window, and the forecast corrected,
+    # counts at the corrected value; with it, the same forecast read "+0.8 %, 보합" instead of "+3.5 %, 상승"
+    spike_adj = False
+    spikes = _current_spikes(analysis, n, k_cur) if bool(finite.all()) else {}
+    if spikes:
+        yc = y.copy()
+        for i, v in spikes.items():
+            yc[i] = v
+        current = float(np.mean(yc[-k_cur:]))
+        spike_adj = True
     future = float(np.mean(fm[-k_fut:]))
     seas, p = _seasonal_component(analysis)
     # the analysis' seasonal pattern carried forward, scaled by how much of it the
@@ -1890,7 +1972,7 @@ def _levels(analysis: AnalysisResult, forecast: ForecastResult
                            adj_fut=adj_fut,
                            undefined=_pct_undefined(y, current, future, k_cur, fm[-k_fut:],
                                                     bool(getattr(forecast, "nonnegative", False))),
-                           scale=_pct_reference(y)[0])
+                           scale=_pct_reference(y)[0], spike_adj=spike_adj)
     return levels, seas_fut
 
 
@@ -1911,6 +1993,145 @@ def outlook_levels(analysis: AnalysisResult, forecast: ForecastResult) -> Outloo
 #: A random-walk forecast whose change only comes from the last value sitting below the
 #: recent mean is 'flat', not 'down'
 _DIRECTION_Z = 0.4307
+#: the same odds for intermittent demand, whose probability is not a normal one (see
+#: _intermittent_prob_increase): 'up' / 'down' need P(rise) above 2/3 / below 1/3
+_DIRECTION_ODDS = 2.0 / 3.0
+
+#: probability of a rise of intermittent demand (_intermittent_prob_increase): pseudo-counts of the
+#: Jeffreys prior on the occurrence probability, the smallest concentration of its Beta distribution
+#: (no U-shaped Beta(0.5, 0.5) that puts the rate at "never or always") and the number of grid
+#: cells for demand sizes that are not small integers
+_INT_PRIOR = 0.5
+_INT_KAPPA_MIN = 1.0
+_INT_SIZE_GRID = 512
+
+
+def _size_pmf(sizes: np.ndarray) -> tuple[np.ndarray, float]:
+    """``(pmf, step)``: the empirical distribution of the demand sizes on a grid of ``step``.
+
+    Integer sizes up to :data:`_INT_SIZE_GRID` keep their exact values (``step = 1``); other sizes
+    are spread over :data:`_INT_SIZE_GRID` cells up to the largest one, each size split between its
+    two neighbouring cells so that the mean is kept.
+    """
+    s = np.asarray(sizes, dtype=float)
+    top = float(np.max(s))
+    if bool(np.all(s == np.round(s))) and top <= _INT_SIZE_GRID:
+        pmf = np.bincount(np.round(s).astype(np.int64), minlength=int(top) + 1).astype(float)
+        return pmf / pmf.sum(), 1.0
+    step = top / _INT_SIZE_GRID
+    x = s / step
+    lo = np.minimum(np.floor(x).astype(np.int64), _INT_SIZE_GRID)
+    w = x - lo
+    pmf = np.zeros(_INT_SIZE_GRID + 2)
+    np.add.at(pmf, lo, 1.0 - w)
+    np.add.at(pmf, lo + 1, w)
+    pmf = np.trim_zeros(pmf, "b")
+    return pmf / pmf.sum(), step
+
+
+def _beta_binomial_pmf(k: int, a: float, b: float) -> np.ndarray:
+    """P(N = j), j = 0..k, for N ~ Beta-binomial(k, a, b) (from log-gamma functions)."""
+    j = np.arange(k + 1)
+    lg = np.vectorize(math.lgamma, otypes=[float])
+    logw = (math.lgamma(k + 1) - lg(j + 1.0) - lg(k - j + 1.0)
+            + lg(j + a) + lg(k - j + b) - math.lgamma(k + a + b)
+            - (math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)))
+    w = np.exp(logw - float(np.max(logw)))
+    return w / w.sum()
+
+
+def _intermittent_prob_increase(y: np.ndarray, current: float, future: float, k: int) -> Optional[float]:
+    """P(future level > current level) for intermittent demand (``None``: no demand to model).
+
+    The future level is the mean of ``k`` periods of demand, each 0 or one demand whose
+    size is drawn from the history's non-zero values -- a compound Bernoulli process --,
+    not a normal variable: with a single period's band (an order of 3 or nothing) the
+    normal approximation read a stopped product (forecast rate 0.005 a week against
+    0.15) as "about 46 %" and gave almost every intermittent series 40-60 %.
+
+    * demand sizes are the history's non-zero values with outliers clipped
+      (:func:`analysis._clip_outliers`: at ten times their 90 % quantile), so one bulk
+      order of 2,000 among sizes of 1-3 does not set the mean size (it read a forecast
+      of +1,133 % as "13 %, 하락 쪽이 우세");
+    * the occurrence probability is centred on the forecast's rate, ``p̂ = rate / mean
+      size``, where the rate is the forecast's future level capped at the largest
+      ``k``-period mean of the (clipped) history -- a forecast beyond any window seen is
+      extrapolation, not information (two closing orders of 50 and 80 forecast 60.9 a week
+      against a history whose best half-year averaged 5) -- and at most the largest share
+      of demand periods in any ``k``-period window (sizes are never scaled up to reach a
+      rate);
+    * its uncertainty is a Beta distribution with the variance ``p̂²·cv² + p̂(1 − p̂)/W``:
+      ``cv²`` is the relative variance of the demand rate over time (the variance of the
+      history's rolling ``k``-period means beyond what demand noise gives them; 0 for a
+      stable rate) and ``W = max(k, n / 4)`` the effective number of periods behind the
+      rate (``n``: the history length); its concentration is at most the number of
+      non-zero periods (the information behind the rate: 13 orders in 26 weeks cannot pin
+      it to ±2 %, which read ">99 %" for a stationary series whose true chance was 61 %);
+      plus the Jeffreys prior's half counts, so a forecast of 0 still allows a restart;
+    * ``P = Σ_j P(N = j) · P(S_j > k · current)``, ``N`` the number of demands
+      (Beta-binomial) and ``S_j`` the sum of ``j`` sizes (the size distribution's
+      ``j``-fold convolution, through one FFT); a tie (the same total demand) is no
+      rise.  A current level at or above the largest size seen keeps the chance of a
+      record (``P(N = k) / (n_sizes + 1)``) instead of 0.
+
+    On simulated intermittent processes (stopping, starting, stable, lumpy, drifting; W/M/D;
+    two independent sets of 383 and 374 series, 200 futures each) the Brier score is 0.229 /
+    0.215 against 0.238 / 0.234 for the normal approximation (~0.5 almost everywhere) and
+    climatology's 0.245 / 0.237; on 18 stationary series with a known process the mean squared
+    error against the true probability is 0.044 (normal approximation and the uncapped model:
+    0.067).  Deterministic (no sampling).
+    """
+    y = np.asarray(y, dtype=float)
+    y = y[np.isfinite(y)]
+    n = len(y)
+    if n == 0 or not bool(np.any(y > 0.0)) or k < 1 or not (math.isfinite(current) and math.isfinite(future)):
+        return None
+    sizes = _clip_outliers(y[y > 0.0])
+    top = float(np.max(sizes))
+    yc = np.where(y > 0.0, np.minimum(y, top), 0.0)      # the history with the same clipped sizes
+    mu = float(np.mean(sizes))
+    m2 = float(np.mean(sizes * sizes))
+    # relative variance of the demand rate over time, beyond the demand noise of a k-period mean
+    kw = max(1, min(k, n // 2))
+    cs = np.concatenate([[0.0], np.cumsum(yc)])
+    roll = (cs[kw:] - cs[:-kw]) / kw
+    mr = float(np.mean(yc))
+    v_noise = (mr / mu * m2 - mr * mr) / kw
+    cv2 = max(float(np.var(roll)) - v_noise, 0.0) / (mr * mr) if mr > 0 else 0.0
+    rate = min(max(0.0, future), float(np.max(roll)))
+    # ... and demand no more often than in the busiest window seen (a forecast lifted by one bulk
+    # order is not more frequent demand: it read "demand every month, >99 %")
+    occ = np.concatenate([[0.0], np.cumsum(y > 0.0)])
+    p = min(1.0, rate / mu, float(np.max((occ[kw:] - occ[:-kw]) / kw)))
+    w_eff = max(float(k), n / 4.0)
+    den = p * cv2 + (1.0 - p) / w_eff
+    kappa = (1.0 - p) / den - 1.0 if den > 0 else w_eff - 1.0
+    kappa = max(min(kappa, float(len(sizes))), _INT_KAPPA_MIN)
+    weights = _beta_binomial_pmf(k, p * kappa + _INT_PRIOR, (1.0 - p) * kappa + _INT_PRIOR)
+    pmf, step = _size_pmf(sizes)
+    # the window sum's distribution: sum_j P(N = j) pmf^(*j), i.e. the generating function of N at
+    # the size distribution's Fourier transform (Horner), then one inverse transform
+    size_len = len(pmf)
+    L = 1 << max(1, int(math.ceil(math.log2(k * (size_len - 1) + 1))))
+    phi = np.fft.rfft(pmf, L)
+    g = np.full_like(phi, weights[-1])
+    for wj in weights[-2::-1]:
+        g = g * phi + wj
+    total = np.fft.irfft(g, L)
+    cells = np.arange(L)
+    # strictly above k * current (a tie -- the same total demand -- is no rise)
+    above = cells * step > k * current * (1.0 + 1e-9) + 1e-9 * step
+    prob = float(np.clip(total[above], 0.0, None).sum())
+    if current >= top:
+        # no window of the sizes seen so far exceeds the current level (a yearly series whose latest
+        # year holds the record): a new record stays possible -- for exchangeable demands the next
+        # one exceeds all n seen with probability 1 / (n + 1) -- so a demand in every period with a
+        # record among them is the floor, not "<1 %" by construction
+        prob = max(prob, float(weights[-1]) / (len(sizes) + 1.0))
+    # FFT round-off (~1e-16) is no probability: an impossible or a certain rise is exactly 0 or 1
+    if prob < 1e-12:
+        return 0.0
+    return 1.0 if prob > 1.0 - 1e-12 else prob
 
 
 def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlook:
@@ -1922,7 +2143,11 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
     * **current level** = mean of the last ``k_cur = min(m, n)``
       observations (``m`` = ``analysis.season_length``, so one full season:
       the last 12 months, 52 weeks, 7 days, 4 quarters; the last value for
-      yearly data);
+      yearly data) -- with a one-off upward spike inside that window that the
+      analysis flagged (an anomaly with ``zscore > 0``, not the last
+      observation) and the models were fitted without (``_clean_spikes``)
+      counted at that corrected value (``OutlookLevels.spike_adj``; every
+      surface names the level ``일시적 급등을 뺀 …``);
     * **future level** = mean of the last ``k_fut = min(m, horizon)``
       forecast means, i.e. the last season *of the forecast horizon* (with
       the default horizons: the 12 months / 4 quarters / last 7 of 30 days
@@ -1972,12 +2197,27 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
       of the season-mean, so the probability is conservative (closer to 0.5).
       It is consistent in sign with ``expected_change_pct`` and is NOT the
       probability that the horizon-end value exceeds the current level.
+      **Intermittent demand** (``_is_intermittent`` on :func:`fit_history`):
+      the future level is a mean of mostly-zero periods, so the probability
+      comes from a compound-Bernoulli model of that mean instead
+      (:func:`_intermittent_prob_increase`: demand occurrence centred on the
+      forecast's rate with a Beta-distributed uncertainty, sizes from the
+      history's non-zero values, outliers clipped; the rate capped at the largest
+      window mean seen).  It is skewed, so it can lean slightly against the sign
+      of a small expected change (the median of a few demands lies below their
+      mean).  Not when the current window is all zeros (``narrative.prob_undefined``
+      ``'zero_current'``: a fall is impossible and every surface withholds the
+      probability): the normal approximation and the general direction rule apply.
     * ``direction`` is ``'flat'`` unless ``|future − current|`` exceeds
       ``max(2 % of the current level, half the 80 % half-width at h = 1,
       0.4307·σ_H)`` -- the last term is ``prob_increase`` outside
       ``[1/3, 2/3]`` (the change is 'likely', odds >= 2:1), so a change
       smaller than the horizon uncertainty (e.g. a random walk's last value
-      sitting below its recent mean) is not called a trend.
+      sitting below its recent mean) is not called a trend.  For intermittent
+      demand that probability is not a normal one: ``'up'`` / ``'down'`` need
+      ``|future − current|`` above 2 % of the current level in that direction
+      and ``prob_increase`` above 2/3 / below 1/3 (a single period's band says
+      nothing about a mean of many periods).
     * ``scenarios`` = lo80 / mean / hi80 at the horizon end (single values
       at that date).
     * ``forecast_peak_date``: date of the forecast maximum when it lies
@@ -2019,7 +2259,19 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
         scenarios = {"pessimistic": float(fm[-1]), "base": float(fm[-1]),
                      "optimistic": float(fm[-1])}
 
-    if sigma_h > 0 and math.isfinite(sigma_h):
+    # intermittent demand: the future level is a mean of mostly-zero periods, whose distribution the
+    # compound-Bernoulli model gives (the normal one with a single period's band read ~50 % everywhere)
+    y_fit = fit_history(y, m)
+    # ... except from a current window of exact zeros of a series that cannot go below 0: a fall is
+    # impossible, so the "probability of a rise" is only that of any demand at all -- every surface
+    # withholds it (narrative.prob_undefined 'zero_current'), and the direction must not rest on it
+    # (a product without demand for 16 months read "전망은 상승" from a hidden 85 %): the level rule
+    zero_current = bool(len(y)) and float(np.min(y)) >= 0.0 and bool(np.all(y[-lv_.k_cur:] == 0.0))
+    int_prob = (_intermittent_prob_increase(y_fit, current, future, lv_.k_fut)
+                if _is_intermittent(y_fit, m) and not zero_current else None)
+    if int_prob is not None:
+        prob_increase = int_prob
+    elif sigma_h > 0 and math.isfinite(sigma_h):
         prob_increase = norm_cdf(diff / sigma_h)
     else:
         prob_increase = 1.0 if diff > 0 else (0.0 if diff < 0 else 0.5)
@@ -2030,11 +2282,22 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
     noise_thr = max(0.02 * abs(current), 0.5 * half80_h1)
     sig_h = sigma_h if math.isfinite(sigma_h) else 0.0
     threshold = max(noise_thr, _DIRECTION_Z * sig_h)
-    if abs(diff) <= threshold:
+    move_thr = noise_thr
+    if int_prob is not None:
+        # a single period's band says nothing about a mean of many periods: the move must exceed
+        # 2 % of the current level and be likely (odds of 2:1, as _DIRECTION_Z gives elsewhere)
+        move_thr = 0.02 * abs(current)
+        if diff > move_thr and prob_increase > _DIRECTION_ODDS:
+            direction = "up"
+        elif diff < -move_thr and prob_increase < 1.0 - _DIRECTION_ODDS:
+            direction = "down"
+        else:
+            direction = "flat"
+    elif abs(diff) <= threshold:
         direction = "flat"
     else:
         direction = "up" if diff > 0 else "down"
-    strong = abs(diff) >= max(0.10 * abs(current), 2.0 * noise_thr)
+    strong = abs(diff) >= max(0.10 * abs(current), 2.0 * move_thr)
 
     # peak strictly inside the horizon, reached by a rise above the noise level and
     # followed by a >= 5 % fall -- of the forecast itself *and* of its seasonally

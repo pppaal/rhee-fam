@@ -116,6 +116,16 @@ def wikipedia_pageviews_url(article: str, lang: str = "ko", start: Optional[str]
             f"{s:%Y%m%d}00/{e:%Y%m%d}00")
 
 
+def _short_error(exc: BaseException) -> str:
+    """``exc`` as a short detail for a message: its class and the first 120 characters of its first line
+    (a urllib3 dump with the whole URL is no help to the user)."""
+    text = str(exc).strip()
+    text = text.splitlines()[0] if text else ""
+    if len(text) > 120:
+        text = text[:119] + "…"
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
 def fetch_wikipedia_pageviews(article: str, lang: str = "ko", start: Optional[str] = None,
                               end: Optional[str] = None, granularity: str = "monthly",
                               session: Any = None) -> pd.Series:
@@ -150,7 +160,7 @@ def fetch_wikipedia_pageviews(article: str, lang: str = "ko", start: Optional[st
     try:
         resp = session.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
     except Exception as exc:  # requests.RequestException, socket errors, timeouts, ...
-        raise ConnectorError(msg("conn_network", error=str(exc))) from exc
+        raise ConnectorError(msg("conn_network", error=_short_error(exc))) from exc
 
     status = getattr(resp, "status_code", None)
     if status == 404:

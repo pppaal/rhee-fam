@@ -2200,7 +2200,9 @@ def test_round5_public_helpers_replace_mirrors():
     for nm in ("seasonal", "peaking", "fad"):
         rep = _sample_run(nm)
         assert R._seasonal_trend_drawdown(rep, R._ChartData(rep)) == nv.seasonal_trend_drawdown(rep.analysis)
-    assert A.CAGR_MIN_YEARS == R._CAGR_MIN_YEARS == 0.95
+    # final round (R6-REV-7): the terminal / HTML reasons now come from narrative.metric_pct_undefined, which
+    # holds the short-span rule (report no longer re-implements it): the same constant there
+    assert A.CAGR_MIN_YEARS == nv.CAGR_MIN_YEARS == 0.95
 
 
 def test_scenarios_name_the_interval_they_come_from():
@@ -2270,8 +2272,13 @@ def test_flat_label_follows_the_levels_of_mostly_zero_demand():
     launch[-6:] = [3, 2, 4, 3, 5, 2]
     rep = _run(_monthly(launch), name="launch")
     lv = outlook_levels(rep.analysis, rep.forecast)
+    # a 'flat' outlook of these levels (1.58 -> 3.18 a month) is never '보합'
     assert lv.undefined == "mostly_zero" and rep.outlook.direction == "flat"
     assert nv.direction_label("flat", None, "ko", levels=lv) == "방향 불확실"
+    # final round: the intermittent probability caps the forecast's rate at the busiest window seen and
+    # its certainty at the number of demands (six months of demand cannot pin the rate): 48 % here, so the
+    # outlook is '방향 불확실' again, as this test pinned before round 6
+    assert 1 / 3 <= rep.outlook.prob_increase <= 2 / 3
     assert "**방향 불확실**" in rep.narrative and "**보합**" not in rep.narrative
     assert "전망 ▶ 방향 불확실" in render_text(rep)
     assert build_llm_payload(*_parts(rep))["outlook"]["direction_label"] == {"ko": "방향 불확실",
@@ -2566,3 +2573,253 @@ def test_recent_pace_phrase_never_contradicts_the_phase_reason():
     assert any("낮아졌습니다" in r for r in rep.analysis.phase.reasons)
     assert "최근에는 하락세가 멈췄습니다" not in rep.narrative
     assert "최근 39주 전체로는 하락세가 멈췄지만, 최근 23주 동안은 다시 낮아졌습니다" in rep.narrative
+
+
+# --------------------------------------------------------------------------- round 6: a trend that fell to 0
+
+
+def test_trend_that_fell_to_zero_reads_fell_to_zero_on_every_surface():
+    """K1: zero_tail read '추세선 기준으로 5.00에서 5.33×10⁻¹⁸까지 **−100.0%** 변했습니다', the level-shift reason
+    '(약 −100.0%)' and the slope '−5.52×10⁻¹⁹/일(평균 수준 대비 0.00%/일)'.  The narrative (ko/en), the
+    terminal, the HTML page, the payload and the JSON export now say that the level fell to 0, through the
+    one % rule (analysis.pct_change_undefined: 'at_zero')."""
+    from trendai import run
+    from trendai.pipeline import report_to_dict
+    from trendai.report import render_html, render_text
+
+    y = np.r_[np.linspace(5, 50, 100), np.zeros(450)]
+    s = pd.Series(y, index=pd.date_range("2020-01-01", periods=len(y), freq="D"))
+    noise = re.compile(r"[−-]100\.0\s?%|100\.0% 낮|×10⁻1\d")
+    for lang in ("ko", "en"):
+        rep = run(s, name="tail0", lang=lang)
+        text = render_text(rep, lang=lang)
+        for surface in (rep.narrative, text, render_html(rep)):
+            assert not noise.search(surface)
+        if lang == "ko":
+            assert "- 추세선 기준으로 5.00에서 0까지 떨어졌습니다." in rep.narrative
+            assert "- 근거: 2020-04-10에 수준이 0까지 한 번에 떨어졌습니다." in rep.narrative
+            # final round (R6-SW-9): 82 % of the values are 0, so the median slope of 0 says why it is 0
+            # (it was the bare "장기 평균 기울기는 0/일", which reads as "no change")
+            assert "장기 평균 기울기(중앙값 기반)는 관측치의 절반 이상이 0이라 0/일로 나와 값의 변화를" in rep.narrative
+            assert "- 최근 7일 동안 추세는 0 수준에 머물렀습니다." in rep.narrative
+            # final round (R6-SW-5): the same reason now also covers a trend that ended at 0.019 of 49.9
+            # (a "−100.0%" by rounding), so the terminal / HTML phrase says "0 수준" rather than "0"
+            assert "※ 전체 변화·CAGR: 추세가 0 수준까지 떨어져 변화율 없음" in text
+            assert "추세가 0 수준까지 떨어져 변화율 없음" in render_html(rep)
+        else:
+            assert "- On the trend line the level fell from 5.00 to 0." in rep.narrative
+            assert "- Evidence: On 2020-04-10 the level dropped to 0 in one step." in rep.narrative
+            assert "- Over the last 7 days the trend stayed at 0." in rep.narrative
+            assert "※ Total change, CAGR: the trend fell to about 0, so no % change" in text
+            assert not HANGUL.search(rep.narrative) and not HANGUL.search(text)
+    pay = build_llm_payload(*_parts(rep))
+    assert pay["metrics"]["pct_undefined"]["total_change_pct"] == "at_zero"
+    assert pay["metrics"]["pct_undefined"]["cagr_pct"] == "at_zero"
+    assert pay["metrics"]["pct_undefined"]["drawdown_pct"] == "at_zero"
+    assert pay["metrics"]["total_change_pct"] is None and pay["metrics"]["drawdown_pct"] is None
+    assert "'at_zero'" in pay["conventions"]["pct_undefined"] and "at_zero" in nv.SYSTEM_PROMPT
+    js = report_to_dict(rep)["metrics"]
+    assert js["pct_undefined"] == nv.metric_pct_undefined(rep.analysis)
+    assert js["pct_undefined"]["total_change_pct"] == "at_zero"
+    assert js["total_change_pct"] is None and js["drawdown_pct"] is None
+    assert rep.analysis.metrics.drawdown_pct == -100.0      # the dataclass keeps its raw number
+
+
+def test_recent_window_that_fell_to_zero_reads_fell_to_zero():
+    """K1: the recent change of a trend that reached 0 inside the window is 'at_zero' as well."""
+    from trendai import run
+
+    w = np.r_[np.full(60, 20.0) + np.sin(np.arange(60)), np.linspace(20, 0, 20), np.zeros(20)]
+    s = pd.Series(w, index=pd.date_range("2021-01-03", periods=len(w), freq="W-SUN"))
+    ko, en = run(s, name="decay"), run(s, name="decay", lang="en")
+    assert "- 최근 52주 동안 추세가 20.0에서 0까지 떨어졌습니다." in ko.narrative
+    assert "- Over the last 52 weeks the trend fell from 20.0 to 0." in en.narrative
+    assert "추세는 고점(2021-01-03, 20.3) 이후 0까지 떨어졌습니다." in ko.analysis.phase.reasons
+    assert nv.metric_pct_undefined(ko.analysis)["recent_change_pct"] == "at_zero"
+    assert not re.search(r"[−-]100\.0\s?%", ko.narrative + en.narrative)
+
+
+# --------------------------------------------------------------------------- final round: K1 surfaces
+
+
+def test_momentum_of_a_trend_at_zero_is_left_out_on_every_surface():
+    """R6-SW-7 / R6-REV-5: after '추세는 고점(2022-07, 74.2) 이후 0까지 떨어졌습니다' the momentum was still
+    printed 'relative to the current trend level' (+13.09%p/월; +133%p/분기 for a product dead for 8
+    quarters, which also lifted it to rank 2 of a comparison).  The level it is relative to is 0: '—' and
+    the reason on every surface, null in the payload and the JSON export, no weight in the score."""
+    from trendai import run
+    from trendai.compare import momentum_per_month, rank_trends
+    from trendai.pipeline import report_to_dict
+    from trendai.report import render_html, render_text
+
+    t = np.arange(60)
+    r = np.random.default_rng(81)
+    fad = np.clip(80 * np.exp(-0.5 * ((t - 20) / 6) ** 2) + r.normal(0, 1, 60), 0, None)
+    fad[-3:] = 0.0
+    s = pd.Series(fad, index=pd.date_range(end="2025-12-01", periods=60, freq="MS"))
+    for lang in ("ko", "en"):
+        rep = run(s, name="fad", lang=lang)
+        assert nv.momentum_pct_undefined(rep.analysis) == "at_zero"
+        text = render_text(rep, lang=lang)
+        if lang == "ko":
+            assert "모멘텀(최근 기울기 − 장기 기울기)은 추세가 0 수준까지 떨어져 %p로 나타내지 않았으며" in rep.narrative
+            assert "모멘텀 —" in text and "※ 모멘텀: 추세가 0 수준까지 떨어져 %로 나타내지 않음" in text
+            assert "추세가 0 수준까지 떨어져 %로 나타내지 않음" in render_html(rep)
+        else:
+            assert "is not given in pp because the trend has fallen to about 0" in rep.narrative
+            assert "Momentum —" in text
+        assert not re.search(r"[+−]\d+\.\d\d ?(?:%p|pp)", rep.narrative + text)
+    pay = build_llm_payload(*_parts(rep))
+    assert pay["metrics"]["momentum"] is None and pay["metrics"]["pct_undefined"]["momentum"] == "at_zero"
+    js = report_to_dict(rep)["metrics"]
+    assert js["momentum"] is None and js["pct_undefined"]["momentum"] == "at_zero"
+    # the dead quarterly product: no momentum in the score, below a steady series
+    dead = run(pd.Series(np.r_[np.linspace(40, 2, 20), np.zeros(8)],
+                         index=pd.date_range(end="2025-10-01", periods=28, freq="QS")), name="dead")
+    steady = run(pd.Series(50 + np.sin(np.arange(28.0)), index=pd.date_range(end="2025-10-01", periods=28,
+                                                                                freq="QS")), name="steady")
+    assert momentum_per_month(dead) == 0.0
+    table = rank_trends([dead, steady])
+    assert list(table["name"]) == ["steady", "dead"] and float(table["score"].iloc[1]) <= 50.0
+
+
+def test_a_stopped_product_ranks_below_a_declining_one():
+    """R6-REV-3: a recent change that fell to 0 ('at_zero') was 'missing' in the score -- neutral -- so a
+    product that stopped 10 months ago scored 38.4, level with the declining sample, and 4 months 12.3
+    against 2.6 before.  The score keeps the direction: the strongest fall (−100 %)."""
+    from trendai import run, sample
+    from trendai.compare import recent_change_annualised, rising_score
+
+    r = np.random.default_rng(0)
+    scores = {}
+    for k in (4, 6, 10):
+        y = np.r_[np.linspace(100, 30, 60 - k) + r.normal(0, 2, 60 - k), np.zeros(k)]
+        rep = run(pd.Series(y, index=pd.date_range(end="2025-12-01", periods=60, freq="MS")), name=f"stop{k}")
+        assert recent_change_annualised(rep) == -100.0
+        assert rep.analysis.metrics.recent_change_pct is None        # still no "−100 %" printed
+        scores[k] = rising_score(rep)
+    declining = rising_score(run(sample("declining"), name="declining"))
+    assert max(scores.values()) < declining
+    assert scores[4] < 20.0
+
+
+def test_forecast_float_noise_is_zero():
+    """R6-SW-6 / R6-REV-8: a forecast that decays to 0 printed its rounding residue: '예측 마지막 7일 평균
+    수요량은 5.92×10⁻¹⁶', '향후 12개월 평균 수요량은 3.81×10⁻¹⁶', '2030년 예측 수요량은 3.26×10⁻¹¹',
+    '최근 12개월 평균 0 → 향후 12개월 평균 3.44×10⁻¹⁴'.  Means and bounds of a non-negative forecast below a
+    millionth of the history's typical level are exactly 0."""
+    from trendai import run
+    from trendai.report import render_text
+
+    def ser(v, pf, end):
+        return pd.Series(np.asarray(v, float), index=pd.date_range(end=end, periods=len(v), freq=pf))
+
+    cases = [ser(np.r_[np.linspace(40, 10, 350), np.zeros(150)], "D", "2025-12-31"),
+             ser(np.r_[np.full(12, 10.0), np.zeros(12)], "MS", "2025-12-01")]
+    for n, pf, end in ((48, "MS", "2025-12-01"), (15, "YS", "2025-01-01")):
+        dec = 100 * 0.93 ** (np.arange(n) * 120 / n)
+        dec[dec < 0.5] = 0.0
+        cases.append(ser(dec, pf, end))
+    for s in cases:
+        for lang in ("ko", "en"):
+            rep = run(s, name="x", lang=lang)
+            fm = rep.forecast.mean.to_numpy()
+            assert np.all((fm == 0.0) | (fm > 1e-6 * np.mean(np.abs(s.to_numpy()))))
+            text = rep.narrative + render_text(rep, lang=lang)
+            assert not re.search(r"×10⁻", text), re.search(r".{40}×10⁻.{10}", text)
+
+
+# --------------------------------------------------------------------------- final round: smaller items
+
+
+def test_demand_rates_use_a_window_that_carries_information():
+    """R6-REV-6: 400 days of demand rising from 0.04 to 0.3 a day read '처음 7일 1.00 → 최근 7일 0' and
+    '최근 평균 수요량은 처음보다 낮아 꾸준한 상승으로 보기는 어렵습니다' next to a significant rise."""
+    from trendai import run
+
+    r = np.random.default_rng(2)
+    n = 400
+    p = np.linspace(0.04, 0.3, n)
+    y = ((r.random(n) < p) * (r.poisson(2, n) + 1)).astype(float)
+    y[-7:] = 0.0
+    s = pd.Series(y, index=pd.date_range(end="2025-12-31", periods=n, freq="D"))
+    rep = run(s, name="parts")
+    w, first, last = nv.demand_rates(rep.analysis)
+    assert w == 100 and last > first
+    assert "처음보다 낮아" not in rep.narrative and "처음 7일" not in rep.narrative
+
+
+def test_a_single_non_zero_value_has_no_recurrence():
+    """R6-REV-10: 48 zeros with one 3.0 read '그전에는 평균 6.0개월마다 0이 아닌 값이 있었습니다'."""
+    from trendai import run
+
+    y = np.zeros(48)
+    y[5] = 3.0
+    rep = run(pd.Series(y, index=pd.date_range("2022-01-01", periods=48, freq="MS")), name="one")
+    run_, last, gap = nv.long_zero_run(rep.analysis)
+    assert run_ == 42 and gap is None
+    assert "최근 42개월 연속" in rep.narrative and "그전에는 평균" not in rep.narrative
+    en = run(pd.Series(y, index=pd.date_range("2022-01-01", periods=48, freq="MS")), name="one", lang="en")
+    assert "came about every" not in en.narrative
+
+
+def test_zero_share_wording_says_most_only_for_most():
+    """R6-SW-9: '관측치의 38%가 0인 간헐적 수요' was followed by '대부분의 기간이 0인 간헐적 수요여서 …'."""
+    from trendai import run
+
+    n = 120
+    dec = 100 * 0.93 ** np.arange(n)
+    dec[dec < 0.5] = 0.0
+    s = pd.Series(dec, index=pd.date_range(end="2025-12-01", periods=n, freq="MS"))
+    assert 0.3 <= float(np.mean(dec == 0)) < 0.5
+    ko, en = run(s, name="decay"), run(s, name="decay", lang="en")
+    assert "대부분의 기간이 0" not in ko.narrative and "0인 기간이 많은 간헐적 수요여서" in ko.narrative
+    assert "zero most of the time" not in en.narrative and "zero in many periods" in en.narrative
+
+
+def test_phase_evidence_does_not_print_a_momentum_the_present_section_withholds():
+    """R5-REV2-5: with no phase reasons, '근거: … 모멘텀 … −0.01%p/월' was printed next to '모멘텀 … 평균
+    수준이 음수여서 %p로 나타내지 않았으며'."""
+    rep = _run(sample("growing") - 500.0, name="neg")
+    assert nv.rate_pct_undefined(rep.analysis) == "negative"
+    a = dataclasses.replace(rep.analysis, phase=dataclasses.replace(rep.analysis.phase, reasons=[]))
+    c = nv._Ctx(a, rep.forecast, rep.outlook, "ko")
+    assert not any("모멘텀" in line for line in nv._evidence(c))
+
+
+def test_metric_reasons_are_one_rule_for_terminal_and_json():
+    """R6-REV-7: the terminal / HTML said 'intermittent' (and 'short_span' for a CAGR) where the JSON export's
+    metrics.pct_undefined had no entry, or 'at_zero': report._metric_undefined re-implemented the rule."""
+    from trendai import report as R
+    from trendai import run
+    from trendai.pipeline import report_to_dict
+
+    r = np.random.default_rng(4)
+    cases = [pd.Series((r.random(80) < 0.4) * (r.poisson(3, 80) + 1.0),
+                       index=pd.date_range("2024-01-07", periods=80, freq="W-SUN")),       # intermittent
+             pd.Series(np.linspace(10, 20, 10) + np.sin(np.arange(10.0)),
+                       index=pd.date_range("2025-01-01", periods=10, freq="MS")),          # under a year
+             pd.Series(np.zeros(30), index=pd.date_range("2025-01-01", periods=30, freq="D")),  # all zero
+             sample("growing")]
+    for s in cases:
+        rep = run(s, name="x")
+        js = report_to_dict(rep)["metrics"]["pct_undefined"]
+        d = R._ChartData(rep)
+        for key in ("total_change_pct", "cagr_pct", "recent_change_pct"):
+            assert R._metric_undefined(rep, d, key) == js.get(key), (key, js)
+    js = report_to_dict(run(cases[0], name="x"))["metrics"]["pct_undefined"]
+    assert js["total_change_pct"] == "intermittent"
+    js = report_to_dict(run(cases[1], name="x"))["metrics"]["pct_undefined"]
+    assert js["cagr_pct"] == "short_span"
+
+
+def test_negative_peak_reason_states_the_gap_in_units():
+    """V2-9: '고점이 음수여서 고점 대비 하락률(%)은 의미가 없습니다' was followed by '근거: 추세 고점(2016-01)
+    대비 현재 수준이 추세 규모(최대 절댓값)의 76.1%만큼 낮습니다' -- a percentage after all."""
+    t = np.arange(120.0)
+    y = -20 - 0.4 * t + 3 * np.sin(2 * np.pi * t / 12) + np.random.default_rng(3).normal(0, 1, 120)
+    rep = _run(pd.Series(y, index=pd.date_range("2016-01-01", periods=120, freq="MS")), name="loss")
+    reasons = " ".join(rep.analysis.phase.reasons)
+    assert "추세 규모(최대 절댓값)" not in reasons and "%만큼 낮습니다" not in reasons
+    if rep.analysis.phase.label in ("declining", "peaking"):
+        assert re.search(r"추세는 고점\([^)]*\) 이후 낮아져 현재 −[\d.,]+입니다", reasons)

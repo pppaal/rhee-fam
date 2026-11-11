@@ -31,8 +31,8 @@ from typing import Any, NamedTuple, Optional
 import numpy as np
 import pandas as pd
 
-from .analysis import CHANGEPOINT_LABEL_EN, MIN_PHASE_OBS, changepoint_label, pct_change_undefined
-from .analysis import _is_intermittent, _mean_level, level_rate_undefined, phase_window
+from .analysis import CAGR_MIN_YEARS, CHANGEPOINT_LABEL_EN, MIN_PHASE_OBS, changepoint_label, pct_change_undefined
+from .analysis import _is_intermittent, _mean_level, level_rate_undefined, momentum_undefined, phase_window
 from .data import periods_per_year
 from .numfmt import number_text as _number_text
 from .numfmt import Z_SHOWN_MAX as _Z_SHOWN_MAX
@@ -46,9 +46,11 @@ __all__ = [
     "rule_based_narrative", "build_llm_payload", "llm_narrative", "generate_narrative", "ask",
     "format_number", "format_pct", "format_date", "format_prob", "period_unit", "translate_reason",
     "direction_label", "model_label", "describe_method", "MODEL_KO", "MODEL_EN",
-    "format_scenario", "scenario_value", "is_intermittent", "changepoint_label", "phase_is_tentative",
+    "format_scenario", "scenario_value", "is_intermittent", "is_synthetic", "changepoint_label", "phase_is_tentative",
     "PHASE_EN", "is_all_zero", "scenario_floor", "floor_note", "future_phase_status",
     "drawdown_undefined", "seasonal_trend_drawdown", "rate_pct_undefined", "rate_reason_clause",
+    "momentum_pct_undefined",
+    "metric_pct_undefined",
     "zero_level_reason", "zscore_text", "volatility_undefined", "prob_undefined", "prob_reason",
     "forecast_is_zero", "trailing_zero_run", "floor_change_reason", "ZeroLevelReason",
     "scenario_reference", "ScenarioRef", "demand_rates", "long_zero_run",
@@ -86,7 +88,8 @@ state no percentage change (outlook.expected_change_basis says why; for 'sign_ch
 is expected to cross zero and give both compared_levels; for 'negative' compare the two compared_levels in \
 units; for 'floor' say that the forecast falls to the floor of 0, never -100%). A null percentage metric \
 (metrics.pct_undefined \
-names why, e.g. a level that crossed zero) gets no percentage either: never derive one yourself; a null \
+names why, e.g. a level that crossed zero; for 'at_zero' say that the level fell to 0, never -100%) gets no \
+percentage either: never derive one yourself; a null \
 outlook.prob_increase (a forecast of exactly 0, or a current level of 0 that cannot fall) gets no probability \
 (outlook.prob_increase_basis says why). A scenario \
 or interval bound of 0 for a nonnegative forecast is the floor of a wide band, not a forecast of zero: write \
@@ -485,7 +488,7 @@ def _pct_reason_clause(code: Optional[str], lang: str, subject: str = "base",
     (``기준 수준이 음수여서``) or an English clause (``the base level is negative``).
 
     ``code`` is an :func:`analysis.pct_change_undefined` reason (``'zero'``,
-    ``'negative'``, ``'sign_change'``, ``'near_zero'``); ``None`` (a value left
+    ``'negative'``, ``'sign_change'``, ``'near_zero'``, ``'at_zero'``); ``None`` (a value left
     out for another reason) falls back to the sign of ``base``.  ``subject``
     names the base: ``'base'`` (기준 수준), ``'start'`` (시작 수준) or ``'peak'`` (고점).
     """
@@ -501,6 +504,9 @@ def _pct_reason_clause(code: Optional[str], lang: str, subject: str = "base",
     if code == "near_zero":
         return (f"{ko_subj}이 값의 변동 폭에 비해 0에 가까워" if lang == "ko"
                 else f"{en_subj} is close to zero relative to the spread of the values")
+    if code == "at_zero":
+        # analysis' rule: a series that cannot go below 0 fell from a positive level to 0
+        return "값이 0 수준까지 떨어져" if lang == "ko" else "the level fell to about 0"
     return f"{ko_subj}이 0에 가까워" if lang == "ko" else f"{en_subj} is close to zero"
 
 
@@ -517,20 +523,13 @@ def drawdown_undefined(analysis: AnalysisResult) -> Optional[str]:
     ``drawdown_pct`` is always a number (typed ``float``), but for a series that
     crossed zero (a P&L from 10 to -10 reads "-179 %") or whose peak is near 0
     relative to the spread of data with negative values it means nothing:
-    :func:`analysis.pct_change_undefined` from the peak to the latest value.  Also
-    ``'at_zero'`` for a non-negative series whose latest value is exactly 0 (a count at
-    its floor: "−100.0 %" says only that it is 0 now; every surface names the peak instead).
+    :func:`analysis.pct_change_undefined` from the peak to the latest value.  That
+    rule also gives ``'at_zero'`` for a non-negative series whose latest value is 0 (a
+    count at its floor: "−100.0 %" says only that it is 0 now; every surface names the
+    peak instead) -- the same reason as a trend that fell to 0 (``total_change_pct``).
     """
     m = analysis.metrics
-    peak, last = _finite(m.peak_value), _finite(m.last_value)
-    why = _pct_reason_of(analysis, peak, last)
-    if why is None and last == 0.0 and peak is not None and peak > 0.0:
-        y = np.asarray(analysis.series, dtype=float)
-        y = y[np.isfinite(y)]
-        if len(y) and float(np.min(y)) >= 0.0:
-            # a count at its 0 floor: "−100.0 %" / "고점의 1/10 이하로 급감" says only that it is 0 now
-            return "at_zero"
-    return why
+    return _pct_reason_of(analysis, _finite(m.peak_value), _finite(m.last_value))
 
 
 _drawdown_undefined = drawdown_undefined
@@ -552,6 +551,7 @@ class _OutlookWindows:
     undefined: Optional[str] = None  # why the % change is undefined: 'zero' | 'mostly_zero' | 'floor' |
                                      # 'sign_change' | 'negative' | 'near_zero' | None (defined)
     scale: Optional[float] = None    # typical absolute level of the history (OutlookLevels.scale)
+    spike_adj: bool = False          # the current level leaves out one-off spikes (OutlookLevels.spike_adj)
 
 
 def _outlook_windows(analysis: AnalysisResult, forecast: ForecastResult) -> _OutlookWindows:
@@ -579,7 +579,16 @@ def _outlook_windows(analysis: AnalysisResult, forecast: ForecastResult) -> _Out
                            period=None if lv.period is None else int(lv.period),
                            adj_fut=bool(lv.adj_fut), adj_cur=bool(lv.adj_cur),
                            current=float(lv.current), future=float(lv.future), undefined=lv.undefined,
-                           scale=_finite(getattr(lv, "scale", None)))
+                           scale=_finite(getattr(lv, "scale", None)),
+                           spike_adj=bool(getattr(lv, "spike_adj", False)))
+
+
+def is_synthetic(analysis: AnalysisResult) -> bool:
+    """The series is a built-in synthetic sample (``samples.sample``; carried by ``pipeline.run``
+    in ``analysis.series.attrs``): the HTML pages, the JSON export and the CLI label it as such."""
+    from .samples import is_synthetic_series   # lazy: samples is a leaf module, but keep imports light
+
+    return is_synthetic_series(getattr(analysis, "series", None))
 
 
 def is_intermittent(analysis: AnalysisResult) -> bool:
@@ -668,12 +677,14 @@ def trailing_zero_run(analysis: AnalysisResult) -> int:
 _ZERO_RUN_GAPS = 3.0
 
 
-def long_zero_run(analysis: AnalysisResult) -> Optional[tuple[int, int, float]]:
+def long_zero_run(analysis: AnalysisResult) -> Optional[tuple[int, int, Optional[float]]]:
     """``(run, last, gap)`` when a non-negative series ends in an unusually long run of exact zeros:
     ``run`` zeros in a row (:func:`trailing_zero_run`), at least 3 and at least 3 times ``gap``,
     the mean interval between the non-zero values before it; ``last`` is the position of the
     last non-zero value.  ``None`` otherwise (and for an all-zero history).  A product without a
-    sale for 41 weeks after a sale every 2.9 weeks is news the present section states."""
+    sale for 41 weeks after a sale every 2.9 weeks is news the present section states.  With a
+    single non-zero value there is no interval: ``gap`` is ``None`` (the run is then judged
+    against the position of that value) and no "그전에는 평균 …마다" is stated."""
     y = np.asarray(analysis.series, dtype=float)
     fin = np.flatnonzero(np.isfinite(y))
     vals = y[fin]
@@ -683,8 +694,8 @@ def long_zero_run(analysis: AnalysisResult) -> Optional[tuple[int, int, float]]:
     if len(nz) == 0:
         return None
     run = len(vals) - 1 - int(nz[-1])
-    gap = float((nz[-1] - nz[0]) / (len(nz) - 1)) if len(nz) >= 2 else float(nz[0] + 1)
-    if run < 3 or run < _ZERO_RUN_GAPS * max(gap, 1.0):
+    gap = float((nz[-1] - nz[0]) / (len(nz) - 1)) if len(nz) >= 2 else None
+    if run < 3 or run < _ZERO_RUN_GAPS * max(gap if gap is not None else float(nz[0] + 1), 1.0):
         return None
     return run, int(fin[nz[-1]]), gap
 
@@ -793,6 +804,18 @@ def _zero_share(analysis: AnalysisResult) -> float:
     return float(np.mean(y == 0)) if len(y) else 0.0
 
 
+def _zero_demand_ko(analysis: AnalysisResult) -> str:
+    """How often intermittent demand is 0, as a Korean modifier: ``대부분의 기간이 0인`` only when at
+    least half of the periods are (the intermittent rule needs only 30 %: "관측치의 38%가 0인 간헐적
+    수요" was followed by "대부분의 기간이 0인"), else ``0인 기간이 많은``."""
+    return "대부분의 기간이 0인" if _zero_share(analysis) >= 0.5 else "0인 기간이 많은"
+
+
+def _zero_demand_en(analysis: AnalysisResult) -> str:
+    """The English of :func:`_zero_demand_ko`: ``most of the time`` / ``in many periods``."""
+    return "most of the time" if _zero_share(analysis) >= 0.5 else "in many periods"
+
+
 def rate_pct_undefined(analysis: AnalysisResult) -> Optional[str]:
     """Why the rates in % of the level -- ``slope_pct`` ("평균 수준 대비 …%/월"), ``momentum``
     (%p) and ``volatility`` (a coefficient of variation) -- mean nothing (``None``: they mean
@@ -805,6 +828,18 @@ def rate_pct_undefined(analysis: AnalysisResult) -> Optional[str]:
     return level_rate_undefined(y[np.isfinite(y)], int(getattr(analysis, "season_length", 1) or 1))
 
 
+def momentum_pct_undefined(analysis: AnalysisResult) -> Optional[str]:
+    """Why ``metrics.momentum`` (%p of the *current* trend level) means nothing (``None``: it means
+    something): :func:`analysis.momentum_undefined` -- :func:`rate_pct_undefined`'s reasons plus
+    ``'at_zero'`` when the trend of a series that cannot go below 0 has fallen to (about) 0, so the
+    level it is "relative to" is gone.  Every surface leaves the momentum out (``—``) for it; the
+    ranking leaves it out of the score."""
+    y = np.asarray(analysis.series, dtype=float)
+    trend = getattr(getattr(analysis, "decomposition", None), "trend", None)
+    return momentum_undefined(y[np.isfinite(y)], int(getattr(analysis, "season_length", 1) or 1),
+                              None if trend is None else np.asarray(trend, dtype=float))
+
+
 def rate_reason_clause(analysis: AnalysisResult, code: Optional[str], lang: str = "ko") -> str:
     """Why a rate in % of the level is left out, as a Korean clause leading into the verb
     (``평균 수준이 음수여서``) or an English clause (``the mean level is negative``); ``code`` is
@@ -814,6 +849,8 @@ def rate_reason_clause(analysis: AnalysisResult, code: Optional[str], lang: str 
         return "관측값이 모두 0이라" if ko else "every observation is 0"
     if code == "intermittent":
         return "간헐적 수요여서" if ko else "demand is intermittent"
+    if code == "at_zero":   # momentum_pct_undefined: the current trend level it is relative to is ~0
+        return "추세가 0 수준까지 떨어져" if ko else "the trend has fallen to about 0"
     if code == "negative":
         return "평균 수준이 음수여서" if ko else "the mean level is negative"
     if code == "near_zero":
@@ -1162,6 +1199,8 @@ _REASON_EN: tuple[tuple[re.Pattern, Any], ...] = tuple((re.compile(p), fn) for p
                f"{'trend' if g[1] == '추세를' else 'lifecycle phase'}."),
     (rf"관측 기간 동안 값이 ({_RX_NUM})에서 ({_RX_NUM})(?:까지|로) ({_RX_PCT}) 변했습니다\.?",
      lambda g: f"Over the observed period the value moved from {g[0]} to {g[1]} ({g[2]})."),
+    (rf"관측 기간 동안 값이 ({_RX_NUM})에서 ({_RX_NUM})까지 떨어졌습니다\.?",
+     lambda g: f"Over the observed period the value fell from {g[0]} to {g[1]}."),
     (rf"현재 값은 ({_RX_NUM})입니다\.?", lambda g: f"The current value is {g[0]}."),
     (rf"직선 추세 대비 잡음 비율은 ({_RX_NUM})%입니다\.?",
      lambda g: f"Noise relative to a straight-line trend is {g[0]}%."),
@@ -1170,6 +1209,8 @@ _REASON_EN: tuple[tuple[re.Pattern, Any], ...] = tuple((re.compile(p), fn) for p
     (rf"최근 ([\d,]+)({_RX_UNIT}) 동안 추세가 ({_RX_NUM})에서 ({_RX_NUM})까지 (높아졌습니다|낮아졌습니다)\.?",
      lambda g: f"Over the last {_en_span(g[0], g[1])} the trend {'rose' if g[4] == '높아졌습니다' else 'fell'} "
                f"from {g[2]} to {g[3]}."),
+    (rf"최근 ([\d,]+)({_RX_UNIT}) 동안 추세가 ({_RX_NUM})에서 ({_RX_NUM})까지 떨어졌습니다\.?",
+     lambda g: f"Over the last {_en_span(g[0], g[1])} the trend fell from {g[2]} to {g[3]}."),
     (rf"최근 ([\d,]+)({_RX_UNIT}) 동안 추세는 ({_RX_NUM}) 수준에 머물렀습니다\.?",
      lambda g: f"Over the last {_en_span(g[0], g[1])} the trend stayed at {g[2]}."),
     (rf"최근 ([\d,]+)({_RX_UNIT}) 동안 추세는 ({_RX_NUM})에서 ({_RX_NUM})까지 거의 변하지 않았습니다\.?",
@@ -1184,6 +1225,8 @@ _REASON_EN: tuple[tuple[re.Pattern, Any], ...] = tuple((re.compile(p), fn) for p
      lambda g: f"The average demand per period ({g[2]} over the earlier {_en_span(g[0], g[1])}, {g[5]} over the "
                f"last {_en_span(g[3], g[4])}) does not show that demand has "
                f"{'risen' if g[6] == '늘었다고' else 'fallen'}."),
+    (rf"추세는 고점\({_RX_WHEN}, ({_RX_NUM})\) 이후 ({_RX_NUM})까지 떨어졌습니다\.?",
+     lambda g: f"The trend has fallen to {g[2]} since its peak ({g[0]}, {g[1]})."),
     (rf"추세는 고점\({_RX_WHEN}, ({_RX_NUM})\) 이후 낮아져 현재 ({_RX_NUM})입니다\.?",
      lambda g: f"The trend has fallen since its peak ({g[0]}, {g[1]}) and is now {g[2]}."),
     (rf"추세는 저점 ({_RX_NUM})에서 ({_RX_NUM})까지 올라 현재 역대 최고 수준입니다\.?",
@@ -1210,6 +1253,8 @@ _REASON_EN: tuple[tuple[re.Pattern, Any], ...] = tuple((re.compile(p), fn) for p
     (r"변화가 누적되는 무작위 행보(?:\(random walk\))?에 가까운 움직임이라, 추세처럼 보이는 등락도 우연일 수 "
      r"있습니다\.?",
      lambda g: "Changes accumulate like a random walk, so trend-like swings may be due to chance."),
+    (rf"{_RX_WHEN}에 수준이 ({_RX_NUM})까지 한 번에 떨어졌습니다\.?",
+     lambda g: f"{_en_when(g[0]).capitalize()} the level dropped to {g[1]} in one step."),
     (rf"{_RX_WHEN}에 수준이 한 단계 (높아졌습니다|낮아졌습니다) \(약 ([^)]+)\)\.?",
      lambda g: f"{_en_when(g[0]).capitalize()} the level stepped {'up' if g[1] == '높아졌습니다' else 'down'} (about {g[2]})."),
     (rf"그 이후 ([\d,]+)({_RX_UNIT}) 동안은 뚜렷한 추세 없이 새 수준에서 안정되어 있습니다 "
@@ -1540,8 +1585,9 @@ def _seasonal_gap_cause(c: _Ctx, raw_gap_larger: bool) -> tuple[str, str]:
 def demand_rates(analysis: AnalysisResult) -> Optional[tuple[int, float, float]]:
     """``(w, first, last)``: the average demand per period (zeros included) over the first and
     the last ``w`` observations of intermittent demand -- a year (``w`` = periods per year) when
-    the series holds two, else a season -- ``None`` when it is shorter than two seasons (or
-    yearly).  The quantity the outlook calls ``평균 수요량``: the trend line of mostly-zero data
+    the series holds two, else ``max(season, n // 4)`` periods (two 7-day means of mostly-zero
+    daily data are noise: "처음 7일 1.00 → 최근 7일 0" contradicted a rise from 0.18 to 0.97 a
+    day) -- ``None`` when it is shorter than two such windows (or yearly).  The quantity the outlook calls ``평균 수요량``: the trend line of mostly-zero data
     sits at 0 when more than half of the values are 0 and its ends follow the edge orders
     (``0.67 → 1.17`` read ``2.81 → 1.06``), so the past is described by these means instead."""
     y = np.asarray(analysis.series, dtype=float)
@@ -1552,7 +1598,7 @@ def demand_rates(analysis: AnalysisResult) -> Optional[tuple[int, float, float]]
         year = int(round(_ppy(str(analysis.freq))))
     except (KeyError, ValueError, TypeError):
         year = m
-    for w in (year, m):
+    for w in (year, max(m, n // 4)):
         if w >= 2 and n >= 2 * w:
             return w, float(np.mean(y[:w])), float(np.mean(y[-w:]))
     return None
@@ -1651,13 +1697,18 @@ def _past_section(c: _Ctx) -> list[str]:
         end = float(trend[-1]) if len(trend) else None
         diff = c.num(float(trend[-1] - trend[0]), signed=True) if len(trend) else c.num(None)
         code = _pct_reason_of(c.a, base, end)
-        ko_why = _pct_reason_clause(code, "ko", "start", base)
-        en_why = _pct_reason_clause(code, "en", "start", base)
-        lines.append(c.t(
-            f"- 추세선 기준으로 {t0}에서 {t1}까지 {diff} 변했지만, {ko_why} 변화율(%)은 정의되지 않습니다.",
-            f"- On the trend line the level moved from {t0} to {t1} ({diff}); the total % change is undefined "
-            f"because {en_why}.",
-        ))
+        if code == "at_zero":
+            # a trend that fell to the 0 floor of a count: "−100.0%" says only that it is 0 now
+            lines.append(c.t(f"- 추세선 기준으로 {t0}에서 {t1}까지 떨어졌습니다.",
+                             f"- On the trend line the level fell from {t0} to {t1}."))
+        else:
+            ko_why = _pct_reason_clause(code, "ko", "start", base)
+            en_why = _pct_reason_clause(code, "en", "start", base)
+            lines.append(c.t(
+                f"- 추세선 기준으로 {t0}에서 {t1}까지 {diff} 변했지만, {ko_why} 변화율(%)은 정의되지 않습니다.",
+                f"- On the trend line the level moved from {t0} to {t1} ({diff}); the total % change is undefined "
+                f"because {en_why}.",
+            ))
     # 3. significance + long-run slope
     p = _finite(m.mk_pvalue)
     pstr = "< 0.001" if p is not None and p < 0.001 else f"= {c.num(p, decimals=3)}"
@@ -1672,12 +1723,14 @@ def _past_section(c: _Ctx) -> list[str]:
     why_ko, why_en = _mk_not_significant_why(c)
     # the median of pairwise slopes of mostly-zero demand is 0 whatever the demand does: next to a
     # significant test, "장기 평균 기울기는 0/주" would read as "no change" -- say why it is 0
+    # -- so is that of any series that is 0 at least half of the time (a product that stopped)
     zero_slope_ko = zero_slope_en = ""
-    if intermittent and _finite(m.slope) == 0.0 and m.direction in ("up", "down"):
-        zero_slope_ko = (f"장기 평균 기울기(중앙값 기반)는 관측치의 절반 이상이 0이라 0{c.unit}로 나와 수요의 변화를 "
+    if _finite(m.slope) == 0.0 and _zero_share(c.a) > 0.5 and not is_all_zero(c.a):
+        what_ko, what_en = ("수요의 변화", "the change in demand") if intermittent else ("값의 변화", "how the values changed")
+        zero_slope_ko = (f"장기 평균 기울기(중앙값 기반)는 관측치의 절반 이상이 0이라 0{c.unit}로 나와 {what_ko}를 "
                          f"보여 주지 못합니다.")
         zero_slope_en = (f"The long-run slope (a median) is 0{c.unit} only because more than half of the "
-                         f"observations are 0, so it does not show the change in demand.")
+                         f"observations are 0, so it does not show {what_en}.")
     against = _mk_against_endpoints(c)
     if against is not None:
         # the test's direction contradicts the total change printed just above: qualify it
@@ -1768,9 +1821,9 @@ def _past_section(c: _Ctx) -> list[str]:
     elif intermittent:
         # the "peak" is one large order and the latest value is often 0: a drawdown means nothing
         lines.append(c.t(
-            f"- 가장 큰 수요는 {pdate}의 {pval}입니다. 대부분의 기간이 0인 간헐적 수요여서 고점 대비 하락률은 "
+            f"- 가장 큰 수요는 {pdate}의 {pval}입니다. {_zero_demand_ko(c.a)} 간헐적 수요여서 고점 대비 하락률은 "
             f"의미가 없습니다.{spike_ko}",
-            f"- The largest demand was {pval} {_en_when(pdate)}. Demand is zero most of the time, so a "
+            f"- The largest demand was {pval} {_en_when(pdate)}. Demand is zero {_zero_demand_en(c.a)}, so a "
             f"drawdown from the peak means nothing here.{spike_en}",
         ))
     elif at_peak:
@@ -1792,8 +1845,9 @@ def _past_section(c: _Ctx) -> list[str]:
         seasonal_dd = seasonal_trend_drawdown(c.a) if dd_why is None else None
         if dd_why == "at_zero":
             # a count at its 0 floor: "100.0% 낮아 고점의 1/10 이하로 급감" says only that it is 0 now
-            lines.append(c.t(f"- 최고치는 {pdate}의 {pval}이며, 최근 값은 0입니다.{spike_ko}",
-                             f"- The peak was {pval} {_en_when(pdate)}; the latest value is 0.{spike_en}"))
+            last_v = c.num(m.last_value)
+            lines.append(c.t(f"- 최고치는 {pdate}의 {pval}이며, 최근 값은 {last_v}입니다.{spike_ko}",
+                             f"- The peak was {pval} {_en_when(pdate)}; the latest value is {last_v}.{spike_en}"))
         elif dd_why is not None:
             # a series that crossed zero (or peaked near 0 among negative values): "179.4% 낮아
             # 고점의 1/10 이하로 급감" is no percentage -- state the gap in the series' units
@@ -1989,10 +2043,13 @@ def _evidence(c: _Ctx) -> list[str]:
         win = c.span(c.recent_window())
         out.append(c.t(f"최근 {win} 동안 추세가 {c.pct(m.recent_change_pct)} 변했습니다.",
                        f"Over the last {win} the trend changed by {c.pct(m.recent_change_pct)}."))
-    mom = c.num(m.momentum, decimals=2, signed=True)
-    out.append(c.t(f"최근 기울기와 장기 기울기의 차이(모멘텀)는 현재 추세 수준 대비 {mom}%p{c.unit}입니다.",
-                   f"The recent slope differs from the long-run slope (momentum) by {mom} pp{c.unit} "
-                   f"of the current trend level."))
+    if momentum_pct_undefined(c.a) is None:
+        # only where the momentum is a %p at all (a negative or ~0 level, intermittent demand or a trend
+        # at 0 has none: the present section says so and must not be contradicted here)
+        mom = c.num(m.momentum, decimals=2, signed=True)
+        out.append(c.t(f"최근 기울기와 장기 기울기의 차이(모멘텀)는 현재 추세 수준 대비 {mom}%p{c.unit}입니다.",
+                       f"The recent slope differs from the long-run slope (momentum) by {mom} pp{c.unit} "
+                       f"of the current trend level."))
     dd = _finite(m.drawdown_pct)
     pk, lst = _finite(m.peak_value), _finite(m.last_value)
     if (dd is not None and c.a.phase.label in ("declining", "peaking", "reviving")
@@ -2172,18 +2229,28 @@ def _present_section(c: _Ctx) -> list[str]:
         lines.append(c.t(f"- 최근 {win} 변화율은 관측값이 모두 0이라 계산하지 않았습니다.",
                          f"- The % change over the last {win} is undefined (every observation is 0)."))
     elif _intermittent(c.a):
-        lines.append(c.t(f"- 대부분의 기간이 0인 간헐적 수요여서 최근 {win} 변화율은 계산하지 않았습니다.",
-                         f"- The % change over the last {win} is not given: demand is zero most of the time."))
+        lines.append(c.t(f"- {_zero_demand_ko(c.a)} 간헐적 수요여서 최근 {win} 변화율은 계산하지 않았습니다.",
+                         f"- The % change over the last {win} is not given: demand is zero "
+                         f"{_zero_demand_en(c.a)}."))
     else:
         tr = np.asarray(c.a.decomposition.trend, dtype=float)
         k_r = c.recent_window()
         base = float(tr[-1 - k_r]) if len(tr) > k_r and math.isfinite(tr[-1 - k_r]) else None
         end = float(tr[-1]) if len(tr) and math.isfinite(tr[-1]) else None
         code = _pct_reason_of(c.a, base, end)
-        lines.append(c.t(f"- 최근 {win} 변화율은 {_pct_reason_clause(code, 'ko', 'base', base)} 계산하지 않았습니다.",
-                         f"- The % change over the last {win} is undefined "
-                         f"({_pct_reason_clause(code, 'en', 'base', base)})."))
-    rate_why = rate_pct_undefined(c.a)
+        if code == "at_zero":   # the trend fell to the 0 floor within the window: no "−100.0%"
+            frm, to = c.nums(base, end)
+            lines.append(c.t(f"- 최근 {win} 동안 추세가 {frm}에서 {to}까지 떨어졌습니다.",
+                             f"- Over the last {win} the trend fell from {frm} to {to}."))
+        elif base == 0.0 and end == 0.0 and float(np.nanmin(np.asarray(c.a.series, dtype=float))) >= 0.0:
+            # a count that has sat at 0 for the whole window: no "기준 수준이 0에 가까워 …"
+            lines.append(c.t(f"- 최근 {win} 동안 추세는 0 수준에 머물렀습니다.",
+                             f"- Over the last {win} the trend stayed at 0."))
+        else:
+            lines.append(c.t(
+                f"- 최근 {win} 변화율은 {_pct_reason_clause(code, 'ko', 'base', base)} 계산하지 않았습니다.",
+                f"- The % change over the last {win} is undefined ({_pct_reason_clause(code, 'en', 'base', base)})."))
+    rate_why = momentum_pct_undefined(c.a)   # %p of the current trend level (also 'at_zero')
     all_zero = is_all_zero(c.a)
     if all_zero:   # nothing moved: no "0.00%p/월", no "a difference within the noise"
         lines.append(c.t("- 모멘텀과 변동성은 관측값이 모두 0이라 계산하지 않았습니다.",
@@ -2252,14 +2319,14 @@ def _latest_value_lines(c: _Ctx) -> list[str]:
         if demand:
             ko = f"- 최근 {c.span(run)} 연속 수요가 없었습니다(마지막 수요: {when}의 {lv})."
             en = f"- No demand for the last {c.span(run)} in a row (the last demand was {lv} {_en_when(when)})."
-            if gap >= 1.5:
+            if gap is not None and gap >= 1.5:
                 ko += f" 그전에는 평균 {g}{unit_ko}마다 수요가 있었습니다."
                 en += f" Before that, demand came about every {g} {unit_en}."
         else:
             ko = f"- 최근 {c.span(run)} 연속 값이 0입니다(마지막 0이 아닌 값: {when}의 {lv})."
             en = f"- The value has been 0 for the last {c.span(run)} in a row (the last non-zero value was {lv} " \
                  f"{_en_when(when)})."
-            if gap >= 1.5:
+            if gap is not None and gap >= 1.5:
                 ko += f" 그전에는 평균 {g}{unit_ko}마다 0이 아닌 값이 있었습니다."
                 en += f" Before that, a non-zero value came about every {g} {unit_en}."
         lines.append(c.t(ko, en))
@@ -2272,6 +2339,84 @@ def volatility_undefined(analysis: AnalysisResult) -> Optional[str]:
     is a level, and the CV of lumpy demand is a classic measure of it)."""
     why = rate_pct_undefined(analysis)
     return None if why == "intermittent" else why
+
+
+#: payload names of the TrendMetrics fields that metric_pct_undefined names
+_PAYLOAD_METRIC = {"slope_pct": "slope_pct_per_period", "volatility": "volatility_cv"}
+
+
+def _growth_reason(analysis: AnalysisResult, key: str) -> Optional[str]:
+    """Why the growth metric ``key`` (``total_change_pct``, ``cagr_pct``, ``recent_change_pct``) is
+    ``None`` (``None``: it is a number, or no reason applies) -- see :func:`metric_pct_undefined`."""
+    m = analysis.metrics
+    if _finite(getattr(m, key, None)) is not None:
+        return None
+    if is_all_zero(analysis):
+        return "all_zero"
+    if _intermittent(analysis):
+        return "intermittent"
+    if key == "cagr_pct":
+        try:
+            years = (int(m.n_obs) - 1) / _ppy(str(analysis.freq))
+        except (KeyError, ValueError, TypeError, ZeroDivisionError):
+            years = None
+        if years is not None and years < CAGR_MIN_YEARS:
+            return "short_span"
+        # the CAGR compares the trend's two ends, as the total change does: the same reason
+        return _growth_reason(analysis, "total_change_pct")
+    tv = np.asarray(analysis.decomposition.trend, dtype=float)
+    tv = tv[np.isfinite(tv)]
+    if len(tv) < 2:
+        return None
+    if key == "recent_change_pct":
+        k_r = _recent_window(analysis.freq, int(analysis.season_length), int(m.n_obs))
+        if len(tv) <= k_r:
+            return None
+        base = float(tv[-1 - k_r])
+    else:
+        base = float(tv[0])
+    return _pct_reason_of(analysis, base, float(tv[-1])) or "zero"
+
+
+def metric_pct_undefined(analysis: AnalysisResult) -> dict[str, str]:
+    """Why each percentage metric of ``analysis.metrics`` is null or must not be printed as a %.
+
+    ``{TrendMetrics field: reason}`` -- the one rule behind the LLM payload's
+    ``metrics.pct_undefined`` and the JSON export's ``metrics.pct_undefined``:
+
+    * ``total_change_pct`` / ``recent_change_pct`` / ``cagr_pct`` (when ``None``):
+      ``'all_zero'`` (every observation is 0), ``'intermittent'`` (mostly-zero
+      demand: no growth rates by design), for ``cagr_pct`` ``'short_span'`` (less
+      than :data:`analysis.CAGR_MIN_YEARS` of data: not annualised), else
+      :func:`analysis.pct_change_undefined` of the trend from the metric's base to
+      its end (``'zero'`` when no other reason applies), e.g. ``'at_zero'`` for a
+      trend that fell to (about) 0 -- ``cagr_pct`` shares the whole-period reason,
+      since it compares the same two trend values.  The terminal summary and the
+      HTML page explain their ``—`` from this too (``report._metric_undefined``);
+    * ``drawdown_pct``: :func:`drawdown_undefined` (``'at_zero'``: the latest value
+      is 0; ``'sign_change'``: the series crossed zero; ...);
+    * ``slope_pct``: :func:`rate_pct_undefined`; ``momentum``: :func:`momentum_pct_undefined`
+      (also ``'at_zero'``: the trend it is relative to fell to about 0); ``volatility``:
+      :func:`volatility_undefined`.
+    """
+    out: dict[str, str] = {}
+    for key in ("total_change_pct", "cagr_pct", "recent_change_pct"):
+        why = _growth_reason(analysis, key)
+        if why is not None:
+            out[key] = why
+    dd = drawdown_undefined(analysis)
+    if dd is not None:
+        out["drawdown_pct"] = dd
+    # rates in % of the level (slope_pct, momentum, the CV): rate_pct_undefined, as every surface prints them
+    rate_why, vol_why = rate_pct_undefined(analysis), volatility_undefined(analysis)
+    mom_why = momentum_pct_undefined(analysis)
+    if rate_why is not None:
+        out["slope_pct"] = rate_why
+    if mom_why is not None:
+        out["momentum"] = mom_why
+    if vol_why is not None:
+        out["volatility"] = vol_why
+    return out
 
 
 def _accuracy_line(c: _Ctx) -> str:
@@ -2366,6 +2511,8 @@ def _level_names(c: _Ctx, win: _OutlookWindows) -> tuple[str, str, str, str]:
         fut_ko, fut_en = adj_ko + fut_ko, fut_en.replace("the ", "the " + adj_en, 1)
     if win.adj_cur:
         cur_ko, cur_en = adj_ko + cur_ko, cur_en.replace("the ", "the " + adj_en, 1)
+    if win.spike_adj:   # the models do not see a one-off spike, so neither does the current level
+        cur_ko, cur_en = "일시적 급등을 뺀 " + cur_ko, cur_en + " (one-off spikes left out)"
     return fut_ko, fut_en, cur_ko, cur_en
 
 
@@ -2539,7 +2686,6 @@ def _undefined_change_line(c: _Ctx, win: _OutlookWindows, dir_word: str, fut_ko:
 def _future_section(c: _Ctx) -> list[str]:
     f, o = c.f, c.o
     lines: list[str] = []
-    h = c.span(f.horizon)
     fc_end = c.date(f.mean.index[-1]) if len(f.mean) else c.num(None)
     chg = _finite(o.expected_change_pct)
     dir_word = c.outlook_direction()
@@ -2723,12 +2869,6 @@ def future_phase_status(analysis: AnalysisResult, outlook: Outlook) -> Optional[
     if fut != cur and str(getattr(outlook, "confidence", "")) == "low":
         return "low_confidence"
     return None
-
-
-def _phase_undecided(c: _Ctx) -> bool:
-    """``future_phase`` only *kept* the current moving phase because a 'flat' outlook cannot tell
-    whether the move goes on (``forecast._future_phase``): say it is hard to judge, not that it lasts."""
-    return future_phase_status(c.a, c.o) == "undecided"
 
 
 def _phase_projection(c: _Ctx) -> list[str]:
@@ -3140,6 +3280,9 @@ def _expected_change_basis(analysis: AnalysisResult, forecast: ForecastResult,
                 f"seasonality the forecast contains)")
     if w.k_fut > 1:
         txt += "; this compares averages, not the horizon-end value (see scenarios_at_horizon_end)"
+    if w.spike_adj:
+        txt += ("; one-off upward spikes inside the current window (listed in anomalies) count at the corrected "
+                "values the forecast models were fitted on: call it the current level without the one-off spike")
     if w.undefined is None and _intermittent(analysis):
         txt += ("; intermittent demand: both levels are average demand per period over their window (zero "
                 "periods included), a different quantity from the trend line whose % changes are null on purpose "
@@ -3244,26 +3387,12 @@ def build_llm_payload(analysis: AnalysisResult, forecast: ForecastResult, outloo
                  for a in sorted(top_an, key=lambda x: pd.Timestamp(x.date))]
     peak_date = outlook.forecast_peak_date
     windows = _outlook_windows(analysis, forecast)
-    # why a percentage metric is null (or, for drawdown_pct, left out): analysis.pct_change_undefined
-    tv_ok = tv[np.isfinite(tv)]
-    k_r = _recent_window(freq, int(analysis.season_length), int(m.n_obs))
-    pct_undefined: dict[str, str] = {}
-    if not _intermittent(analysis) and len(tv_ok) >= 2:
-        if _finite(m.total_change_pct) is None:
-            pct_undefined["total_change_pct"] = (_pct_reason_of(analysis, float(tv_ok[0]), float(tv_ok[-1]))
-                                                 or "zero")
-        if _finite(m.recent_change_pct) is None and len(tv_ok) > k_r:
-            pct_undefined["recent_change_pct"] = (
-                _pct_reason_of(analysis, float(tv_ok[-1 - k_r]), float(tv_ok[-1])) or "zero")
-    dd_undefined = _drawdown_undefined(analysis)
-    if dd_undefined is not None:
-        pct_undefined["drawdown_pct"] = dd_undefined
-    # rates in % of the level (slope_pct, momentum, the CV): rate_pct_undefined, as every surface prints them
-    rate_why, vol_why = rate_pct_undefined(analysis), volatility_undefined(analysis)
-    if rate_why is not None:
-        pct_undefined["slope_pct_per_period"] = pct_undefined["momentum"] = rate_why
-    if vol_why is not None:
-        pct_undefined["volatility_cv"] = vol_why
+    # why a percentage metric is null (or, for drawdown_pct, left out): the one rule of the JSON export
+    # too (metric_pct_undefined), with the payload's names for the rates
+    pct_undefined = {_PAYLOAD_METRIC.get(k, k): v for k, v in metric_pct_undefined(analysis).items()}
+    dd_undefined = pct_undefined.get("drawdown_pct")
+    rate_why = pct_undefined.get("slope_pct_per_period")
+    vol_why = pct_undefined.get("volatility_cv")
     p_why = prob_undefined(analysis)
     sref = scenario_reference(analysis, forecast)
     payload: dict[str, Any] = {
@@ -3301,8 +3430,12 @@ def build_llm_payload(analysis: AnalysisResult, forecast: ForecastResult, outloo
                               "'negative' = negative base (for slope_pct_per_period / momentum / volatility_cv: "
                               "a negative mean level), 'zero' = base about 0, 'near_zero' = base within half a "
                               "standard deviation of 0 in data with negative values, 'intermittent' = mostly-zero "
-                              "demand, 'at_zero' = drawdown of a count whose latest value is 0 (name the peak, "
-                              "never -100%); state no percentage for it"),
+                              "demand, 'all_zero' = every observation is 0, 'short_span' = a CAGR over less than "
+                              "a year (not annualised), 'at_zero' = the level of a series that cannot go below 0 "
+                              "fell to (about) 0 (for total/recent change and CAGR: say that the trend fell to "
+                              "that level and give its start; for drawdown_pct: the latest value is (about) 0, "
+                              "name the peak; for momentum: the trend it is relative to is gone), never -100%; "
+                              "state no percentage for it"),
             "robust_zscore": "robust z-score of an anomaly; capped at +-100 (larger ones only mean 'far outside')",
         },
         "history": history,
@@ -3318,7 +3451,8 @@ def build_llm_payload(analysis: AnalysisResult, forecast: ForecastResult, outloo
             "slope_per_period": _r(m.slope),
             "slope_pct_per_period": (None if rate_why else
                                      _r_as(m.slope_pct, lambda v: format_pct(v, decimals=2), 4)),
-            "momentum": None if rate_why else _r_as(m.momentum, _two_dec, 4), "acceleration": _r(m.acceleration),
+            "momentum": (None if "momentum" in pct_undefined else _r_as(m.momentum, _two_dec, 4)),
+            "acceleration": _r(m.acceleration),
             "volatility_cv": (None if vol_why else
                               _r_as(m.volatility, lambda v: format_number(v * 100, decimals=1), 4)),
             "trend_strength": _r_as(m.trend_strength, _two_dec, 3),

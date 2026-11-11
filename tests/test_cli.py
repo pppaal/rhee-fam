@@ -624,3 +624,94 @@ def test_compare_ranking_explains_every_dash(tmp_path, capsys):
         assert main(["compare", *paths, "--lang", lang, "-q"]) == 0
         out = capsys.readouterr().out
         assert neg in out and zero in out, out[out.index("■"):]
+
+
+# --------------------------------------------------------------------------- final round: first-user items
+
+
+def test_argparse_messages_and_help_are_korean(capsys):
+    """U12: 'the following arguments are required: file', 'invalid choice', 'unrecognized arguments' and the
+    help titles ('positional arguments', 'options', 'show this help message and exit') were English."""
+    import re as _re
+
+    with pytest.raises(SystemExit):
+        main(["analyze"])
+    err = capsys.readouterr().err
+    assert "사용법: trendai analyze" in err and "오류: 다음 인자가 필요합니다: file" in err
+    with pytest.raises(SystemExit):
+        main(["analyze", "x.csv", "--freq", "X"])
+    assert "--freq: 허용되지 않는 값 'X'" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        main(["list-samples", "--bogus"])
+    assert "알 수 없는 인자입니다: --bogus" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        main(["sample", "--help"])
+    out = capsys.readouterr().out
+    assert "위치 인자:" in out and "옵션:" in out and "이 도움말을 보여 주고 끝냅니다" in out
+    assert not _re.search(r"positional arguments|show this help|^options:", out, _re.M)
+    # U9: the default horizons, and help for every option
+    assert "기본: 일 30일·주 26주·월 12개월·분기 8분기·연 5년" in out and "합성 샘플의 난수 시드" in out
+    # --lang en keeps argparse's English
+    with pytest.raises(SystemExit):
+        main(["analyze", "--lang", "en"])
+    assert "error: the following arguments are required: file" in capsys.readouterr().err
+
+
+def test_save_error_names_the_file_in_plain_words(tmp_path, capsys):
+    """V2-12: '오류: 파일을 저장할 수 없습니다 — [Errno 2] No such file or directory: '/proc/nope''."""
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    target = blocker / "sub" / "x.html"            # a path through a file: the folder cannot be made
+    assert main(["sample", "fad", "-q", "--n", "24", "--html", str(target)]) == 1
+    err = capsys.readouterr().err
+    assert f"오류: {target} 파일을 저장할 수 없습니다 — " in err and "Errno" not in err
+    assert main(["sample", "fad", "-q", "--n", "24", "--html", str(target), "--lang", "en"]) == 1
+    err = capsys.readouterr().err
+    assert f"Error: cannot save {target} — " in err and "Errno" not in err and not _HANGUL.search(err)
+
+
+def test_multi_series_hint_fits_the_command(tmp_path, capsys):
+    """U11: 'sample all --html out.html' was told to use --html (given) or --value-col (not an option of sample)."""
+    assert main(["sample", "all", "--n", "24", "-H", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "sample <이름> 으로 하나씩" in out and "--value-col" not in out
+    page = tmp_path / "cmp.html"
+    assert main(["sample", "all", "--n", "24", "-H", "2", "--html", str(page)]) == 0
+    out = capsys.readouterr().out
+    assert f"시리즈별 해석문은 {tmp_path / 'cmp_<이름>.html'} 에 있습니다" in out
+
+
+def test_compare_with_samples_says_they_are_synthetic(tmp_path, capsys):
+    """U6: 'compare a.csv --samples emerging,fad' mixed synthetic samples with real data without a word,
+    and neither the HTML pages nor the JSON said so."""
+    page, js = tmp_path / "c.html", tmp_path / "c.json"
+    assert main(["compare", "--samples", "emerging,fad", "-q", "-H", "3", "--html", str(page),
+                 "--json", str(js)]) == 0
+    assert "emerging, fad: 합성(가상) 샘플 데이터입니다" in capsys.readouterr().out
+    assert "합성(가상) 샘플 데이터: emerging, fad" in page.read_text(encoding="utf-8")
+    assert "합성(가상) 샘플 데이터" in (tmp_path / "c_emerging.html").read_text(encoding="utf-8")
+    assert all(rec["synthetic"] is True for rec in json.loads(js.read_text(encoding="utf-8")))
+
+
+def test_terminal_narrative_is_plain_text_on_a_tty(capsys, monkeypatch):
+    """U10: the narrative was printed to the terminal as raw Markdown ('**한눈에 보기**', '## 과거')."""
+    import trendai.cli as C
+
+    monkeypatch.setattr(C, "_stdout_is_tty", lambda: True)
+    assert main(["sample", "emerging", "-H", "3", "--n", "36"]) == 0
+    out = capsys.readouterr().out
+    assert "■ 과거: 어떻게 여기까지 왔나" in out and "**" not in out and "\n## " not in out
+    monkeypatch.setattr(C, "_stdout_is_tty", lambda: False)
+    assert main(["sample", "emerging", "-H", "3", "--n", "36"]) == 0
+    assert "## 과거: 어떻게 여기까지 왔나" in capsys.readouterr().out     # redirected: Markdown kept
+
+
+def test_json_export_in_english_has_english_phase_reasons(tmp_path, capsys):
+    """V2-13: 'sample growing --lang en --json' exported Korean phase.reasons."""
+    import re as _re
+
+    js = tmp_path / "g.json"
+    assert main(["sample", "growing", "--lang", "en", "-q", "--json", str(js)]) == 0
+    d = json.loads(js.read_text(encoding="utf-8"))
+    assert d["phase"]["reasons"] and not any(_re.search("[가-힣]", r) for r in d["phase"]["reasons"])
+    assert d["phase"]["label_en"] == "Growing" and d["phase"]["reasons_ko"]

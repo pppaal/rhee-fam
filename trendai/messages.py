@@ -155,7 +155,13 @@ MESSAGES: dict[str, tuple[str, str]] = {
                           "선형 보간했습니다. 실제 관측은 {observed}개입니다.",
                           "{name}on a {unit} grid, {filled} empty periods ({share:.0%} of {total}) were "
                           "interpolated linearly; {observed} were actually observed."),
-    "duplicates_merged": ("{name}같은 {unit} 단위 기간에 값이 여러 개 있어 {how}으로 합쳤습니다 "
+    "upsampled": ("{name}{own} 단위 데이터를 더 촘촘한 {unit} 단위로 바꾸면서 {filled:,}개 기간(전체 {total:,}개 중 "
+                  "{share:.0%})을 선형 보간했습니다. 실제 관측은 {observed:,}개뿐이라 정확도와 확률이 실제보다 좋아 "
+                  "보일 수 있습니다.",
+                  "{name}data with one value per {own} were spread over a finer {unit} grid: {filled:,} of "
+                  "{total:,} periods ({share:.0%}) were interpolated linearly and only {observed:,} were observed, "
+                  "so accuracy and probabilities can look better than they are."),
+    "duplicates_merged": ("{name}같은 {unit} 단위 기간에 값이 여러 개 있어 {how} 합쳤습니다 "
                           "(관측 {n_raw}개 → {observed}개 기간). 다른 주기로 보려면 --freq 를 지정하세요.",
                           "{name}several values fell in the same {unit} period and were {how} "
                           "({n_raw} observations → {observed} periods). Use --freq for another frequency."),
@@ -254,9 +260,11 @@ MESSAGES: dict[str, tuple[str, str]] = {
                              "The start date ({start}) is after the end date ({end})."),
     "conn_need_requests": ("위키백과 조회에는 requests 패키지가 필요합니다: pip install requests",
                            "Fetching Wikipedia page views needs the requests package: pip install requests"),
-    "conn_network": ("Wikimedia API에 연결하지 못했습니다 (network error): {error}",
-                     "Could not connect to the Wikimedia API (network error): {error}"),
-    "conn_wiki_404": ("위키백과 문서를 찾을 수 없습니다 (article not found): '{title}' ({lang}.wikipedia). "
+    "conn_network": ("Wikimedia API에 연결하지 못했습니다. 인터넷 연결(회사망이면 프록시 설정)을 확인한 뒤 다시 "
+                     "시도하세요. (자세한 오류: {error})",
+                     "Could not connect to the Wikimedia API (network error). Check the internet connection "
+                     "(and the proxy settings on a company network), then try again. (Details: {error})"),
+    "conn_wiki_404": ("위키백과 문서를 찾을 수 없습니다: '{title}' ({lang}.wikipedia). "
                       "정확한 문서 제목(대소문자·띄어쓰기)을 확인하거나, 조회 기간에 데이터가 있는지 확인하세요.",
                       "Wikipedia article not found: '{title}' ({lang}.wikipedia). Check the exact title "
                       "(capital letters, spaces) and whether the period has data."),
@@ -266,7 +274,7 @@ MESSAGES: dict[str, tuple[str, str]] = {
     "conn_wiki_error": ("Wikimedia API 오류: {error}", "Wikimedia API error: {error}"),
     "conn_wiki_json": ("Wikimedia API 응답을 JSON으로 해석할 수 없습니다.",
                        "The Wikimedia API response is not valid JSON."),
-    "conn_wiki_empty": ("조회 기간에 '{title}' 페이지뷰 데이터가 없습니다 (empty items).",
+    "conn_wiki_empty": ("조회 기간에 '{title}' 페이지뷰 데이터가 없습니다.",
                         "No page views of '{title}' in the requested period (empty items)."),
     "conn_wiki_no_valid": ("Wikimedia API 응답에 유효한 페이지뷰 항목이 없습니다.",
                            "The Wikimedia API response has no valid page-view items."),

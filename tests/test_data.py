@@ -509,7 +509,7 @@ def test_message_catalog_renders_every_code_in_both_languages():
         "freq": "X", "value": 0, "horizon": 20_000, "max": 10_000, "n": 3, "ratio": 5, "series": "s",
         "detail": MS.msg("too_few_obs", name="", n=1), "label": MS.L("YYYY (연도)", "YYYY (year)"),
         "examples": "'a'", "lo": "1", "hi": "36", "name": "'v': ", "n_obs": 60, "filled": 22, "n_out": 82,
-        "unit": MS.unit("M"), "total": 47, "share": 0.32, "observed": 32, "how": MS.L("평균", "averaged"),
+        "unit": MS.unit("M"), "total": 47, "share": 0.32, "observed": 32, "how": MS.L("평균으로", "averaged"), "own": MS.unit("M"),
         "n_raw": 25, "col": "v", "columns": ["date", "v"], "cols": ["id"], "edge": "", "what": "f.csv",
         "error": "boom", "hint": "", "line": 3, "pkg": "openpyxl", "path": "/x/f.csv",
         # connectors.ConnectorError (R5-REV-5)
@@ -568,3 +568,22 @@ def test_data_errors_and_warnings_carry_code_params_and_english_text(tmp_path):
                                            dtype=object))
     assert [c for c, _ in note.parts] == ["date_order_ambiguous", "dates_unreadable_rows"]
     assert str(note).startswith("날짜의 일/월 순서가 모호해") and not _HANGUL.search(note.text("en"))
+
+
+def test_forced_finer_frequency_warns_about_interpolation():
+    """U3: '--freq W' on 48 monthly values gave 205 weekly points (157 interpolated) without a warning, and
+    a confident accuracy and '상승 확률 >99%'; prepare reported its repairs only when it inferred the frequency."""
+    from trendai.data import DataWarning
+
+    s = pd.Series(100 + np.arange(48.0), index=pd.date_range("2021-01-01", periods=48, freq="MS"), name="search")
+    with pytest.warns(DataWarning) as rec:
+        out, f = prepare(s, freq="W")
+    assert f == "W" and len(out) == 205
+    w = [r.message for r in rec if "보간" in str(r.message)][0]
+    assert "월 단위 데이터를 더 촘촘한 주 단위로 바꾸면서 157개 기간(전체 205개 중 77%)을 선형 보간했습니다" in str(w)
+    assert "157 of 205 periods" in w.text("en") and not _HANGUL.search(w.text("en"))
+    # the data's own frequency, or an aggregation that was asked for: no such warning
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        prepare(s, freq="M")
+        prepare(s, freq="Q")

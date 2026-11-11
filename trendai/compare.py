@@ -27,7 +27,10 @@ file of the same process get about the same score:
   when the analysis states no recent change in % (``metrics.recent_change_pct``
   is ``None``: intermittent demand, a level that crossed zero, a base near
   zero), and when :func:`trendai.analysis.pct_change_undefined` refuses the
-  year-over-year change itself (a P&L that fell through zero is no "−100 %"),
+  year-over-year change itself (a P&L that fell through zero is no "−100 %") --
+  except for a trend that fell to about 0 (``'at_zero'``): no % is printed for
+  it, but it scores as the strongest fall (−100 %), as an outlook whose
+  forecast falls to the 0 floor (``'floor'``) does for ``expected_ann``,
 * ``momentum_pm`` – the analysis' momentum converted from % per period to
   % per month; 0 (no contribution) where a %p of the level means nothing
   (:func:`momentum_undefined`: a level near 0, a negative level, intermittent
@@ -54,8 +57,9 @@ from typing import Iterable, Mapping, Optional, Union
 import numpy as np
 import pandas as pd
 
-from .analysis import _is_intermittent, level_rate_undefined, pct_change_undefined
+from .analysis import _is_intermittent, momentum_undefined as _momentum_undefined, pct_change_undefined
 from .data import periods_per_year
+from .forecast import outlook_levels
 from .narrative import prob_undefined
 from .types import PHASE_KO, TrendReport
 
@@ -124,7 +128,19 @@ def expected_change_annualised(report: TrendReport) -> Optional[float]:
     h = max(1, int(fc.horizon or len(fc.mean) or 1))
     k_cur, k_fut = min(m, n), min(m, h)
     gap = h - (k_fut - 1) / 2.0 + (k_cur - 1) / 2.0
-    return annualise_pct(report.outlook.expected_change_pct, gap, _ppy(report))
+    pct = report.outlook.expected_change_pct
+    if pct is None and _outlook_undefined(report) == "floor":
+        # the forecast falls to the 0 floor: no "−100 %" is printed, but the score keeps the fall
+        pct = -100.0
+    return annualise_pct(pct, gap, _ppy(report))
+
+
+def _outlook_undefined(report: TrendReport) -> Optional[str]:
+    """``forecast.outlook_levels(...).undefined`` (``None`` for a hand-made / partial report)."""
+    try:
+        return outlook_levels(report.analysis, report.forecast).undefined
+    except Exception:  # noqa: BLE001 - hand-made / partial reports
+        return None
 
 
 def recent_change_annualised(report: TrendReport) -> Optional[float]:
@@ -140,8 +156,6 @@ def recent_change_annualised(report: TrendReport) -> Optional[float]:
     ``—`` for the recent change never sits next to a score driven by it.
     """
     a = report.analysis
-    if getattr(a.metrics, "recent_change_pct", 0.0) is None:
-        return None
     values = np.asarray(a.series, dtype=float)
     if _is_intermittent(values, int(a.season_length or 1)):
         return None
@@ -154,7 +168,13 @@ def recent_change_annualised(report: TrendReport) -> Optional[float]:
     ppy = _ppy(report)
     k = int(min(max(1, round(ppy)), n - 1))
     base, last = float(y[-1 - k]), float(y[-1])
-    if pct_change_undefined(base, last, values) is not None:
+    why = pct_change_undefined(base, last, values)
+    if why == "at_zero":
+        # a trend that fell to (about) 0: the surfaces print no "−100 %" ('at_zero'), but the
+        # score keeps the direction -- the strongest fall, not a neutral 0 (a stopped product
+        # scored 38.4, level with an ordinary declining series)
+        return -100.0
+    if why is not None or getattr(a.metrics, "recent_change_pct", 0.0) is None:
         return None
     return annualise_pct((last / base - 1.0) * 100.0, k, ppy)
 
@@ -165,10 +185,14 @@ def _values(report: TrendReport) -> np.ndarray:
 
 
 def momentum_undefined(report: TrendReport) -> Optional[str]:
-    """Why the momentum (%p of the trend level) means nothing for ``report``:
-    :func:`trendai.analysis.level_rate_undefined` (a level near 0, a negative level, intermittent
-    demand, an all-zero history) -- the rule every surface uses before printing it (``—``)."""
-    return level_rate_undefined(_values(report), int(report.analysis.season_length or 1))
+    """Why the momentum (%p of the current trend level) means nothing for ``report``:
+    :func:`trendai.analysis.momentum_undefined` (a level near 0, a negative level, intermittent
+    demand, an all-zero history, or a trend that fell to about 0: ``'at_zero'``) -- the rule every
+    surface uses before printing it (``—``)."""
+    a = report.analysis
+    trend = getattr(getattr(a, "decomposition", None), "trend", None)
+    return _momentum_undefined(_values(report), int(a.season_length or 1),
+                               None if trend is None else np.asarray(trend, dtype=float))
 
 
 def momentum_per_month(report: TrendReport) -> float:

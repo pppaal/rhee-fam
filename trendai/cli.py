@@ -23,13 +23,15 @@ written before ``--html``, so a rendering problem never loses the JSON result.
 from __future__ import annotations
 
 import argparse
+import errno
 import inspect
 import os
+import re
 import sys
 import unicodedata
 import warnings
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, NoReturn, Optional, Sequence
 
 import pandas as pd
 
@@ -45,6 +47,7 @@ FREQ_CHOICES = ["D", "W", "M", "Q", "Y"]
 _MSG: dict[str, dict[str, str]] = {
     "ko": {
         "synthetic": "※ 합성(가상) 샘플 데이터입니다 — 실제 데이터가 아닙니다.",
+        "synthetic_some": "※ {names}: 합성(가상) 샘플 데이터입니다 — 실제 데이터가 아닙니다.",
         # the score blends the outlook with the recent momentum (compare.rising_score): "higher = a
         # stronger expected rise" overclaimed
         "rank_title": "■ 상승 트렌드 순위 (상승 점수: 전망 + 최근 기세, 50=중립)",
@@ -67,6 +70,11 @@ _MSG: dict[str, dict[str, str]] = {
         "rank_undefined_prob": "예측 변화·상승확률",
         "narr_hidden": ("※ 시계열이 여러 개라 개별 해석문은 생략했습니다 — HTML(--html)·JSON(--json) "
                         "리포트 또는 --value-col 로 하나씩 실행해 확인하세요."),
+        "narr_hidden_html": "※ 시계열이 여러 개라 개별 해석문은 생략했습니다 — 시리즈별 해석문은 {pattern} 에 있습니다.",
+        "narr_hidden_sample": ("※ 시계열이 여러 개라 개별 해석문은 생략했습니다 — HTML(--html)·JSON(--json) "
+                               "리포트 또는 sample <이름> 으로 하나씩 실행해 확인하세요."),
+        "narr_hidden_other": ("※ 시계열이 여러 개라 개별 해석문은 생략했습니다 — HTML(--html)·JSON(--json) "
+                              "리포트에서 확인하세요."),
         "html_one": "HTML 리포트 저장: {path}",
         "html_many": "HTML 비교 리포트 저장: {path} (+ 개별 리포트 {n}개)",
         "json": "JSON 저장: {path}",
@@ -77,7 +85,7 @@ _MSG: dict[str, dict[str, str]] = {
         "error": "오류: {exc}",
         "unknown_sample": "오류: 알 수 없는 샘플 {bad}. 사용 가능: {names}",
         "no_series": "오류: 비교할 시계열이 없습니다 (파일 또는 --samples 지정).",
-        "save_failed": "오류: 파일을 저장할 수 없습니다 — {exc}",
+        "save_failed": "오류: {path} 파일을 저장할 수 없습니다 — {why}",
         "data_error": "데이터 오류: {exc}",
         "not_found": "파일 없음: {exc}",
         "interrupted": "중단되었습니다.",
@@ -93,6 +101,7 @@ _MSG: dict[str, dict[str, str]] = {
     },
     "en": {
         "synthetic": "※ Synthetic sample data — not real data.",
+        "synthetic_some": "※ {names}: synthetic sample data — not real data.",
         "rank_title": "■ Rising-trend ranking (rising score: outlook + recent momentum, 50 = neutral)",
         "rank_cols": "Exp. change",
         "rank_span": "Horizon",
@@ -111,6 +120,11 @@ _MSG: dict[str, dict[str, str]] = {
         "rank_undefined_prob": "Exp. change, P(up)",
         "narr_hidden": ("※ Several series: individual narratives are not printed — see the HTML (--html) / "
                         "JSON (--json) output or run one column at a time with --value-col."),
+        "narr_hidden_html": "※ Several series: individual narratives are not printed — they are in {pattern}.",
+        "narr_hidden_sample": ("※ Several series: individual narratives are not printed — see the HTML (--html) / "
+                               "JSON (--json) output or run one sample at a time with sample <name>."),
+        "narr_hidden_other": ("※ Several series: individual narratives are not printed — see the HTML (--html) / "
+                              "JSON (--json) output."),
         "html_one": "HTML report saved: {path}",
         "html_many": "HTML comparison saved: {path} (+ {n} individual reports)",
         "json": "JSON saved: {path}",
@@ -121,7 +135,7 @@ _MSG: dict[str, dict[str, str]] = {
         "error": "Error: {exc}",
         "unknown_sample": "Error: unknown sample {bad}. Available: {names}",
         "no_series": "Error: nothing to compare (give files or --samples).",
-        "save_failed": "Error: cannot save the file — {exc}",
+        "save_failed": "Error: cannot save {path} — {why}",
         "data_error": "Data error: {exc}",
         "not_found": "File not found: {exc}",
         "interrupted": "Interrupted.",
@@ -239,9 +253,13 @@ def _int_at_least(lo: int, what: str) -> Callable[[str], int]:
     return conv
 
 
+#: the default horizons of data.default_horizon, as --help states them
+_HORIZON_HELP = "예측 기간(기간 수, 1 이상). 기본: 일 30일·주 26주·월 12개월·분기 8분기·연 5년"
+
+
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--horizon", "-H", type=_int_at_least(1, "what_horizon"), default=None,
-                   help="예측 기간(주기 수, 1 이상). 기본: 약 1년/1주기")
+                   help=_HORIZON_HELP)
     p.add_argument("--freq", choices=FREQ_CHOICES, default=None,
                    help="데이터 주기 강제 지정 (D/W/M/Q/Y). 기본: 자동 감지")
     p.add_argument("--html", metavar="PATH", default=None, help="HTML 리포트 저장 경로")
@@ -447,6 +465,23 @@ def _slug(name: str) -> str:
 # --------------------------------------------------------------------------- core
 
 
+def _narr_hidden(args: argparse.Namespace) -> str:
+    """Where the individual narratives of several series are, for the command that was run: the
+    per-series pages when --html was given, ``sample <이름>`` for samples, --value-col only for files
+    (``sample`` / ``wiki`` / ``trends`` have no --value-col)."""
+    if getattr(args, "html", None):
+        out = Path(args.html)
+        return _t(args, "narr_hidden_html", pattern=str(out.parent / f"{out.with_suffix('').name}_<이름>.html"
+                                                        if getattr(args, "lang", "ko") != "en" else
+                                                        out.parent / f"{out.with_suffix('').name}_<name>.html"))
+    cmd = getattr(args, "command", "")
+    if cmd == "sample":
+        return _t(args, "narr_hidden_sample")
+    if cmd in ("analyze",) or (cmd == "compare" and getattr(args, "files", None)):
+        return _t(args, "narr_hidden")
+    return _t(args, "narr_hidden_other")
+
+
 def _print_report(report: TrendReport, quiet: bool, lang: str = "ko") -> None:
     from .report import render_text
 
@@ -454,8 +489,26 @@ def _print_report(report: TrendReport, quiet: bool, lang: str = "ko") -> None:
     _say(render_text(report, lang=lang))
     if not quiet:
         _say()
-        _say(report.narrative)
+        # on a terminal the Markdown marks are noise ("**한눈에 보기**", "## 과거: …"): plain text there;
+        # redirected to a file (or a pipe) the narrative stays Markdown, as in the JSON export
+        _say(_plain_markdown(report.narrative) if _stdout_is_tty() else report.narrative)
         _say()
+
+
+def _stdout_is_tty() -> bool:
+    try:
+        return bool(sys.stdout.isatty())
+    except (AttributeError, ValueError):   # closed / replaced stream
+        return False
+
+
+_MD_HEADING = re.compile(r"^#{1,6}\s+(.*)$", re.MULTILINE)
+_MD_BOLD = re.compile(r"\*\*(.+?)\*\*")
+
+
+def _plain_markdown(text: str) -> str:
+    """The narrative's Markdown as terminal text: ``## 과거: …`` -> ``■ 과거: …``, ``**상승**`` -> ``상승``."""
+    return _MD_BOLD.sub(r"\1", _MD_HEADING.sub(r"■ \1", str(text)))
 
 
 def _analyse(series: dict[str, pd.Series], args: argparse.Namespace) -> tuple[dict[str, TrendReport], int]:
@@ -496,16 +549,21 @@ def _emit(reports: dict[str, TrendReport], args: argparse.Namespace, fail_code: 
         if ranking["freq"].nunique() > 1:
             _say(_t(args, "mixed_freq"))
         if not args.quiet:
-            _say(_t(args, "narr_hidden"))
+            _say(_narr_hidden(args))
+    target = None
     try:
         # JSON first: it does not depend on the (much larger) HTML rendering, so a rendering
         # problem never costs the user the machine-readable result
         if args.json:
+            target = args.json
             out = _ensure_parent(args.json)
-            text = reports_to_json(reports.values()) if many else report_to_json(next(iter(reports.values())))
+            lang = getattr(args, "lang", "ko")
+            text = (reports_to_json(reports.values(), lang=lang) if many
+                    else report_to_json(next(iter(reports.values())), lang=lang))
             out.write_text(text, encoding="utf-8")
             _say(_t(args, "json", path=out))
         if args.html:
+            target = args.html
             out = _ensure_parent(args.html)
             if many:
                 slugs = _unique_slugs(list(reports))
@@ -522,9 +580,35 @@ def _emit(reports: dict[str, TrendReport], args: argparse.Namespace, fail_code: 
                 render_html(next(iter(reports.values())), path=out)
                 _say(_t(args, "html_one", path=out))
     except OSError as exc:
-        _err(_t(args, "save_failed", exc=exc))
+        _err(_t(args, "save_failed", path=target or getattr(exc, "filename", "") or "",
+                why=_os_error_text(exc, getattr(args, "lang", "ko"))))
         return 1
     return 0
+
+
+#: why a file could not be written, in the user's language (errno -> text); others fall back to
+#: the system's own message
+_OS_ERRORS = {
+    "ko": {errno.ENOENT: "저장할 폴더를 만들 수 없습니다", errno.EACCES: "쓰기 권한이 없습니다",
+           errno.EPERM: "쓰기 권한이 없습니다", errno.EROFS: "읽기 전용 위치입니다",
+           errno.ENOSPC: "디스크 공간이 부족합니다", errno.EISDIR: "같은 이름의 폴더가 있습니다",
+           errno.ENOTDIR: "경로 중간에 폴더가 아닌 파일이 있습니다"},
+    "en": {errno.ENOENT: "the folder cannot be created", errno.EACCES: "permission denied",
+           errno.EPERM: "permission denied", errno.EROFS: "the location is read-only",
+           errno.ENOSPC: "the disk is full", errno.EISDIR: "a folder of that name exists",
+           errno.ENOTDIR: "a part of the path is a file, not a folder"},
+}
+
+
+def _os_error_text(exc: OSError, lang: str = "ko") -> str:
+    """Why ``exc`` stopped a save, as a short localised clause (the path is named separately):
+    no raw "[Errno 2] No such file or directory: '/proc/nope'"."""
+    table = _OS_ERRORS["en" if lang == "en" else "ko"]
+    why = table.get(getattr(exc, "errno", None) or -1)
+    if why is None:
+        why = str(getattr(exc, "strerror", None) or exc)
+    where = getattr(exc, "filename", None)
+    return f"{why} ({where})" if where and lang == "en" else (f"{why}({where})" if where else why)
 
 
 def _load(path: str, date_col: Optional[str], value_cols: Optional[list[str]],
@@ -630,6 +714,8 @@ def cmd_compare(args: argparse.Namespace) -> int:
             series[key] = s
     for nm in sample_names:
         series[nm if nm not in series else f"sample:{nm}"] = sample(nm, freq=args.freq or "M")
+    if sample_names:   # built-in samples mixed in: say they are synthetic, as `sample` does
+        _say(_t(args, "synthetic_some", names=", ".join(sample_names)))
     if len(series) < 1:
         _err(_t(args, "no_series"))
         return 2
@@ -661,17 +747,77 @@ def cmd_ask(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- parser
 
 
+#: argparse's own messages in Korean (its error() text; the help titles and the usage prefix are set
+#: by _Parser / _HelpFormatter) -- the README promises Korean help, and "the following arguments are
+#: required: file" was the first thing a user saw.  With --lang en the originals are kept.
+_ARGPARSE_KO: tuple[tuple[re.Pattern, str], ...] = tuple((re.compile(p), r) for p, r in (
+    (r"^the following arguments are required: (.*)$", r"다음 인자가 필요합니다: \1"),
+    (r"^unrecognized arguments: (.*)$", r"알 수 없는 인자입니다: \1"),
+    (r"^one of the arguments (.*) is required$", r"다음 인자 중 하나가 필요합니다: \1"),
+    (r"^ambiguous option: (\S+) could match (.*)$", r"모호한 옵션 \1: \2 중 어느 것인지 알 수 없습니다"),
+    (r"^argument ([^:]+): invalid choice: (.*) \(choose from (.*)\)$", r"\1: 허용되지 않는 값 \2 (가능한 값: \3)"),
+    (r"^argument ([^:]+): expected one argument$", r"\1: 값이 하나 필요합니다"),
+    (r"^argument ([^:]+): expected at least one argument$", r"\1: 값이 하나 이상 필요합니다"),
+    (r"^argument ([^:]+): expected at most one argument$", r"\1: 값은 하나까지만 줄 수 있습니다"),
+    (r"^argument ([^:]+): invalid \S+ value: (.*)$", r"\1: 올바르지 않은 값 \2"),
+    (r"^argument ([^:]+): not allowed with argument (.*)$", r"\1: \2 인자와 함께 쓸 수 없습니다"),
+    (r"^argument ([^:]+): (.*)$", r"\1: \2"),
+))
+
+
+def _argparse_ko(message: str) -> str:
+    """argparse's English ``message`` in Korean (unknown messages are kept as they are)."""
+    own = re.match(r"^argument ([^:]+): (.*)$", message)
+    if own and any(name in own.group(2) for name in own.group(1).split("/")):
+        return own.group(2)   # our own type error already names the option ("관측치 수(--n): 8 이상 …")
+    for rx, rep in _ARGPARSE_KO:
+        if rx.match(message):
+            return rx.sub(rep, message)
+    return message
+
+
+class _HelpFormatter(argparse.HelpFormatter):
+    """Korean usage prefix (``사용법:``) unless the messages are English (``--lang en``)."""
+
+    def add_usage(self, usage, actions, groups, prefix=None):  # type: ignore[no-untyped-def]
+        if prefix is None and _LANG != "en":
+            prefix = "사용법: "
+        return super().add_usage(usage, actions, groups, prefix)
+
+
+class _Parser(argparse.ArgumentParser):
+    """``argparse.ArgumentParser`` with Korean help titles (``위치 인자`` / ``옵션``), ``-h`` help and
+    error messages (``trendai analyze: 오류: 다음 인자가 필요합니다: file``); English errors with
+    ``--lang en``.  Subcommand parsers are of this class too."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("formatter_class", _HelpFormatter)
+        kwargs["add_help"] = False
+        super().__init__(*args, **kwargs)
+        self._positionals.title = "위치 인자"
+        self._optionals.title = "옵션"
+        self.add_argument("-h", "--help", action="help", default=argparse.SUPPRESS,
+                          help="이 도움말을 보여 주고 끝냅니다")
+
+    def error(self, message: str) -> "NoReturn":  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        if _LANG == "en":
+            self.exit(2, f"{self.prog}: error: {message}\n")
+        self.exit(2, f"{self.prog}: 오류: {_argparse_ko(message)}\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The ``trendai`` argument parser (subcommands analyze, sample, list-samples, wiki, trends, compare, ask)."""
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog="trendai",
         description="과거→현재→미래: 시계열 트렌드를 분석하고 예측하는 AI",
     )
-    p.add_argument("--version", action="version", version=f"trendai {__version__}")
+    p.add_argument("--version", action="version", version=f"trendai {__version__}",
+                   help="버전을 보여 주고 끝냅니다")
     sub = p.add_subparsers(dest="command", metavar="COMMAND")
 
     a = sub.add_parser("analyze", help="CSV/TSV/Excel/JSON 파일의 시계열 분석·예측")
-    a.add_argument("file")
+    a.add_argument("file", help="분석할 파일 (CSV/TSV/TXT/Excel/JSON)")
     a.add_argument("--date-col", default=None, help="날짜 열 이름 (기본: 자동 감지)")
     a.add_argument("--value-col", action="append", default=None,
                    help="값 열 이름 (여러 번 지정 가능, 기본: 숫자 열 전체)")
@@ -679,9 +825,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_analyze)
 
     s = sub.add_parser("sample", help="내장 합성 샘플로 데모 실행 (all = 전체 비교)")
-    s.add_argument("name", nargs="?", default="emerging")
+    s.add_argument("name", nargs="?", default="emerging",
+                   help="샘플 이름 또는 all (기본 emerging; 목록은 list-samples)")
     s.add_argument("--n", type=_int_at_least(8, "what_n"), default=120, help="관측치 수 (8 이상)")
-    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--seed", type=int, default=0, help="합성 샘플의 난수 시드 (기본 0)")
     _add_common(s)
     s.set_defaults(func=cmd_sample)
 
@@ -693,34 +840,37 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--wiki-lang", default="ko", help="위키백과 언어 (ko, en, ...)")
     w.add_argument("--start", default=None, help="시작일 YYYY-MM-DD (기본 2016-01-01)")
     w.add_argument("--end", default=None, help="종료일 YYYY-MM-DD (기본: 지난달 말)")
-    w.add_argument("--granularity", choices=["monthly", "daily"], default="monthly")
+    w.add_argument("--granularity", choices=["monthly", "daily"], default="monthly",
+                   help="조회 단위: monthly(월별, 기본) 또는 daily(일별)")
     _add_common(w)
     w.set_defaults(func=cmd_wiki)
 
     t = sub.add_parser("trends", help="Google Trends 검색 관심도 (pytrends 필요)")
-    t.add_argument("keyword", nargs="+")
-    t.add_argument("--timeframe", default="today 5-y")
+    t.add_argument("keyword", nargs="+", help="검색어 (여러 개면 비교)")
+    t.add_argument("--timeframe", default="today 5-y", help="조회 기간 (pytrends 형식, 기본 'today 5-y')")
     t.add_argument("--geo", default="", help="국가 코드 (예: KR)")
     _add_common(t)
     t.set_defaults(func=cmd_trends)
 
     c = sub.add_parser("compare", help="여러 시계열을 분석해 상승 트렌드 순위 매기기")
-    c.add_argument("files", nargs="*")
+    c.add_argument("files", nargs="*", help="비교할 파일 (CSV/TSV/TXT/Excel/JSON, 여러 개 가능)")
     c.add_argument("--samples", default=None, help="쉼표로 구분한 내장 샘플 이름")
-    c.add_argument("--date-col", default=None)
-    c.add_argument("--value-col", action="append", default=None)
+    c.add_argument("--date-col", default=None, help="날짜 열 이름 (기본: 자동 감지)")
+    c.add_argument("--value-col", action="append", default=None,
+                   help="값 열 이름 (여러 번 지정 가능, 기본: 숫자 열 전체)")
     _add_common(c)
     c.set_defaults(func=cmd_compare)
 
     q = sub.add_parser("ask", help="분석 결과를 바탕으로 Claude에게 질문 (ANTHROPIC_API_KEY 필요)")
-    q.add_argument("file")
-    q.add_argument("question")
-    q.add_argument("--date-col", default=None)
-    q.add_argument("--value-col", action="append", default=None)
-    q.add_argument("--horizon", "-H", type=_int_at_least(1, "what_horizon"), default=None)
-    q.add_argument("--freq", choices=FREQ_CHOICES, default=None)
-    q.add_argument("--model", default="claude-opus-5-5")
-    q.add_argument("--lang", choices=["ko", "en"], default="ko")
+    q.add_argument("file", help="분석할 파일 (CSV/TSV/TXT/Excel/JSON)")
+    q.add_argument("question", help="질문 (따옴표로 감싸서)")
+    q.add_argument("--date-col", default=None, help="날짜 열 이름 (기본: 자동 감지)")
+    q.add_argument("--value-col", action="append", default=None, help="값 열 이름 (기본: 첫 번째 숫자 열)")
+    q.add_argument("--horizon", "-H", type=_int_at_least(1, "what_horizon"), default=None, help=_HORIZON_HELP)
+    q.add_argument("--freq", choices=FREQ_CHOICES, default=None,
+                   help="데이터 주기 강제 지정 (D/W/M/Q/Y). 기본: 자동 감지")
+    q.add_argument("--model", default="claude-opus-5-5", help="Claude 모델 ID")
+    q.add_argument("--lang", choices=["ko", "en"], default="ko", help="답변 언어")
     q.set_defaults(func=cmd_ask)
     return p
 

@@ -761,12 +761,21 @@ def _weekday_only(index: pd.DatetimeIndex) -> bool:
     return span >= 14
 
 
-def _report_regularisation(raw: pd.Series, out: pd.Series, freq: str, how: str) -> None:
-    """Tell the user when regularisation filled or merged a noticeable share of the data."""
-    alias = _alias_for(freq, raw.index)
-    counts = raw.resample(alias).count()
-    counts = counts.reindex(out.index, fill_value=0)
-    observed = int((counts > 0).sum())
+def _observed_periods(raw: pd.Series, out: pd.Series, freq: str) -> int:
+    """How many periods of the regular grid ``out`` hold at least one raw observation."""
+    counts = raw.resample(_alias_for(freq, raw.index)).count()
+    return int((counts.reindex(out.index, fill_value=0) > 0).sum())
+
+
+#: granularity order of the frequency codes (finer first): a --freq finer than the data's own
+#: frequency interpolates most of the grid (data.prepare's 'upsampled' warning)
+_FREQ_RANK = {"D": 0, "W": 1, "M": 2, "Q": 3, "Y": 4}
+
+
+def _report_regularisation(raw: pd.Series, out: pd.Series, freq: str, how: str, merges: bool = True) -> None:
+    """Tell the user when regularisation filled or merged a noticeable share of the data (``merges``:
+    also a merge of several values into one period -- not for an aggregation the user asked for)."""
+    observed = _observed_periods(raw, out, freq)
     filled = len(out) - observed
     merged = int(len(raw) - observed)
     name = _label(raw)
@@ -775,8 +784,9 @@ def _report_regularisation(raw: pd.Series, out: pd.Series, freq: str, how: str) 
     elif filled >= 3 and filled / max(len(out), 1) >= 0.2:
         _warn(msg("gaps_interpolated", name=name, unit=unit(freq), filled=filled, total=len(out),
                   share=filled / len(out), observed=observed))
-    if merged > 0 and merged / max(len(raw), 1) >= 0.05:
-        verb = L("평균", "averaged") if how == "mean" else L("합계", "summed")
+    if merges and merged > 0 and merged / max(len(raw), 1) >= 0.05:
+        # the particle goes with the word: 평균으로 / 합계로 (not "합계으로")
+        verb = L("평균으로", "averaged") if how == "mean" else L("합계로", "summed")
         _warn(msg("duplicates_merged", name=name, unit=unit(freq), how=verb, n_raw=len(raw),
                   observed=observed))
 
@@ -789,18 +799,40 @@ def prepare(series: pd.Series, freq: Optional[str] = None, name: Optional[str] =
     (1000..2200) or date strings as the index, and numbers or number strings
     (``'1,234'``) as values.  The frequency is inferred from every dated row,
     including rows whose value is missing (see :func:`_infer_freq_with_gaps`).
-    When the frequency is inferred, a :class:`DataWarning` reports
-    weekday-only data, large interpolated gaps or merged duplicate periods.
+    A :class:`DataWarning` reports weekday-only data, large interpolated gaps or
+    merged duplicate periods -- also when ``freq`` is given and is the data's own
+    frequency; a ``freq`` finer than the data's (monthly data as ``'W'``) is reported
+    as interpolation of most of the grid (``upsampled``: accuracy and probabilities
+    can look better than the data allow), and a coarser one (an aggregation that was
+    asked for) only for large gaps.
     """
     s, dates = _clean_with_dates(series)
     if len(s) < 2:
         raise DataError(msg("too_few_obs", name=_label(series), n=len(s)))
     inferred = freq is None
+    own: Optional[str] = None
     if freq is None:
         freq = _infer_freq_with_gaps(s.index, dates)
+    else:
+        try:   # the data's own frequency, to tell a forced finer grid (interpolation) from aggregation
+            own = _infer_freq_with_gaps(s.index, dates)
+        except (DataError, ValueError, TypeError):
+            own = None
     out = regularize(s, freq, how=how)
-    if inferred:
+    if inferred or own == freq:
         _report_regularisation(s, out, freq, how)
+    elif own is not None and _FREQ_RANK.get(str(freq), 0) < _FREQ_RANK.get(own, 0):
+        # --freq finer than the data (monthly data as weekly): most periods are interpolated, which makes
+        # the series smoother and its backtest look better than the data allow -- say so
+        observed = _observed_periods(s, out, freq)
+        filled = len(out) - observed
+        if filled > 0:
+            _warn(msg("upsampled", name=_label(s), own=unit(own), unit=unit(freq), filled=filled,
+                      total=len(out), share=filled / max(len(out), 1), observed=observed))
+    else:
+        # a coarser grid than the data's own (daily data as monthly): the aggregation was asked for --
+        # only a grid with many empty periods is reported
+        _report_regularisation(s, out, freq, how, merges=False)
     if name is not None:
         out.name = name
     elif out.name is None:
