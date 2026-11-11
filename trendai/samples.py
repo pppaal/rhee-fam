@@ -59,9 +59,10 @@ def sample(name: str, n: int = 120, freq: str = "M", start: str = "2016-01-01",
     Values are always positive.
     """
     if name not in DESCRIPTIONS:
-        raise KeyError(f"unknown sample {name!r}; choose from {list_samples()}")
-    if n < 8:
-        raise ValueError("n must be >= 8")
+        raise KeyError(f"알 수 없는 샘플 {name!r} (unknown sample); 사용 가능: {list_samples()}")
+    if isinstance(n, bool) or int(n) != n or n < 8:
+        raise ValueError(f"관측치 수 n은 8 이상의 정수여야 합니다 (n must be an integer >= 8): {n!r}")
+    n = int(n)
     rng = np.random.default_rng(seed + sum(map(ord, name)))
     t = np.arange(n, dtype=float)
     u = t / (n - 1)  # 0..1

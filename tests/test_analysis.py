@@ -744,3 +744,255 @@ def test_analyze_long_daily_series_fast():
     r = A.analyze(s, freq="D")
     assert time.perf_counter() - t0 < 3.0          # was ~6 s (quadratic Mann-Kendall)
     assert r.phase.label == "growing"
+
+
+# =========================================================================== fixer regressions (round 2)
+# Known issues A1-A4 and verifier findings; each test failed before the fix.
+
+MINUS = "−"
+
+
+def _ar1(n: int, phi: float, rng: np.random.Generator, marginal_sd: float = 5.0) -> np.ndarray:
+    e = rng.normal(0.0, marginal_sd * math.sqrt(max(1.0 - phi * phi, 1e-12)), n)
+    x = np.empty(n)
+    x[0] = rng.normal(0.0, marginal_sd)
+    for i in range(1, n):
+        x[i] = phi * x[i - 1] + e[i]
+    return x
+
+
+def test_short_nonnegative_series_keep_a_nonnegative_trend():
+    # A1: the edge extrapolation of a short fad ended at -1.03 (last value 8.29),
+    # giving a total/recent change of -123%
+    s = samples.sample("fad", n=10, freq="M", seed=0)
+    r = A.analyze(s, freq="M")
+    tr = r.decomposition.trend.to_numpy()
+    assert tr.min() >= 0.0
+    assert tr[-1] >= 0.5 * float(s.iloc[-3:].min())          # inside the data at the edge
+    assert r.metrics.total_change_pct is not None and r.metrics.total_change_pct > -100.0
+    np.testing.assert_allclose((r.decomposition.trend + r.decomposition.seasonal
+                                + r.decomposition.resid).to_numpy(), s.to_numpy(), atol=1e-9)
+    neg = 0
+    for seed in range(5):
+        for n in (8, 9, 10, 12, 16):
+            for freq in ("M", "Q", "Y"):
+                d = A.analyze(samples.sample("fad", n=n, freq=freq, seed=seed), freq=freq).decomposition
+                neg += int(d.trend.min() < 0)
+    assert neg == 0
+
+
+def test_reasons_use_typographic_minus_and_narrative_number_format():
+    # A2 + finding 6: "-42.3%" (ASCII hyphen), "tau=0.95, p=2.2e-53", "변동계수" that
+    # differed from the KPI's 변동계수, "고점을 형성" for a peak at the last point
+    seen_minus = False
+    for name in ("fad", "declining", "growing", "volatile", "peaking", "emerging"):
+        ph = A.analyze(samples.sample(name, seed=0)).phase
+        for sentence in ph.reasons:
+            assert not re.search(r"(?<![\w])-\d", sentence), sentence
+            assert "tau=" not in sentence and "p=" not in sentence, sentence
+            assert "변동계수" not in sentence, sentence
+            seen_minus |= MINUS in sentence
+    assert seen_minus
+    growing = " ".join(A.analyze(samples.sample("growing", seed=0)).phase.reasons)
+    assert "τ = 0.9" in growing and "p < 0.001" in growing
+    # a trend whose maximum is the latest point has not "formed" a peak yet
+    for seed in range(5):
+        r = A.analyze(samples.sample("peaking", seed=seed))
+        if int(np.argmax(r.decomposition.trend.to_numpy())) == len(r.series) - 1:
+            assert not any("고점을 형성" in x for x in r.phase.reasons), r.phase.reasons
+
+
+@pytest.mark.parametrize("freq,n", [("M", 120), ("D", 400)])
+def test_flat_ar1_noise_is_not_a_trend(freq, n):
+    # A3: flat series with AR(1) phi=0.7 noise got growing/declining labels in ~1/4
+    # of the cases (and MK p < 0.05 in ~40%): no correction for serial correlation
+    labels, sig = [], 0
+    idx = pd.date_range("2015-01-01", periods=n, freq={"M": "MS", "D": "D"}[freq])
+    for seed in range(20):
+        y = 100 + _ar1(n, 0.7, np.random.default_rng(seed))
+        r = A.analyze(pd.Series(y, index=idx), freq=freq)
+        labels.append(r.phase.label)
+        sig += r.metrics.mk_pvalue < 0.05
+    assert sum(lb not in ("stable", "volatile") for lb in labels) <= 1, labels
+    assert sig <= 4
+
+
+def test_white_noise_gets_little_seasonality():
+    # A4: noise-only seasonal patterns (James-Stein (p-3)/p shrinkage is weak for
+    # p = 4 and for 2-3 cycles)
+    for freq, n, max_frac in (("M", 120, 0.0), ("M", 36, 0.15), ("Q", 40, 0.05)):
+        ss = []
+        for seed in range(20):
+            y = np.random.default_rng(seed).normal(100, 10, n)
+            idx = pd.date_range("2010-01-01", periods=n, freq={"M": "MS", "Q": "QS"}[freq])
+            ss.append(A.analyze(pd.Series(y, index=idx), freq=freq).metrics.seasonal_strength)
+        assert np.mean(np.array(ss) >= 0.3) <= max_frac, (freq, n, np.round(ss, 2))
+
+
+def test_random_walk_is_not_a_confident_trend():
+    # finding 1: driftless geometric random walks got MK p ~ 1e-60 in 29/30 runs,
+    # exactly 5 (= the cap) changepoints each and growing/declining/peaking at ~0.8
+    labels, conf, ncp, sig = [], [], [], 0
+    idx = pd.date_range("2023-01-01", periods=730, freq="D")
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        y = 100 * np.exp(np.cumsum(rng.normal(0, 0.018, 730)))
+        r = A.analyze(pd.Series(y, index=idx))
+        labels.append(r.phase.label)
+        conf.append(r.phase.confidence)
+        ncp.append(len(r.changepoints))
+        sig += r.metrics.mk_pvalue < 0.05
+    assert sig <= 4
+    assert np.median(ncp) <= 1 and max(ncp) <= 4, ncp
+    assert sum(lb in ("volatile", "stable") for lb in labels) >= 14, labels
+    assert np.mean(conf) < 0.6
+    walk = [x for x in A.analyze(pd.Series(100 * np.exp(np.cumsum(
+        np.random.default_rng(0).normal(0, 0.018, 730))), index=idx)).phase.reasons]
+    assert any("무작위 행보" in x for x in walk), walk
+
+
+def test_serial_dependence_helpers():
+    # exact AR(1) slope variance (incl. the random-walk limit) vs. brute force
+    h = 25
+    x = np.arange(h) - (h - 1) / 2
+    for phi in (0.0, 0.6, 1.0):
+        if phi < 1:
+            g = phi ** np.abs(np.subtract.outer(np.arange(h), np.arange(h))) / (1 - phi ** 2)
+        else:
+            g = np.minimum.outer(np.arange(1, h + 1), np.arange(1, h + 1)).astype(float)
+        brute = x @ g @ x / np.sum(x * x) ** 2
+        assert A._ols_slope_var(h, phi, 1.0) == pytest.approx(brute, rel=1e-10)
+    assert A._mk_variance_ratio(0.0, 100) == 1.0
+    assert A._mk_variance_ratio(1.0, 100) == pytest.approx(1 + 2 * np.sum(
+        (100 - np.arange(1, 98)) * (99 - np.arange(1, 98)) * (98 - np.arange(1, 98))) / (100 * 99 * 98))
+    y = np.random.default_rng(3).normal(size=150)
+    assert A._trend_test(y, 0.0) == A.mann_kendall(y)
+    walks = [A._noise_model(np.cumsum(np.random.default_rng(k).normal(size=500)), 1)[0]
+             for k in range(1, 6)]
+    assert np.median(walks) > 0.95 and min(walks) > 0.75        # ~ unit root
+    assert A._noise_model(np.random.default_rng(2).normal(size=500), 1)[0] == 0.0
+    ars = [A._noise_model(_ar1(500, 0.6, np.random.default_rng(k)), 1)[0] for k in range(4, 9)]
+    assert 0.45 < np.median(ars) < 0.75
+
+
+def test_multiplicative_seasonality_is_decomposed_in_log_space():
+    # finding 2: (a) a decaying product with +-20% seasonality got a trend that
+    # rose over the last 5 months (+15..+72% end bias, recent change -12% vs. a true
+    # -26%); (b) every December of growing retail sales was flagged as an anomaly
+    idx = pd.date_range("2018-01-01", periods=84, freq="MS")
+    t = np.arange(84)
+    rng = np.random.default_rng(0)
+    lvl = 5000 * np.exp(-0.025 * t)
+    y = lvl * (1 + 0.2 * np.sin(2 * np.pi * (np.asarray(idx.month) - 3) / 12)) * np.exp(rng.normal(0, 0.05, 84))
+    s = pd.Series(y, index=idx)
+    r = A.analyze(s)
+    d = r.decomposition
+    tr = d.trend.to_numpy()
+    assert A._is_multiplicative(d)
+    np.testing.assert_allclose((d.trend + d.seasonal + d.resid).to_numpy(), y, rtol=0, atol=1e-9 * y.max())
+    assert np.all(np.diff(tr[-6:]) < 0)                         # still falling at the end
+    assert abs(tr[-1] / lvl[-1] - 1) < 0.08
+    assert r.metrics.recent_change_pct == pytest.approx((math.exp(-0.3) - 1) * 100, abs=5)
+    assert not any(c.kind == "level_shift" for c in r.changepoints)
+    idx2 = pd.date_range("2017-01-01", periods=96, freq="MS")
+    seas = np.array([.85, .82, .95, .97, 1, .98, .99, 1.02, .98, 1.03, 1.15, 1.65])[np.asarray(idx2.month) - 1]
+    dec_flagged = 0
+    for seed in range(15):
+        y2 = 1000 * 1.06 ** (np.arange(96) / 12) * seas * np.exp(np.random.default_rng(seed).normal(0, 0.025, 96))
+        an = A.analyze(pd.Series(y2, index=idx2)).anomalies
+        dec_flagged += any(x.date.month == 12 for x in an)
+    assert dec_flagged <= 3
+    # additive samples stay additive (exactly periodic seasonal component)
+    assert not A._is_multiplicative(A.decompose(samples.sample("growing", seed=0), 12))
+    assert not A._is_multiplicative(A.decompose(samples.sample("seasonal", seed=0), 12))
+
+
+def test_metrics_are_robust_to_flagged_spikes():
+    # finding 3: four one-day spikes turned a clear weekday pattern into "almost no
+    # seasonality" (0.60 -> 0.04), volatility 11% -> 63% and a -88% drawdown
+    idx = pd.date_range("2022-01-01", "2024-12-31", freq="D")
+    n, t = len(idx), np.arange(len(idx))
+    dow = np.array([.10, .12, .11, .08, 0, -.25, -.20])[np.asarray(idx.dayofweek)]
+    for seed in range(2):
+        rng = np.random.default_rng(seed)
+        ar = np.zeros(n)
+        e = rng.normal(0, 0.08, n)
+        for i in range(1, n):
+            ar[i] = 0.7 * ar[i - 1] + e[i]
+        clean = np.exp(np.log(2000) + 0.35 * t / n + dow + ar)
+        spiky = clean.copy()
+        spiky[[200, 480, 700, 950]] *= [12, 6, 20, 8]
+        mc = A.analyze(pd.Series(clean, index=idx)).metrics
+        ra = A.analyze(pd.Series(spiky, index=idx))
+        ms = ra.metrics
+        assert {200, 480, 700, 950} <= {a.index for a in ra.anomalies}
+        assert ms.seasonal_strength > 0.8 * mc.seasonal_strength > 0.3
+        assert ms.volatility < 1.3 * mc.volatility
+        assert ms.trend_strength > 0.7 * mc.trend_strength
+        assert ms.drawdown_pct > mc.drawdown_pct - 10
+        assert ms.peak_date not in {idx[i] for i in (200, 480, 700, 950)}
+
+
+def test_level_shift_has_no_neighbouring_anomalies_and_is_stable_after():
+    # finding 4: the smoother pre-empted the step, so ~3 points next to it were
+    # flagged as "temporary spikes/dips" (30/30 seeds) and the flat series was
+    # called growing/peaking
+    near, labels = 0, []
+    idx = pd.date_range("2021-01-03", periods=156, freq="W-SUN")
+    for seed in range(10):
+        y = 200 + np.random.default_rng(seed).normal(0, 6, 156)
+        y[100:] += 60
+        r = A.analyze(pd.Series(y, index=idx))
+        assert any(c.kind == "level_shift" and abs(c.index - 100) <= 2 for c in r.changepoints)
+        near += sum(98 <= a.index <= 102 for a in r.anomalies)
+        labels.append(r.phase.label)
+        tr = r.decomposition.trend.to_numpy()
+        assert tr[101] - tr[98] > 45                              # the trend jumps
+    assert near <= 1
+    assert labels.count("stable") >= 9, labels
+    reasons = " ".join(r.phase.reasons)
+    assert "수준이 한 단계 높아졌습니다" in reasons and "안정" in reasons
+    # annual, GDP-like: a permanent drop must not make the year before a "spike"
+    idx_y = pd.date_range("1980-01-01", periods=44, freq="YS")
+    flagged = 0
+    for seed in range(6):
+        rng = np.random.default_rng(seed)
+        g = 100 * np.exp(0.025 * np.arange(44) + rng.normal(0, 0.006, 44))
+        g[28:] *= 0.92
+        flagged += sum(26 <= a.index <= 29 for a in A.analyze(pd.Series(g, index=idx_y), freq="Y").anomalies)
+    assert flagged <= 2                                       # was 2 per series
+
+
+def test_decompose_breaks_argument_lets_the_trend_jump():
+    rng = np.random.default_rng(0)
+    y = np.r_[np.full(60, 10.0), np.full(60, 30.0)] + rng.normal(0, 1, 120)
+    s = from_values(y)
+    smooth, piecewise = A.decompose(s, 1), A.decompose(s, 1, breaks=[60])
+    np.testing.assert_allclose((piecewise.trend + piecewise.resid).to_numpy(), y, atol=1e-9)
+    assert piecewise.trend.iloc[60] - piecewise.trend.iloc[59] > 17
+    assert np.abs(piecewise.resid.to_numpy()[55:65]).max() < np.abs(smooth.resid.to_numpy()[55:65]).max()
+    # a "level shift" found on a smooth curve does not get a jump (see finding 2)
+    assert A.decompose(s, 1, breaks=None).trend.equals(smooth.trend)
+
+
+def test_noisy_series_edges_do_not_drive_growth_numbers():
+    # finding 5: the one-sided edge fit copied edge noise -> total change +128.6% on
+    # pure noise (Q, seed 1), recent change +28% / momentum +2.4 while the last 12
+    # months were 13% below the previous 12 (M, seed 4)
+    m = A.analyze(samples.sample("volatile", n=40, freq="Q", seed=1), freq="Q").metrics
+    assert abs(m.total_change_pct) < 70
+    m = A.analyze(samples.sample("volatile", seed=4)).metrics
+    assert m.recent_change_pct < 20 and m.momentum < 2.0
+    for freq, n, tot_max, rec_max in (("M", 120, 30, 20), ("W", 156, 30, 25)):
+        tot, rec = [], []
+        for seed in range(10):
+            mm = A.analyze(samples.sample("volatile", n=n, freq=freq, seed=seed), freq=freq).metrics
+            tot.append(abs(mm.total_change_pct))
+            rec.append(abs(mm.recent_change_pct))
+        assert max(tot) < tot_max and max(rec) < rec_max, (freq, np.round(tot), np.round(rec))
+    # one-sided edge variance: ~1/3 lower than the plain local-linear end point
+    errs = []
+    for seed in range(100):
+        y = 50 + 0.1 * np.arange(120) + np.random.default_rng(seed).normal(0, 5, 120)
+        errs.append(A.decompose(from_values(y), 1).trend.iloc[-1] - (50 + 0.1 * 119))
+    assert np.std(errs) < 2.4                                 # was ~3.0 (sd of the noise: 5)

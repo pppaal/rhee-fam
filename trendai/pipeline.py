@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import math
 from typing import Any, Iterable, Mapping, Optional
@@ -15,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from .analysis import analyze
-from .data import prepare
+from .data import DataError, prepare
 from .forecast import auto_forecast, compute_outlook
 from .narrative import generate_narrative
 from .types import PHASE_KO, TrendReport
@@ -42,7 +43,20 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
     use_llm:
         Ask Claude to write the interpretation (falls back to the rule-based
         narrative when the SDK/credentials are unavailable).
+
+    Raises :class:`trendai.data.DataError` (Korean message) when the input
+    cannot be used (no date index, fewer than 2 observations, ``horizon < 1``).
+    Data issues that were worked around (interpolated gaps, weekday-only data,
+    unreadable values) are reported as :class:`trendai.data.DataWarning`.
     """
+    if horizon is not None:
+        try:
+            h_int = int(horizon)
+        except (TypeError, ValueError):
+            raise DataError(f"예측 기간(horizon)은 정수여야 합니다: {horizon!r}") from None
+        if h_int != horizon or h_int < 1:
+            raise DataError(f"예측 기간(horizon)은 1 이상의 정수여야 합니다: {horizon!r}")
+        horizon = h_int
     s, f = prepare(series, freq=freq, name=name)
     display_name = str(name if name is not None else (s.name if s.name is not None else "series"))
     analysis = analyze(s, freq=f, name=display_name)
@@ -55,11 +69,18 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
                        narrative=text, narrative_source=source)
 
 
-def run_many(series_map: Mapping[str, pd.Series], **kwargs: Any) -> dict[str, TrendReport]:
+class SeriesFailedWarning(UserWarning):
+    """A series in :func:`run_many` could not be analysed and was skipped."""
+
+
+def run_many(series_map: Mapping[str, pd.Series], errors: Optional[dict[str, Exception]] = None,
+             **kwargs: Any) -> dict[str, TrendReport]:
     """Run :func:`run` for every series in ``series_map`` (name -> series).
 
-    Series that fail (e.g. too short) are skipped with a warning instead of
-    aborting the whole batch.
+    Series that fail (e.g. too short) are skipped with a
+    :class:`SeriesFailedWarning` instead of aborting the whole batch.  Pass a
+    dict as ``errors`` to also receive ``{name: exception}`` for the skipped
+    series.  Keyword arguments are forwarded to :func:`run`.
     """
     import warnings
 
@@ -68,7 +89,13 @@ def run_many(series_map: Mapping[str, pd.Series], **kwargs: Any) -> dict[str, Tr
         try:
             out[nm] = run(s, name=nm, **kwargs)
         except Exception as exc:  # noqa: BLE001 - batch mode must keep going
-            warnings.warn(f"{nm}: 분석 실패 ({type(exc).__name__}: {exc})", stacklevel=2)
+            if errors is not None:
+                errors[str(nm)] = exc
+            detail = str(exc) if isinstance(exc, DataError) else f"{type(exc).__name__}: {exc}"
+            prefix = f"'{nm}': "
+            if detail.startswith(prefix):
+                detail = detail[len(prefix):]
+            warnings.warn(f"'{nm}' 분석 실패 — {detail}", SeriesFailedWarning, stacklevel=2)
     return out
 
 
@@ -79,9 +106,11 @@ def _clean(obj: Any) -> Any:
     """Recursively convert numpy/pandas objects into JSON-serialisable values."""
     if isinstance(obj, dict):
         return {str(k): _clean(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, (list, tuple, np.ndarray)):
         return [_clean(v) for v in obj]
-    if isinstance(obj, (pd.Timestamp,)):
+    if obj is None or obj is pd.NaT:
+        return None
+    if isinstance(obj, (pd.Timestamp, _dt.date)):
         return obj.strftime("%Y-%m-%d")
     if isinstance(obj, (np.integer,)):
         return int(obj)
@@ -123,6 +152,7 @@ def report_to_dict(report: TrendReport) -> dict[str, Any]:
             "levels": list(fc.levels),
             "method": fc.method,
             "backtest_mase": fc.backtest_mase,
+            "skill": getattr(fc, "skill", None),
             "nonnegative": fc.nonnegative,
             "table": forecast_rows,
             "models": [ms.__dict__ for ms in fc.model_scores],
@@ -135,8 +165,10 @@ def report_to_dict(report: TrendReport) -> dict[str, Any]:
 
 
 def report_to_json(report: TrendReport, indent: int = 2) -> str:
+    """:func:`report_to_dict` as a UTF-8-friendly JSON string (NaN/inf become ``null``)."""
     return json.dumps(report_to_dict(report), ensure_ascii=False, indent=indent)
 
 
 def reports_to_json(reports: Iterable[TrendReport], indent: int = 2) -> str:
+    """A JSON array of :func:`report_to_dict` for several reports."""
     return json.dumps([report_to_dict(r) for r in reports], ensure_ascii=False, indent=indent)

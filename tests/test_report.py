@@ -89,8 +89,8 @@ def build_report(values, freq: str = "M", start: str = "2020-01-01", horizon: in
 class _TagBalance(HTMLParser):
     """Counts open/close tags for a few structural elements."""
 
-    TAGS = {"div", "section", "table", "tr", "td", "th", "ul", "li", "header", "main", "svg", "g", "span",
-            "article", "dl", "p", "h1", "h2", "h3"}
+    TAGS = {"div", "section", "table", "tr", "td", "th", "ul", "ol", "li", "header", "main", "svg", "g", "span",
+            "article", "dl", "p", "h1", "h2", "h3", "h4", "em", "strong", "code", "abbr"}
 
     def __init__(self) -> None:
         super().__init__()
@@ -765,3 +765,266 @@ def test_svg_extreme_sizes(fake_report, w, h):
     ET.fromstring(svg)
     vb = re.search(r'viewBox="0 0 (\d+) (\d+)"', svg)
     assert int(vb.group(1)) >= 240 and int(vb.group(2)) >= 160
+
+
+# --------------------------------------------------------------------------- fixer round 2 regressions
+
+
+import html as _html
+
+_LBL_RE = re.compile(r'<text class="tai-lbl[^"]*" x="([\d.]+)" y="([\d.]+)" font-size="([\d.]+)" '
+                     r'text-anchor="(\w+)">([^<]+)</text>')
+
+
+def _label_boxes(svg: str) -> list[tuple[str, float, float, float]]:
+    """(text, x0, x1, baseline y) of every top label of a chart."""
+    out = []
+    for x, y, fs, anchor, txt in _LBL_RE.findall(svg):
+        txt = _html.unescape(txt)
+        x, fs = float(x), float(fs)
+        w = R._text_width(txt, fs)
+        x0 = x if anchor == "start" else (x - w if anchor == "end" else x - w / 2)
+        out.append((txt, x0, x0 + w, float(y)))
+    return out
+
+
+def _vertical_lines(svg: str) -> list[float]:
+    """x of every changepoint line and of the "현재" divider (legend swatches use a lowercase ``v``)."""
+    xs_ = [float(v) for v in re.findall(r'class="tai-cp" d="M([\d.]+),[\d.]+V', svg)]
+    return xs_ + [float(v) for v in re.findall(r'class="tai-now" d="M([\d.]+),', svg)]
+
+
+def _with_changepoints(rep: TrendReport, idx: list[int], kinds: list[str] | None = None) -> TrendReport:
+    s = rep.analysis.series
+    kinds = kinds or ["acceleration"] * len(idx)
+    rep.analysis.changepoints = [
+        Changepoint(date=s.index[k], index=k, slope_before=0.2, slope_after=0.9, kind=kd, magnitude=0.5)
+        for k, kd in zip(idx, kinds)]
+    return rep
+
+
+def test_markdown_nested_and_ordered_lists_and_emphasis():
+    out = R._markdown_lite("- 구조 변화가 2번 감지되었습니다:\n  - **2022-04** 가속\n  - **2023-10** 가속\n- 끝")
+    assert out == ("<ul><li>구조 변화가 2번 감지되었습니다:<ul><li><strong>2022-04</strong> 가속</li>"
+                   "<li><strong>2023-10</strong> 가속</li></ul></li><li>끝</li></ul>")
+    # a lead-in line ending with ':' followed by an indented list; numbered items -> <ol>
+    out = R._markdown_lite("요약:\n  - a\n  - b\n\n1. 첫째\n2. 둘째\n\n*강조*입니다, a*b*c, 2 * 3, `holt_damped`")
+    assert out.startswith("<p>요약:</p><ul><li>a</li><li>b</li></ul><ol><li>첫째</li><li>둘째</li></ol>")
+    assert "<em>강조</em>입니다" in out and "a*b*c" in out and "2 * 3" in out
+    assert "<code>holt_damped</code>" in out
+    assert R._markdown_lite("3. x\n4. y").startswith('<ol start="3">')
+    # three levels deep, dedent back to the middle and to the top; tabs count as 4 spaces
+    out = R._markdown_lite("- a\n  - b\n    - c\n  - d\n- e\n\t- f")
+    assert out == ("<ul><li>a<ul><li>b<ul><li>c</li></ul></li><li>d</li></ul></li>"
+                   "<li>e<ul><li>f</li></ul></li></ul>")
+    # an indented continuation line stays in its item
+    assert R._markdown_lite("- 첫 줄\n  이어지는 줄") == "<ul><li>첫 줄 이어지는 줄</li></ul>"
+    # still escaped first: nested items, emphasis and code cannot inject markup
+    evil = R._markdown_lite("- x\n  - *<img src=x onerror=alert(1)>*\n  1. `<script>alert(2)</script>`")
+    assert "<img" not in evil and "<script" not in evil
+    assert "<em>&lt;img src=x onerror=alert(1)&gt;</em>" in evil
+    assert "<code>&lt;script&gt;alert(2)&lt;/script&gt;</code>" in evil
+    for txt in ("- a\n    - b\n  - c\n- d", "1. a\n   - b\n2. c", "  - x\n- y\n\n## h\n- z\n  - w"):
+        _assert_balanced(R._markdown_lite(txt))
+
+
+def test_narrative_nested_bullets_rendered_in_page(fake_report):
+    fake_report.narrative = "## 과거\n- 변곡점 2개:\n  - **2022-04** 성장 가속\n  - **2023-10** 하락 가속\n1. 하나"
+    html_text = R.render_html(fake_report)
+    assert "<li>변곡점 2개:<ul><li><strong>2022-04</strong> 성장 가속</li>" in html_text
+    assert "<ol><li>하나</li></ol>" in html_text
+    _assert_balanced(html_text)
+
+
+def test_skill_shown_in_outlook_leaderboard_and_text(fake_report):
+    fake_report.forecast.skill = 0.65
+    fake_report.forecast.backtest_mase = 1.36     # multi-step MASE above 1 although it beats naive
+    html_text = R.render_html(fake_report)
+    assert "계절 단순 예측과 비슷하거나 부정확" not in html_text
+    # outlook card fact with an explanatory tooltip
+    m = re.search(r'<dt><abbr title="([^"]+)">단순 예측 대비 오차</abbr></dt><dd class="pos">−35%</dd>', html_text)
+    assert m and "단순 기준 예측" in m.group(1)
+    # leaderboard headline: skill first, MASE only as a technical note
+    assert '<strong class="pos">−35%</strong>' in html_text
+    assert "가장 나은 단순 기준 예측보다 약 35% 작습니다" in html_text
+    assert "백테스트 MASE 1.36" in html_text and "1을 넘기 쉬우므로" in html_text
+    # per-model error versus the best naive row (holt_damped MAE 2.0 vs naive 6.0)
+    row = re.search(r"holt_<wbr>damped</span>.*?</tr>", html_text).group(0)
+    assert "−67%" in row
+    naive_row = re.search(r'<span class="mname">naive</span>.*?</tr>', html_text).group(0)
+    assert "기준" in naive_row
+    text = R.render_text(fake_report, width=100)
+    assert "단순 예측 대비 오차 −35%" in text and "MASE 1.36" in text
+    # worse than naive
+    fake_report.forecast.skill = 1.3
+    html_text = R.render_html(fake_report)
+    assert '<dd class="neg">+30%</dd>' in html_text and "낫지 않았습니다" in html_text
+
+
+def test_skill_missing_shows_dash(fake_report):
+    fake_report.forecast.skill = None
+    html_text = R.render_html(fake_report)
+    assert re.search(r"단순 예측 대비 오차</abbr></dt><dd>—</dd>", html_text)
+    assert "비교한 결과가 없어" in html_text
+    assert "단순 예측 대비 오차 —" in R.render_text(fake_report, width=100)
+    _numbers_ok(html_text)
+    fake_report.forecast.skill = float("nan")  # non-finite is treated like None
+    assert re.search(r"단순 예측 대비 오차</abbr></dt><dd>—</dd>", R.render_html(fake_report))
+
+
+def test_compare_momentum_has_unit():
+    reports = [make_fake_report(), build_report(np.linspace(50, 20, 36), name="주간", freq="W", phase="declining")]
+    html_text = R.render_compare_html(reports, _ranking(reports))
+    assert "모멘텀 (%p/기간)" in html_text
+    assert "+1.50</span><span class=unit>%p/월</span>" in html_text      # monthly report
+    assert "+0.50</span><span class=unit>%p/주</span>" in html_text      # weekly report
+    # a ranking row without a matching report still shows the percentage-point unit
+    rk = pd.DataFrame([{"name": "unknown", "momentum": 2.0, "score": 50.0}])
+    assert "+2.00</span><span class=unit>%p</span>" in R.render_compare_html([], rk)
+
+
+def _spiky_report(spike: float, n: int = 200) -> TrendReport:
+    base = 100 + 10 * np.sin(np.arange(n) * 2 * np.pi / 7)
+    vals = base.copy()
+    spikes = {50: spike, 51: spike * 0.4, 120: spike * 0.75, n - 1: 140.0}  # the last point is flagged too
+    for i, v in spikes.items():
+        vals[i] = v
+    rep = build_report(vals, freq="D", horizon=14, slope=0.0)
+    s = rep.analysis.series
+    # a robust decomposition's trend does not follow one-day spikes
+    rep.analysis.decomposition.trend = pd.Series(np.full(n, 100.0), index=s.index)
+    rep.analysis.anomalies = [Anomaly(date=s.index[i], index=i, value=float(vals[i]), expected=100.0,
+                                      zscore=9.0) for i in spikes]
+    _set_forecast(rep, np.full(14, 105.0), np.linspace(8, 20, 14))
+    return rep
+
+
+def test_flagged_spikes_do_not_squash_the_axis():
+    rep = _spiky_report(2000.0)
+    svg = R.svg_chart(rep)
+    vals = [_tick_value(lab) for _, lab in _y_ticks(svg)]
+    assert vals[-1] <= 200, vals          # was 0..2,000: the level and the forecast used <10% of the plot
+    d = R._ChartData(rep)
+    lo, hi = d.y_extent()
+    normal = d.hist_y[~d.anom_mask]
+    assert normal.min() >= lo and normal.max() <= hi       # every unflagged observation stays visible
+    assert lo <= d.last_y <= hi                            # the last observation (flagged) is kept too
+    # out-of-range spikes: an edge marker with a value label each (the 2-day spike is one group)
+    assert svg.count('class="tai-spike"') == 2
+    labels = [t for t, *_ in _label_boxes(svg)]
+    assert "2,000" in labels and "1,500" in labels
+    assert "축 범위 밖" in svg                               # tooltip says why it sits on the edge
+    assert "축 범위를 크게 벗어난 이상치" in R.render_html(rep)
+    ET.fromstring(svg)
+    for w, h in ((600, 360), (380, 340)):
+        ET.fromstring(R.svg_chart(rep, w, h))
+
+
+def test_moderate_anomalies_stay_inside_the_axis():
+    rep = _spiky_report(135.0)
+    svg = R.svg_chart(rep)
+    assert 'class="tai-spike"' not in svg and svg.count('class="tai-anom"') >= 4  # rings (legend has one)
+    vals = [_tick_value(lab) for _, lab in _y_ticks(svg)]
+    assert vals[-1] >= 140
+    assert "축 범위를 크게 벗어난" not in R.render_html(rep)
+
+
+def test_changepoint_labels_are_never_crossed_by_vertical_lines():
+    rng = np.random.default_rng(7)
+    checked = 0
+    for trial in range(40):
+        n = int(rng.integers(40, 160))
+        freq = ["M", "W", "D", "Q"][trial % 4]
+        k = int(rng.integers(2, 8))
+        idx = sorted(set(int(i) for i in rng.integers(2, n - 1, size=k)))
+        rep = _with_changepoints(build_report(np.linspace(10, 30, n) + rng.normal(0, 1, n), freq=freq,
+                                              horizon=int(rng.integers(3, 30)), slope=0.2), idx)
+        for w, h in ((960, 380), (600, 360), (380, 340)):
+            svg = R.svg_chart(rep, w, h)
+            lines = _vertical_lines(svg)
+            boxes = _label_boxes(svg)
+            assert [b[0] for b in boxes].count("현재") == 1
+            for txt, x0, x1, _y in boxes:
+                assert 0 <= x0 and x1 <= w, (txt, x0, x1, w)
+                if txt != "현재":   # "현재" may only be crossed when boxed in on both sides
+                    assert not [x for x in lines if x0 + 1 < x < x1 - 1], (trial, w, txt, x0, x1, lines)
+            for i, a in enumerate(boxes):           # labels in the same row never overlap
+                for b in boxes[i + 1:]:
+                    if a[3] == b[3]:
+                        assert a[2] <= b[1] or b[2] <= a[1], (a, b)
+            # every changepoint line carries its number (the key to the HTML table)
+            nums = re.findall(r'class="tai-cpn"[^>]*>(\d+)</text>', svg)
+            assert nums == [str(i) for i in range(1, len(idx) + 1)]
+            checked += 1
+    assert checked == 120
+
+
+def test_compact_chart_labels_from_verifier_repro():
+    """fad-like monthly series with 5 breaks 1-2 years apart, rendered at phone width."""
+    rep = _with_changepoints(build_report(np.linspace(10, 90, 120), slope=0.5), [28, 46, 63, 75, 95])
+    svg = R.svg_chart(rep, 380, 340)
+    lines = _vertical_lines(svg)
+    for txt, x0, x1, _ in _label_boxes(svg):
+        assert not [x for x in lines if x0 + 1 < x < x1 - 1], (txt, x0, x1, lines)
+    assert re.findall(r'class="tai-cpn"[^>]*>(\d+)</text>', svg) == ["1", "2", "3", "4", "5"]
+    html_text = R.render_html(rep)
+    assert all(f'<span class="cpn" aria-label="변곡점 {i}">{i}</span>' in html_text for i in range(1, 6))
+    # the "현재" label moves to the free side instead of being struck by a break just left of it
+    rep2 = _with_changepoints(build_report(np.linspace(10, 90, 120), slope=0.5), [100, 112])
+    svg2 = R.svg_chart(rep2, 380, 340)
+    now = [b for b in _label_boxes(svg2) if b[0] == "현재"][0]
+    assert not [x for x in _vertical_lines(svg2) if now[1] + 1 < x < now[2] - 1]
+
+
+def test_changepoint_kind_carries_direction():
+    rep = build_report(np.linspace(100, 10, 60), slope=-1.0, changepoints=True)
+    cp = rep.analysis.changepoints[0]
+    cp.kind, cp.slope_before, cp.slope_after = "acceleration", -1.18, -3.38
+    svg, html_text, text = R.svg_chart(rep), R.render_html(rep), R.render_text(rep, width=100)
+    assert "하락 가속" in svg and "하락 가속" in html_text and "하락 가속" in text
+    assert re.search(r'background:#d03b3b"></span>하락 가속', html_text)        # red, not "good" green
+    cp.kind, cp.slope_before, cp.slope_after = "deceleration", -3.38, -0.52
+    out = R.render_html(rep) + R.render_text(rep, width=100) + R.svg_chart(rep)
+    assert "하락세 둔화" in out and "감속" not in out
+    cp.kind, cp.slope_before, cp.slope_after = "deceleration", 2.0, 0.5
+    assert "성장 둔화" in R.render_text(rep, width=100)
+    cp.kind, cp.slope_before, cp.slope_after = "acceleration", 0.5, 2.0
+    assert "성장 가속" in R.render_text(rep, width=100)
+    cp.slope_after = float("nan")                                  # undefined slope: plain label
+    assert "가속" in R.render_text(rep, width=100)
+
+
+def test_text_change_basis_and_yearly_unit(fake_report):
+    text = R.render_text(fake_report, width=100)
+    assert "예측 변화 +15.0% (향후 12개월 평균, 최근 12개월 평균 대비)" in text
+    assert "개월 후" not in text
+    assert "향후 12개월 평균 · <span class=\"nw\">최근 12개월 평균 대비</span>" in R.render_html(fake_report)
+    q = build_report(np.linspace(10, 30, 40), freq="Q", horizon=8)
+    q.analysis.season_length = 4
+    assert "(예측 마지막 4분기 평균, 최근 4분기 평균 대비)" in R.render_text(q, width=100)
+    y = build_report(np.linspace(10, 30, 8), freq="Y", horizon=5)
+    ty, hy = R.render_text(y, width=100), R.render_html(y)
+    assert "연 단위 8개" in ty and "연 단위 · 관측 8개" in hy
+    assert "년 단위" not in ty + hy
+    assert "(2032 예측값, 최근 값 대비)" in ty        # yearly: season 1 -> horizon-end value vs latest value
+
+
+def test_diagnosis_card_does_not_repeat_the_narratives_reasons(fake_report):
+    reasons = fake_report.analysis.phase.reasons
+    fake_report.narrative = "## 현재\n" + "\n".join(f"- 근거: {r}" for r in reasons)
+    html_text = R.render_html(fake_report)
+    assert all(html_text.count(r) == 1 for r in reasons)
+    assert '<ul class="reasons">' not in html_text and "판단 근거는 ‘AI 트렌드 해석’" in html_text
+    # an LLM narrative that does not quote them: the card keeps its reasons
+    fake_report.narrative = "## 현재\n- 성장 중입니다."
+    html_text = R.render_html(fake_report)
+    assert '<ul class="reasons">' in html_text and all(r in html_text for r in reasons)
+
+
+def test_leaderboard_model_names_break_only_at_separators(fake_report):
+    fake_report.forecast.model_scores[1].name = "holt_winters@log"
+    html_text = R.render_html(fake_report)
+    assert '<span class="mname">holt_<wbr>winters<wbr>@log</span>' in html_text
+    assert re.search(r"\.mname\{[^}]*overflow-wrap:break-word", html_text)
+    assert not re.search(r"\.mname\{[^}]*anywhere", html_text)
+    assert '<th class="num hide-sm">sMAPE</th>' in html_text

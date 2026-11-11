@@ -20,7 +20,7 @@ import pytest
 
 from trendai import forecast as F
 from trendai import models as M
-from trendai.data import default_horizon, from_values, future_index, season_length
+from trendai.data import default_horizon, from_values, future_index, prepare, season_length
 from trendai.samples import sample
 from trendai.types import (
     PHASES, AnalysisResult, Decomposition, ForecastResult, LifecyclePhase, ModelScore, Outlook,
@@ -673,9 +673,23 @@ def test_window_scales_floor_only_binds_for_degenerate_windows():
                                [F.mase_scale(y[:o], 1) for o in origins])
     flat = np.r_[np.full(40, 5.0), 5 + np.arange(20.0)]
     sc = F._window_scales(flat, [20, 30, 45], 1)
-    floor = F._SCALE_FLOOR_FRAC * F.mase_scale(flat, 1)
+    # the floor comes from the history before the latest origin (no look-ahead into the
+    # target period of the latest window; it used to be the whole series)
+    floor = F._SCALE_FLOOR_FRAC * F.mase_scale(flat[:45], 1)
     assert sc[0] == pytest.approx(floor) and sc[1] == pytest.approx(floor)
     assert sc[2] == pytest.approx(F.mase_scale(flat[:45], 1))
+
+
+def test_window_scales_do_not_look_past_the_latest_origin():
+    """Changing observations at or after the latest origin must not change any scale
+    (it used to rescale every window through the floor: [0.15, 0.22, 0.28] -> 2.6 each)."""
+    y = np.r_[np.full(20, 5.0), 5 + np.cumsum(np.random.default_rng(0).standard_normal(20))]
+    plan = F._make_plan(len(y), 1, 6, 3)
+    ref = F._window_scales(y, plan.origins, 1)
+    for i in range(plan.origins[-1], len(y)):
+        y2 = y.copy()
+        y2[i] += 1000.0
+        np.testing.assert_array_equal(F._window_scales(y2, plan.origins, 1), ref)
 
 
 def test_rms_does_not_overflow():
@@ -924,3 +938,333 @@ def test_outlook_short_weekly_horizons(H):
     o = F.compute_outlook(an, fc)
     assert o.direction in ("up", "down", "flat") and 0.0 <= o.prob_increase <= 1.0
     assert o.expected_change_pct is not None and math.isfinite(o.expected_change_pct)
+
+
+# --------------------------------------------------------------------------- fixer regressions
+# (skill / confidence, short-series intervals, plausibility guard, intermittent demand,
+#  spikes, history cap, seasonal layout, ensemble disagreement, outlook direction)
+
+
+def test_t_distribution_helpers():
+    assert F.t_ppf(0.975, 1) == pytest.approx(12.706204736, rel=1e-8)
+    assert F.t_ppf(0.9, 4) == pytest.approx(1.533206274, rel=1e-8)
+    assert F.t_ppf(0.975, 30) == pytest.approx(2.042272456, rel=1e-8)
+    assert F.t_ppf(0.025, 5) == pytest.approx(-F.t_ppf(0.975, 5))
+    assert F.t_ppf(0.975, math.inf) == pytest.approx(F.norm_ppf(0.975))
+    assert F.t_ppf(0.975, 1e9) == pytest.approx(F.norm_ppf(0.975), rel=1e-6)
+    for df in (1.0, 2.5, 7.0, 40.0):
+        for p in (0.6, 0.9, 0.975, 0.995):
+            assert F.t_cdf(F.t_ppf(p, df), df) == pytest.approx(p, abs=1e-10)
+    for bad in ((0.0, 3), (1.0, 3), (0.5, 0), (0.5, -1)):
+        with pytest.raises(ValueError):
+            F.t_ppf(*bad)
+
+
+@pytest.mark.parametrize("n", [2, 3, 5, 7])
+def test_fallback_reports_no_fake_scores(registry, n):
+    """Too short to backtest: no model scores (a naive 'MASE' of 10-1000 used to be
+    reported and narrated), no skill, no backtest MASE."""
+    s = from_values(10.0 + np.arange(n) + np.random.default_rng(n).standard_normal(n), freq="M")
+    fc = F.auto_forecast(s, horizon=6, freq="M")
+    assert fc.method.startswith("fallback")
+    assert fc.model_scores == [] and fc.skill is None and fc.backtest_mase is None
+    o = F.compute_outlook(_make_analysis(s, "M"), fc)
+    assert o.confidence == "low"
+
+
+def test_skill_definition_and_benchmarks_are_always_backtested():
+    # a candidate that equals a benchmark on every window -> skill = its MAE / best benchmark MAE
+    rng = np.random.default_rng(3)
+    y = 100 + np.cumsum(rng.standard_normal(60))
+    fc = F.auto_forecast(from_values(y, freq="Y"), horizon=5, freq="Y", candidates=["naive"])
+    plan = F._make_plan(60, 1, 5, F._default_n_windows(60), prefer_seasonal=False)
+    act = F._actuals(y, plan)
+    scales = F._window_scales(y, plan.origins, 1)
+    w = F._recency_weights(plan)
+    mae = {nm: F._scores(F._window_forecasts(y, nm, 1, plan), act, scales, w)["mae"]
+           for nm in ("naive", "drift")}
+    assert fc.skill == pytest.approx(mae["naive"] / min(mae.values()), rel=1e-9)
+    assert [ms.name for ms in fc.model_scores] == ["naive"]
+    # drift as the only candidate on a purely seasonal series: seasonal naive (not a
+    # candidate) is backtested anyway and shows that drift is much worse than naive
+    s = sample("seasonal", n=96)
+    fc2 = F.auto_forecast(s, horizon=12, freq="M", candidates=["drift"])
+    assert fc2.skill is not None and fc2.skill > 1.5
+    assert [ms.name for ms in fc2.model_scores] == ["drift"]
+    # a good forecast of a trending series beats naive clearly
+    fc3 = F.auto_forecast(sample("growing", n=120), horizon=12, freq="M")
+    assert fc3.skill is not None and 0 < fc3.skill < 0.8
+
+
+def test_skill_is_finite_on_degenerate_series(registry):
+    for y in (np.full(40, 5.0), np.zeros(40), 2.0 + 0.5 * np.arange(40.0)):
+        fc = F.auto_forecast(from_values(y, freq="M"), horizon=6, freq="M")
+        assert fc.skill is not None and math.isfinite(fc.skill) and 0 <= fc.skill <= 100
+
+
+def test_confidence_uses_skill_and_interval_width():
+    s = from_values(100 + np.sin(np.arange(120.0)), freq="M")
+    an = _make_analysis(s, "M", "stable")
+    mean = np.full(12, 100.0)
+
+    def conf(skill, mase=0.5, sd=1.0):
+        fc = _hand_forecast(s, "M", mean, np.full(12, sd), mase)
+        fc.skill = skill
+        return F.compute_outlook(an, fc).confidence
+
+    assert conf(0.5) == "high"
+    assert conf(0.5, mase=1.9) == "high"      # multi-step MASE > 1.5 is no reason for 'low'
+    assert conf(0.9) == "medium"
+    assert conf(1.2, mase=0.3) == "low"       # worse than a naive benchmark
+    assert conf(0.5, sd=25.0) == "medium"     # 80 % band of +-32 %: at most medium
+    assert conf(0.5, sd=90.0) == "low"        # band wider than the level itself
+    assert conf(None, mase=None) == "low"
+
+
+def test_confidence_labels_on_samples():
+    """breakout beats the best naive benchmark by ~50 % (was 'low' because its multi-step
+    MASE is > 1.5); volatile is a coin flip with a +-36 % band (was 'high'); the fad's
+    collapse is not forecast with 'high' confidence."""
+    expect = {"breakout": ("high", "medium"), "volatile": ("medium", "low"),
+              "fad": ("medium", "low"), "growing": ("high",)}
+    phase = {"breakout": "growing", "volatile": "volatile", "fad": "declining",
+             "growing": "growing"}
+    for nm, ok in expect.items():
+        s = sample(nm)
+        fc = F.auto_forecast(s, horizon=12, freq="M")
+        o = F.compute_outlook(_make_analysis(s, "M", phase[nm]), fc)
+        assert o.confidence in ok, (nm, o.confidence, fc.skill)
+
+
+def test_short_series_interval_coverage():
+    """n = 12..24 with the full registry: 80/95 % bands used to cover ~0.6-0.75 / ~0.72-0.9;
+    tiny backtests are now shrunk towards a random-walk prior and widened with t-quantiles."""
+
+    def proc(kind: str, n: int, rng: np.random.Generator) -> np.ndarray:
+        t = np.arange(n, dtype=float)
+        e = rng.standard_normal(n)
+        if kind == "rw":
+            return 100 + 2 * np.cumsum(e)
+        if kind == "rw_drift":
+            return 100 + t + np.cumsum(e)
+        if kind == "linear":
+            return 50 + 0.8 * t + 3 * e
+        if kind == "ar1":
+            x = np.zeros(n)
+            for i in range(1, n):
+                x[i] = 0.7 * x[i - 1] + e[i]
+            return 100 + 5 * x
+        return 100 + 10 * e
+
+    cover = {80: [], 95: []}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for kind in ("rw", "rw_drift", "linear", "ar1", "white"):
+            for ntr in (12, 16, 20, 24):
+                for seed in range(4):
+                    rng = np.random.default_rng(1000 * ntr + seed + 17 * len(kind))
+                    y = proc(kind, ntr + 12, rng)
+                    fc = F.auto_forecast(from_values(y[:ntr], freq="M"), horizon=12, freq="M")
+                    for lv in cover:
+                        cover[lv].append((y[ntr:] >= fc.lower[lv].to_numpy())
+                                         & (y[ntr:] <= fc.upper[lv].to_numpy()))
+    c80, c95 = float(np.mean(cover[80])), float(np.mean(cover[95]))
+    assert 0.75 <= c80 <= 0.97, c80
+    assert 0.88 <= c95 <= 0.995, c95
+
+
+def test_very_short_trend_series_widen_beyond_the_backtest_horizon():
+    """Monthly n = 10, h = 12, true model linear trend + noise: the 80/95 % bands at h = 12
+    covered 0.58 / 0.73 (the 2-step backtest's b could drop to 0.1)."""
+    idx = pd.date_range("2024-01-01", periods=10, freq="MS")
+    hit80 = hit95 = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for seed in range(40):
+            rng = np.random.default_rng(seed)
+            y = 50 + 1.7 * np.arange(22) + rng.normal(0, 2, 22)
+            fc = F.auto_forecast(pd.Series(y[:10], index=idx), horizon=12, freq="M")
+            hit80 += fc.lower[80].iloc[-1] <= y[-1] <= fc.upper[80].iloc[-1]
+            hit95 += fc.lower[95].iloc[-1] <= y[-1] <= fc.upper[95].iloc[-1]
+    assert hit80 / 40 >= 0.75 and hit95 / 40 >= 0.9, (hit80, hit95)
+    # a 5-year forecast from 8 yearly points is no +-3 % band any more
+    s = sample("growing", n=13, freq="Y", seed=0)
+    fc = F.auto_forecast(s.iloc[:8], horizon=5, freq="Y")
+    assert (fc.upper[95].iloc[-1] - fc.mean.iloc[-1]) / fc.mean.iloc[-1] > 0.1
+
+
+def test_plausibility_guard_stops_explosive_extrapolation():
+    """20 daily points of an S-curve's take-off: forecasts reached 9-100x the observed
+    maximum within 30 days (log-linear / Holt compounding the last burst)."""
+    for seed in range(5):
+        s = sample("emerging", freq="D", n=20, seed=seed)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fc = F.auto_forecast(s)
+        assert fc.mean.max() < 6 * s.max(), (seed, fc.mean.max(), fc.method)
+    # envelope properties
+    line = 2.0 + 0.5 * np.arange(30.0)
+    up, dn = F._move_envelope(line, 1, 40)
+    k = np.arange(1, 41)
+    assert np.all(up >= 0.5 * k) and np.all(dn > 0)          # continuing the line passes
+    np.testing.assert_allclose(F._guard(line[-1] + 0.5 * k, (line[-1], up, dn)), line[-1] + 0.5 * k)
+    burst = np.r_[np.full(15, 5.0) + np.sin(np.arange(15.0)), 5 * 1.6 ** np.arange(1, 6)]
+    up, dn = F._move_envelope(burst, 1, 30, nonnegative=True)
+    explosive = burst[-1] * 1.6 ** np.arange(1, 31)
+    g = F._guard(explosive, (burst[-1], up, dn))
+    assert g[-1] < 0.01 * explosive[-1] and np.all(np.diff(g) >= 0)
+    assert np.all(np.isinf(dn))                              # drops of >= 0 data: bounded by 0
+    assert F._move_envelope(np.array([1.0, 2.0]), 1, 5) is None
+
+
+def test_intermittent_demand_is_not_anchored_on_the_last_observation():
+    """Spare-part demand (P(sale) = 0.15/week, 1-5 units, mean 0.45/week): naive/drift won
+    on MAE and the 26-week total was ~6 when the last week was 0 and ~28 when it was not
+    (truth 11.7); the 95 % band excluded 0 and the outlook claimed +969 %."""
+    totals = {True: [], False: []}
+    for seed in range(12):
+        rng = np.random.default_rng(seed)
+        y = np.where(rng.random(150) < 0.15, rng.integers(1, 6, 150), 0).astype(float)
+        s = pd.Series(y, index=pd.date_range("2021-01-03", periods=150, freq="W-SUN"))
+        fc = F.auto_forecast(s, freq="W")
+        _assert_valid(fc, 26)
+        totals[bool(y[-1] == 0)].append(float(fc.mean.sum()))
+        assert fc.lower[95].iloc[0] == 0.0
+        assert not any(nm in fc.method for nm in ("naive", "drift", "analog_knn"))
+        o = F.compute_outlook(_make_analysis(s, "W", "stable"), fc)
+        assert o.expected_change_pct is None and o.direction == "flat"
+    for zero_last, tot in totals.items():
+        if tot:
+            assert 4.0 <= float(np.median(tot)) <= 25.0, (zero_last, tot)
+
+
+def test_is_intermittent_and_clean_spikes_helpers():
+    rng = np.random.default_rng(0)
+    y = np.where(rng.random(100) < 0.2, 3.0, 0.0)
+    assert F._is_intermittent(y, 52)
+    assert not F._is_intermittent(np.r_[np.zeros(60), 1 + np.arange(40.0)], 12)  # took off
+    assert not F._is_intermittent(y - 1.0, 52)                                    # negatives
+    assert not F._is_intermittent(np.zeros(50), 12)                               # all zero
+    # isolated spikes are replaced; the last point, level shifts and short seasonal series not
+    t = np.arange(60.0)
+    base = 100 + 10 * np.sin(2 * np.pi * t / 12) + np.random.default_rng(1).normal(0, 1, 60)
+    spiky = base.copy()
+    spiky[[20, 41]] *= 1.8
+    cleaned, k = F._clean_spikes(spiky, 12)
+    assert k == 2 and np.max(np.abs(cleaned - base)) < 6
+    last = base.copy()
+    last[-1] *= 1.8
+    assert F._clean_spikes(last, 12)[1] == 0
+    shift = np.r_[base[:40], base[40:] + 40]
+    assert F._clean_spikes(shift, 12)[1] == 0
+    assert F._clean_spikes(spiky[:30], 12)[1] == 0             # < 3 seasons: peaks look like spikes
+
+
+def test_one_off_spikes_are_not_projected_as_seasonality():
+    """Monthly page views with a few one-off news spikes (flagged as anomalies by the
+    analysis): seasonal models used to project them into next year (Dec +24 % YoY)."""
+    rng = np.random.default_rng(5)
+    t = np.arange(48.0)
+    clean = 1000 * np.exp(0.01 * t + 0.15 * np.cos(2 * np.pi * (t - 11) / 12)
+                          + rng.normal(0, 0.02, 48))
+    spiky = clean.copy()
+    spiky[[18, 35, 43]] *= (1.8, 1.6, 1.7)               # Jul, Dec, Aug of different years
+    fc_c = F.auto_forecast(from_values(clean, freq="M"), horizon=12, freq="M")
+    fc_s = F.auto_forecast(from_values(spiky, freq="M"), horizon=12, freq="M")
+    rel = np.abs(fc_s.mean.to_numpy() / fc_c.mean.to_numpy() - 1)
+    assert rel.max() < 0.06, rel.round(3)
+
+
+def test_final_fit_uses_the_backtested_history():
+    """The backtest used the last 400 points but the final fit up to 1000, so long series
+    got forecasts the backtest never scored (breakout, daily 700 points: test MAE 22 vs 1.1
+    with the last 400 points, 0 % coverage)."""
+    s = sample("breakout", n=500, freq="D", seed=0)
+    a = F.auto_forecast(s, horizon=30, freq="D")
+    b = F.auto_forecast(s.iloc[-400:], horizon=30, freq="D")
+    assert a.method == b.method
+    pd.testing.assert_frame_equal(a.to_frame(), b.to_frame())
+
+
+def test_two_to_two_and_a_half_seasons_keep_the_seasonal_layout():
+    """Weekly n = 120 (2.3 seasons) fell through to the non-seasonal backtest layout, whose
+    short windows excluded every seasonal model: a flat forecast 3x worse than seasonal naive."""
+    plan = F._make_plan(120, 52, 26, F._default_n_windows(120), prefer_seasonal=True)
+    assert plan.seasonal and plan.min_train >= 104 and plan.n_windows >= 2
+    assert not F._make_plan(120, 52, 26, F._default_n_windows(120)).seasonal
+    ratios = []
+    for freq, ntr, h, m in (("W", 120, 26, 52), ("D", 28, 30, 7)):
+        for seed in (0, 1):
+            s = sample("seasonal", n=ntr + h, freq=freq, seed=seed)
+            y = s.to_numpy()
+            fc = F.auto_forecast(s.iloc[:ntr], horizon=h, freq=freq)
+            sn = M.make_model("seasonal_naive").fit(y[:ntr], m).predict(h)
+            ratios.append(np.mean(np.abs(y[ntr:] - fc.mean.to_numpy()))
+                          / np.mean(np.abs(y[ntr:] - sn)))
+            assert np.ptp(fc.mean.to_numpy()) > 0.5 * np.ptp(sn), (freq, seed, fc.method)
+    assert float(np.exp(np.mean(np.log(ratios)))) < 1.3, np.round(ratios, 2)
+
+
+def test_intervals_cover_ensemble_member_disagreement():
+    """An explosive member dragged the mean to 4.5x the training maximum under a +-10 %
+    band (members at h = 30: 206, 1195, 406; actual 200.6)."""
+    t = np.arange(90.0)
+    y = 5 + 200 / (1 + np.exp(-(t - 54) / 9)) + np.random.default_rng(1192).standard_normal(90)
+    fc = F.auto_forecast(pd.Series(y[:60], pd.date_range("2015-01-05", periods=60, freq="D")),
+                         horizon=30, freq="D")
+    assert fc.lower[95].iloc[-1] <= y[-1] <= fc.upper[95].iloc[-1]
+    members = {"a": np.array([1.0, 2.0, 3.0]), "b": np.array([1.0, 4.0, 9.0])}
+    sp = F._member_spread(members, {"a": 0.5, "b": 0.5})
+    np.testing.assert_allclose(sp * F.norm_ppf(0.975) * 2, [0.0, 2.0, 6.0])
+    assert np.all(F._member_spread(members, {"a": 1.0}) == 0)
+
+
+def test_direction_needs_a_change_beyond_the_horizon_uncertainty():
+    """A flat (random-walk) forecast whose last value sits 2 % below the recent mean was
+    called 'down' (prob_increase 0.43) next to an 80 % band of 72..99."""
+    s = from_values(np.r_[np.full(47, 100.0) + np.tile([1.0, -1.0], 24)[:47], 96.0], freq="M")
+    an = _make_analysis(s, "M", "stable")
+    cur = float(s.iloc[-12:].mean())
+    flat = _hand_forecast(s, "M", np.full(12, 96.0), np.linspace(2.0, 10.0, 12))
+    o = F.compute_outlook(an, flat)
+    assert (96.0 - cur) / cur < -0.03                     # beyond the old 2 % threshold
+    assert o.direction == "flat" and 0.3 <= o.prob_increase < 0.5
+    # the same change with a tight band is a direction
+    tight = F.compute_outlook(an, _hand_forecast(s, "M", np.full(12, 96.0), np.full(12, 0.5)))
+    assert tight.direction == "down"
+    # the reported case: a business-day random walk whose forecast is flat at the last value
+    rng = np.random.default_rng(0)
+    raw = pd.Series((100 * np.exp(np.cumsum(rng.normal(0.0002, 0.018, 504)))).round(2),
+                    index=pd.bdate_range("2023-01-02", periods=504))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")          # business days -> calendar days (DataWarning)
+        stock, f = prepare(raw)
+        fc = F.auto_forecast(stock, freq=f)
+    o = F.compute_outlook(_make_analysis(stock, f, "stable"), fc)
+    assert o.direction == "flat" and 1 / 3 <= o.prob_increase <= 2 / 3, o
+
+
+def test_prob_increase_compares_seasonally_comparable_levels():
+    """prob_increase is P(future level > current level) for the same season-mean levels as
+    expected_change_pct (documented), not P(horizon-end value > current mean): a forecast
+    that repeats last year's pattern ends in a seasonal low but has no level change."""
+    t = np.arange(48.0)
+    pattern = 10 * np.sin(2 * np.pi * (t + 10) / 12)         # horizon end = seasonal low
+    s = from_values(100 + pattern, freq="M")
+    seas = pd.Series(pattern, index=s.index)
+    fc = _hand_forecast(s, "M", 100 + pattern[-12:], np.full(12, 2.0))
+    assert fc.mean.iloc[-1] < 91                              # the end value is a seasonal low
+    o = F.compute_outlook(_make_analysis(s, "M", "stable", seasonal=seas), fc)
+    assert abs(o.expected_change_pct) < 1e-6 and o.prob_increase == pytest.approx(0.5)
+    assert o.direction == "flat"
+    assert o.scenarios["base"] == pytest.approx(float(fc.mean.iloc[-1]))
+
+
+def test_error_dof_factor_reflects_autocorrelated_errors():
+    rng = np.random.default_rng(0)
+    iid = rng.standard_normal((8, 30))
+    walk = np.cumsum(rng.standard_normal((8, 30)), axis=1)    # random-walk multi-step errors
+    assert F._error_dof_factor(iid) > 0.8
+    assert F._error_dof_factor(walk) < 0.15
+    assert F._error_dof_factor(np.ones((3, 1))) == 1.0 and F._error_dof_factor(np.zeros((3, 4))) == 1.0
+    assert F._error_dof_factor(1e300 * walk) == pytest.approx(F._error_dof_factor(walk))

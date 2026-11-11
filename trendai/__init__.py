@@ -7,6 +7,11 @@ Quick start::
     print(report.analysis.phase.label_ko, report.outlook.expected_change_pct)
     print(report.narrative)
 
+Problems with the input raise :class:`DataError` (Korean message); data that
+was repaired (interpolated gaps, unreadable cells, weekday-only data) is
+reported with a :class:`DataWarning`, interpretation notes with a
+:class:`DataNotice`.
+
 Public names are imported lazily so that ``import trendai`` stays fast and
 optional pieces (e.g. the Claude SDK) are only needed when used.
 """
@@ -24,6 +29,7 @@ _LAZY = {
     "run_many": ("pipeline", "run_many"),
     "report_to_dict": ("pipeline", "report_to_dict"),
     "report_to_json": ("pipeline", "report_to_json"),
+    "reports_to_json": ("pipeline", "reports_to_json"),
     # building blocks
     "analyze": ("analysis", "analyze"),
     "auto_forecast": ("forecast", "auto_forecast"),
@@ -31,13 +37,19 @@ _LAZY = {
     "generate_narrative": ("narrative", "generate_narrative"),
     "ask": ("narrative", "ask"),
     "rank_trends": ("compare", "rank_trends"),
+    "rising_score": ("compare", "rising_score"),
     "render_html": ("report", "render_html"),
     "render_text": ("report", "render_text"),
+    "render_compare_html": ("report", "render_compare_html"),
     # data
     "load_table": ("data", "load_table"),
     "prepare": ("data", "prepare"),
     "from_values": ("data", "from_values"),
+    "DataError": ("data", "DataError"),
+    "DataWarning": ("data", "DataWarning"),
+    "DataNotice": ("data", "DataNotice"),
     "sample": ("samples", "sample"),
+    "sample_set": ("samples", "sample_set"),
     "list_samples": ("samples", "list_samples"),
     # types
     "TrendReport": ("types", "TrendReport"),

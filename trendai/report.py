@@ -59,6 +59,8 @@ DIRECTION_KO: dict[str, str] = {"up": "상승", "down": "하락", "flat": "보�
 DIRECTION_ARROW: dict[str, str] = {"up": "▲", "down": "▼", "flat": "▶"}
 CONFIDENCE_KO: dict[str, str] = {"high": "높음", "medium": "보통", "low": "낮음"}
 PERIOD_KO: dict[str, str] = {"D": "일", "W": "주", "M": "개월", "Q": "분기", "Y": "년"}
+# "<x> 단위" labels (data granularity): yearly data is "연 단위" (두음법칙), not "년 단위"
+UNIT_KO: dict[str, str] = {"D": "일", "W": "주", "M": "월", "Q": "분기", "Y": "연"}
 # per-period unit suffix, as used by narrative.period_unit ("%p/월")
 _PER_UNIT: dict[str, str] = {"D": "/일", "W": "/주", "M": "/월", "Q": "/분기", "Y": "/년"}
 SCENARIOS_KO: tuple[tuple[str, str], ...] = (
@@ -99,6 +101,25 @@ KIND_COLOR: dict[str, str] = {
     "reversal_down": "#d03b3b",
     "level_shift": "#6250d6",
 }
+# acceleration / deceleration only say "steeper" / "flatter": the direction comes from the
+# slopes.  Same wording as narrative._changepoint_line, coloured by meaning for the series.
+_CP_DIRECTED: dict[tuple[str, bool], tuple[str, str]] = {
+    ("acceleration", True): ("성장 가속", "#0ca30c"),
+    ("acceleration", False): ("하락 가속", "#d03b3b"),
+    ("deceleration", True): ("성장 둔화", "#eda100"),
+    ("deceleration", False): ("하락세 둔화", "#1baf7a"),
+}
+
+#: the benchmarks behind ForecastResult.skill
+_NAIVE_NAMES: tuple[str, ...] = ("naive", "seasonal_naive", "drift")
+_SKILL_LABEL = "단순 예측 대비 오차"
+_SKILL_TIP = ("같은 백테스트 구간에서 가장 나은 단순 기준 예측(직전값 반복·계절 반복·평균 기울기 연장)의 "
+              "평균 절대 오차와 비교한 최종 예측의 오차 증감입니다. 음수일수록 단순 예측보다 정확합니다.")
+_MASE_TIP = ("MASE: 예측 오차를 학습 구간에서 한 기 앞을 계절 단순 예측한 오차로 나눈 값(낮을수록 좋음). "
+             "여러 기 앞을 내다보는 예측은 단순 예측보다 정확해도 1을 넘기 쉬우므로, 단순 예측과의 비교는 "
+             "‘단순 대비’ 열을 보세요.")
+# anomalies are left out of the y range when they stretch it by more than 1 / _SPIKE_RATIO
+_SPIKE_RATIO = 0.5
 
 _BLOCKS = "▁▂▃▄▅▆▇█"
 _MINUS = "−"
@@ -278,6 +299,101 @@ def _model_desc(name: str) -> str:
     if desc and variant == "log":
         desc += " (로그 공간)"
     return desc
+
+
+def _cp_kind(cp: Any) -> tuple[str, str]:
+    """Korean label and colour of a changepoint, with the direction for (de)acceleration.
+
+    ``acceleration`` with a falling slope is a *decline* accelerating (red), not
+    growth; ``deceleration`` of a decline is the decline easing.  Matches the
+    wording of the rule-based narrative.  Other kinds use :data:`CHANGEPOINT_KO`.
+    """
+    kind = str(getattr(cp, "kind", ""))
+    before = _finite(getattr(cp, "slope_before", None))
+    after = _finite(getattr(cp, "slope_after", None))
+    if kind == "acceleration" and after is not None:
+        return _CP_DIRECTED[(kind, after >= 0)]
+    if kind == "deceleration" and before is not None:
+        return _CP_DIRECTED[(kind, before > 0)]
+    return CHANGEPOINT_KO.get(kind, kind), KIND_COLOR.get(kind, "#898781")
+
+
+def _skill_value(fc: Any) -> Optional[float]:
+    """``forecast.skill`` (MAE ratio to the best naive benchmark) as a finite float >= 0, else ``None``."""
+    v = _finite(getattr(fc, "skill", None))
+    return None if v is None else max(0.0, v)
+
+
+def _rel_error_text(ratio: Optional[float]) -> str:
+    """Error ratio -> signed percent change of the error (``0.65`` -> ``−35%``); ``—`` for None."""
+    if ratio is None:
+        return _DASH
+    return _fmt_pct((ratio - 1.0) * 100.0, decimals=0)
+
+
+def _rel_error_class(ratio: Optional[float]) -> str:
+    """``pos`` when clearly better than naive (lower error), ``neg`` when worse, else ``''``."""
+    if ratio is None:
+        return ""
+    return "pos" if ratio <= 0.95 else ("neg" if ratio > 1.0 else "")
+
+
+def _skill_sentence(skill: Optional[float]) -> str:
+    """Plain-Korean verdict of the final method versus the naive benchmarks (same thresholds as the narrative)."""
+    if skill is None:
+        return "같은 백테스트 구간에서 단순 기준 예측과 비교한 결과가 없어, 단순 예측보다 나은지는 판단하지 않았습니다."
+    if skill <= 0.95:
+        gain = (1.0 - skill) * 100.0
+        g = "99% 이상" if gain > 99.5 else f"약 {gain:.0f}%"
+        return f"최종 방법의 백테스트 오차는 가장 나은 단순 기준 예측보다 {g} 작습니다."
+    if skill <= 1.0:
+        return "최종 방법의 백테스트 오차가 가장 나은 단순 기준 예측과 비슷합니다(차이 5% 이내)."
+    worse = (skill - 1.0) * 100.0
+    size = f"약 {skill:.1f}배" if skill >= 2.0 else f"약 {worse:.0f}% 더 큼"
+    return f"최종 방법은 백테스트에서 단순 기준 예측보다 낫지 않았습니다(오차 {size})."
+
+
+def _best_naive_mae(scores: Sequence[Any]) -> tuple[Optional[str], Optional[float]]:
+    """Name and MAE of the most accurate naive benchmark among the leaderboard rows."""
+    best: tuple[Optional[str], Optional[float]] = (None, None)
+    for s in scores:
+        name = str(getattr(s, "name", ""))
+        mae = _finite(getattr(s, "mae", None))
+        if name in _NAIVE_NAMES and mae is not None and mae >= 0 and (best[1] is None or mae < best[1]):
+            best = (name, mae)
+    return best
+
+
+def _model_html(name: Any) -> str:
+    """Escaped model name with line-break opportunities after ``_`` and before ``@`` only."""
+    e = _esc(name)
+    return e.replace("_", "_<wbr>").replace("@", "<wbr>@")
+
+
+def _change_basis(report: TrendReport, d: "_ChartData") -> tuple[str, str]:
+    """The two levels behind ``Outlook.expected_change_pct`` (see ``forecast.compute_outlook``).
+
+    Future level = mean of the last ``min(season, horizon)`` forecast points,
+    current level = mean of the last ``min(season, n)`` observations.  Returns
+    Korean phrases such as ``('향후 12개월 평균', '최근 12개월 평균')``; both end in
+    a consonant, so they take the particles 을/과.
+    """
+    freq = d.freq
+    unit = PERIOD_KO.get(freq, "기간")
+    m = max(1, int(_finite(getattr(report.analysis, "season_length", 1)) or 1))
+    n = max(1, int(np.isfinite(d.hist_y).sum()))
+    mean = getattr(report.forecast, "mean", None)
+    h = len(mean) if isinstance(mean, pd.Series) and len(mean) else max(1, int(_finite(report.forecast.horizon) or 1))
+    k_fut, k_cur = min(m, h), min(m, n)
+    if k_fut <= 1:
+        end = _fmt_date(d.fc_dates[-1], freq) if len(d.fc_dates) else ""
+        fut = f"{end} 예측값".strip()
+    elif k_fut >= h:
+        fut = f"향후 {h:,}{unit} 평균"
+    else:
+        fut = f"예측 마지막 {k_fut:,}{unit} 평균"
+    cur = "최근 값" if k_cur <= 1 else f"최근 {k_cur:,}{unit} 평균"
+    return fut, cur
 
 
 def _text_width(s: str, size: float) -> float:
@@ -637,6 +753,18 @@ class _ChartData:
             self.t_end = 1.0  # single point: avoid a zero-width axis
             self.end_date = self.t0 + pd.Timedelta(days=1)
 
+        # history points flagged as anomalies (the last observation, which anchors the
+        # "현재" dot and the forecast line, is never treated as one for the y range)
+        self.anom_mask = np.zeros(len(self.hist_y), dtype=bool)
+        anoms = list(getattr(a, "anomalies", None) or [])
+        if anoms and len(self.hist_t):
+            days = [self.day_of(getattr(an, "date", None)) for an in anoms]
+            days_arr = np.asarray([v for v in days if v is not None], dtype=float)
+            if days_arr.size:
+                self.anom_mask = np.isin(np.round(self.hist_t, 6), np.round(days_arr, 6))
+            if fin.any():
+                self.anom_mask[int(np.flatnonzero(fin)[-1])] = False
+
     @staticmethod
     def _index(s: pd.Series) -> pd.DatetimeIndex:
         idx = s.index
@@ -674,8 +802,27 @@ class _ChartData:
         * Very wide bands are clipped to about one data range beyond the data.
         * Non-negative data (history, forecast and bands all >= 0) never shows
           a negative axis because of a slight dip of the smoothed trend line.
+        * Points flagged as anomalies (``analysis.anomalies``) are left out of
+          the range when they more than double it (e.g. one-day news spikes of
+          page views), so the level, the seasonal pattern and the forecast stay
+          readable; :func:`svg_chart` then marks them at the plot edge with
+          their values.  Every other observation always stays inside the range.
         """
-        core = [arr[np.isfinite(arr)] for arr in (self.hist_y, self.trend_y, self.fc_y)]
+        full = self._extent_of(self.hist_y)
+        if not self.anom_mask.any() or int((~self.anom_mask & np.isfinite(self.hist_y)).sum()) < 2:
+            return full
+        robust = self._extent_of(np.where(self.anom_mask, np.nan, self.hist_y))
+        if robust[1] - robust[0] < _SPIKE_RATIO * (full[1] - full[0]):
+            return robust
+        return full
+
+    def spikes_clipped(self) -> bool:
+        """Whether :meth:`y_extent` leaves flagged anomalies out of the value range."""
+        return bool(self.anom_mask.any()) and self.y_extent() != self._extent_of(self.hist_y)
+
+    def _extent_of(self, hist_y: np.ndarray) -> tuple[float, float]:
+        """:meth:`y_extent` computed with ``hist_y`` (NaN = ignored) as the observed values."""
+        core = [arr[np.isfinite(arr)] for arr in (hist_y, self.trend_y, self.fc_y)]
         core = [c for c in core if c.size]
         if not core:
             return 0.0, 1.0
@@ -724,7 +871,11 @@ _SVG_STYLE = (
     ".tai-cp{stroke:var(--c-cp,#1baf7a);stroke-width:1.25;stroke-opacity:.75}"
     ".tai-cpm{fill:var(--c-cp,#1baf7a)}"
     ".tai-cphit{stroke:transparent;stroke-width:10;pointer-events:stroke}"
+    ".tai-cpb{fill:var(--c-cp,#1baf7a);stroke:var(--surface,#fff);stroke-width:1.5}"
+    ".tai-chart .tai-cpn{fill:#fff;font-weight:700;font-variant-numeric:tabular-nums}"
     ".tai-anom{fill:var(--surface,#fff);stroke:var(--c-anom,#e34948);stroke-width:2}"
+    ".tai-spike{fill:var(--c-anom,#e34948);stroke:var(--surface,#fff);stroke-width:1}"
+    ".tai-chart .tai-spkl{fill:var(--c-anom,#e34948);font-weight:600}"
     ".tai-dot-h{fill:var(--c-hist,#2a78d6);stroke:var(--surface,#fff);stroke-width:2}"
     ".tai-dot-f{fill:var(--c-fc,#eb6834);stroke:var(--surface,#fff);stroke-width:2}"
     ".tai-chart .tai-lbl{paint-order:stroke;stroke:var(--surface,#fff);stroke-width:4px;stroke-linejoin:round}"
@@ -826,10 +977,16 @@ def svg_chart(report: TrendReport, width: int = 960, height: int = 380) -> str:
 
     Draws the observed history, the trend component (dashed), the forecast mean
     with layered 95 % / 80 % prediction bands, a dashed "현재" divider at the
-    last observation, changepoint markers (with date labels), anomaly rings,
-    nice y-axis ticks, non-overlapping date ticks and a legend.  Wide charts
-    (``width >= 700``) also carry a CSS-only hover read-out per date.  The SVG
-    uses a ``viewBox`` with ``width="100%"`` so it scales to its container.
+    last observation, changepoint lines with numbered badges (the numbers of
+    the HTML changepoint table) and date labels, anomaly rings, nice y-axis
+    ticks, non-overlapping date ticks and a legend.  Top labels never overlap
+    each other and are never crossed by another vertical line; a changepoint
+    label that does not fit is left out (its badge still identifies the line).
+    Anomalies that :meth:`_ChartData.y_extent` leaves outside the value range
+    (spikes that would squash the rest of the chart) are drawn as triangles on
+    the plot edge with their values.  Wide charts (``width >= 700``) also carry
+    a CSS-only hover read-out per date.  The SVG uses a ``viewBox`` with
+    ``width="100%"`` so it scales to its container.
     """
     width = max(240, int(width))
     height = max(160, int(height))
@@ -957,11 +1114,12 @@ def svg_chart(report: TrendReport, width: int = 960, height: int = 380) -> str:
                  f'text-anchor="{anchor}">{_esc(lab)}</text>')
     parts.append("<g>" + "".join(g) + "</g>")
 
-    # changepoint lines (behind the data)
-    cp_marks: list[tuple[float, str, str]] = []
+    # changepoint lines (behind the data); each carries a numbered badge keyed to the
+    # changepoint table of the HTML page, so a line whose date label does not fit stays identifiable
+    cp_marks: list[tuple[float, list[str]]] = []
     cp_hits: list[str] = []
     events: dict[float, list[tuple[str, str]]] = {}  # day -> extra hover rows
-    for cp in cps:
+    for num, cp in enumerate(cps, 1):
         dd = d.day_of(getattr(cp, "date", None))
         if dd is None:
             try:
@@ -971,18 +1129,25 @@ def svg_chart(report: TrendReport, width: int = 960, height: int = 380) -> str:
         if not (0 <= dd <= d.t_end):
             continue
         x = xs(dd)
-        kind = str(getattr(cp, "kind", ""))
-        kind_ko = CHANGEPOINT_KO.get(kind, kind)
+        kind_ko, _ = _cp_kind(cp)
         date_s = _fmt_date(getattr(cp, "date", None), freq)
         sb, sa = _fmt_num(getattr(cp, "slope_before", None), signed=True), _fmt_num(
             getattr(cp, "slope_after", None), signed=True)
-        tip = f"변곡점 {date_s} · {kind_ko} (기울기 {sb} → {sa})"
+        tip = f"변곡점 {num}: {date_s} · {kind_ko} (기울기 {sb} → {sa})"
         parts.append(f'<path class="tai-cp" d="M{_f1(x)},{_f1(plot_t)}V{_f1(plot_b)}"/>')
+        badge_r = 7.0 if num < 10 else 8.0
+        badge_fs = 10.0 if num < 10 else 9.0
         cp_hits.append(f'<g><title>{_esc(tip)}</title>'
                        f'<path class="tai-cphit" d="M{_f1(x)},{_f1(plot_t)}V{_f1(plot_b)}"/>'
-                       f'<circle class="tai-cpm" cx="{_f1(x)}" cy="{_f1(plot_t)}" r="3"/></g>')
-        cp_marks.append((x, date_s if compact else f"{date_s} {kind_ko}", tip))
-        events.setdefault(round(dd, 3), []).append(("변곡점", kind_ko))
+                       f'<circle class="tai-cpb" cx="{_f1(x)}" cy="{_f1(plot_t)}" r="{badge_r:g}"/>'
+                       f'<text class="tai-cpn" x="{_f1(x)}" y="{_f1(plot_t + badge_fs * 0.36)}" '
+                       f'font-size="{badge_fs:g}" text-anchor="middle">{num}</text></g>')
+        # label candidates, most informative first (the badge number is the last resort)
+        texts = [date_s] if compact else [f"{date_s} {kind_ko}", date_s]
+        if compact and freq in ("D", "W"):
+            texts.append(_fmt_date(getattr(cp, "date", None), "M"))
+        cp_marks.append((x, texts))
+        events.setdefault(round(dd, 3), []).append(("변곡점", f"{num} · {kind_ko}"))
 
     # "현재" divider
     if math.isfinite(d.last_y) or len(d.hist_t):
@@ -1017,23 +1182,45 @@ def svg_chart(report: TrendReport, width: int = 960, height: int = 380) -> str:
     if cp_hits:
         parts.append("<g>" + "".join(cp_hits) + "</g>")
 
-    # anomalies
+    # anomalies: rings inside the axis range; points outside it (left out of the range by
+    # _ChartData.y_extent) become triangles on the plot edge, grouped when they are close
     g = []
+    clipped: list[tuple[float, float, str]] = []  # (x, value, tooltip)
     for an in anoms:
         dd = d.day_of(getattr(an, "date", None))
         v = _finite(getattr(an, "value", None))
-        if dd is None or v is None or not (0 <= dd <= d.t_end) or not (ymin <= v <= ymax):
+        if dd is None or v is None or not (0 <= dd <= d.t_end):
             continue
         events.setdefault(round(dd, 3), []).append(
             ("이상치", f"z {_fmt_num(getattr(an, 'zscore', None), 1, signed=True)}"))
         tip = (f"이상치 {_fmt_date(getattr(an, 'date', None), freq)}: 값 {_fmt_num(v)} "
                f"(예상 {_fmt_num(getattr(an, 'expected', None))}, z={_fmt_num(getattr(an, 'zscore', None), 1)})")
+        if not (ymin <= v <= ymax):
+            clipped.append((xs(dd), v, tip + " — 축 범위 밖"))
+            continue
         g.append(f'<circle class="tai-anom" cx="{_f1(xs(dd))}" cy="{_f1(ys(v))}" r="{4.5 if not compact else 4:g}">'
                  f'<title>{_esc(tip)}</title></circle>')
+    spikes: list[tuple[float, float, bool]] = []  # (x, most extreme value, above) per group
+    for above in (True, False):
+        side = sorted((c for c in clipped if (c[1] > ymax) == above), key=lambda c: c[0])
+        groups: list[list[tuple[float, float, str]]] = []
+        for c in side:
+            if groups and c[0] - groups[-1][-1][0] <= 10.0:
+                groups[-1].append(c)
+            else:
+                groups.append([c])
+        for grp in groups:
+            x_s, v_s, _ = max(grp, key=lambda c: c[1]) if above else min(grp, key=lambda c: c[1])
+            tri = (f"M{_f1(x_s - 5)},{_f1(plot_t + 8)}L{_f1(x_s)},{_f1(plot_t)}L{_f1(x_s + 5)},{_f1(plot_t + 8)}Z"
+                   if above else
+                   f"M{_f1(x_s - 5)},{_f1(plot_b - 8)}L{_f1(x_s)},{_f1(plot_b)}L{_f1(x_s + 5)},{_f1(plot_b - 8)}Z")
+            g.append(f'<path class="tai-spike" d="{tri}"><title>{_esc(" / ".join(c[2] for c in grp))}</title></path>')
+            spikes.append((x_s, v_s, above))
     if g:
         parts.append("<g>" + "".join(g) + "</g>")
 
     # end-point dots + direct label of the final value
+    end_box: Optional[tuple[float, float]] = None  # vertical extent of the end label (right margin)
     if math.isfinite(d.last_y) and ymin <= d.last_y <= ymax:
         parts.append(f'<circle class="tai-dot-h" cx="{_f1(x_now)}" cy="{_f1(ys(d.last_y))}" r="4"/>')
     if end_val is not None and end_t is not None and ymin <= end_val <= ymax:
@@ -1041,46 +1228,92 @@ def svg_chart(report: TrendReport, width: int = 960, height: int = 380) -> str:
         if end_cls == "tai-dot-f":
             parts.append(f'<circle class="tai-dot-f" cx="{_f1(ex)}" cy="{_f1(ey)}" r="4"/>')
         parts.append(f'<text class="tai-strong" x="{_f1(ex + 8)}" y="{_f1(ey + fs * 0.35)}">{_esc(end_label)}</text>')
+        end_box = (ey - fs, ey + fs)
 
-    # top labels: "현재" + changepoints, stacked into rows so they never overlap
-    rows: list[list[tuple[float, float]]] = []
+    # top labels: "현재", changepoint dates and clipped-spike values, stacked into rows.
+    # A label never overlaps another label and is never crossed by a vertical line
+    # (changepoint, "현재" divider or clipped spike) other than its own; a changepoint
+    # label that cannot be placed is dropped -- its numbered badge still identifies it.
     max_rows = 2 if compact else 3
     lab_fs = fs - 1 if not compact else fs - 0.5
+    rows: list[list[tuple[float, float]]] = [[] for _ in range(max_rows)]
+    vlines = [m[0] for m in cp_marks] + [x_now] + [s[0] for s in spikes if s[2]]
     lbl_g: list[str] = []
 
-    def place(x0: float, x1: float) -> Optional[int]:
-        for r in range(max_rows):
-            while len(rows) <= r:
-                rows.append([])
-            if all(x1 + 6 < a0 or x0 > a1 + 6 for a0, a1 in rows[r]):
-                rows[r].append((x0, x1))
-                return r
+    def row_y(r: int) -> float:
+        return plot_t + lab_fs + 4 + r * (lab_fs + 6)
+
+    def right_limit(baseline: float) -> float:
+        """A label may run into the right margin unless the end-value label sits at its height."""
+        if end_box is None or baseline + 4 < end_box[0] or baseline - lab_fs - 2 > end_box[1]:
+            return width - 2.0
+        return plot_r - 2.0
+
+    def place(x: float, texts: Sequence[str], offset: float, anchors: Sequence[str] = ("start", "end"),
+              avoid_lines: bool = True) -> Optional[tuple[int, str, str, float]]:
+        """First (text, row, anchor) whose box fits; returns ``(row, text, anchor, text_x)``."""
+        # the preferred side first (any text, any row), so labels sit consistently on one side of their line
+        for anchor in anchors:
+            for text in texts:
+                w = _text_width(text, lab_fs)
+                for r in range(max_rows):
+                    margin = 9.0 if r == 0 else 4.0  # row 0 also clears the badges on the top edge
+                    x0 = x + offset if anchor == "start" else x - offset - w
+                    x1 = x0 + w
+                    if x0 < plot_l + 2 or x1 > right_limit(row_y(r)):
+                        continue
+                    if any(not (x1 + 6 < a0 or x0 > a1 + 6) for a0, a1 in rows[r]):
+                        continue
+                    if avoid_lines and any(x0 - margin < vx < x1 + margin for vx in vlines if abs(vx - x) > 0.5):
+                        continue
+                    rows[r].append((x0, x1))
+                    return r, text, anchor, (x0 if anchor == "start" else x1)
         return None
 
-    now_txt = "현재"
-    w_now = _text_width(now_txt, lab_fs)
-    if len(d.fc_y):
-        nx0, anchor_now = x_now - w_now - 5, "end"   # "현재" sits just left of the divider
-        if nx0 < plot_l + 2:
-            nx0, anchor_now = x_now + 5, "start"
-    else:
-        nx0, anchor_now = x_now - w_now - 5, "end"
-    r0 = place(nx0, nx0 + w_now)
-    if r0 is not None:
-        tx = x_now - 5 if anchor_now == "end" else x_now + 5
-        lbl_g.append(f'<text class="tai-lbl tai-strong" x="{_f1(tx)}" y="{_f1(plot_t + lab_fs + 4 + r0 * (lab_fs + 6))}" '
-                     f'font-size="{lab_fs:g}" text-anchor="{anchor_now}">{now_txt}</text>')
-    for x, text, _tip in sorted(cp_marks, key=lambda m: m[0]):
-        w = _text_width(text, lab_fs)
-        if x + 6 + w <= plot_r:
-            x0, anchor, tx = x + 6, "start", x + 6
-        else:
-            x0, anchor, tx = x - 6 - w, "end", x - 6
-        r = place(x0, x0 + w)
-        if r is None:
+    if math.isfinite(d.last_y) or len(d.hist_t):
+        # "현재" sits just left of the divider at the top (right of it when there is no room);
+        # boxed in by changepoint lines there, it moves to the bottom of the divider, and only
+        # as a last resort is it drawn across a line -- it is too important to drop
+        got = place(x_now, ["현재"], 5.0, ("end", "start"))
+        now_y = row_y(got[0]) if got is not None else None
+        if got is None:
+            w_now = _text_width("현재", lab_fs)
+            for anchor_now in ("end", "start"):
+                x0 = x_now - 5 - w_now if anchor_now == "end" else x_now + 5
+                if (x0 >= plot_l + 2 and x0 + w_now <= right_limit(plot_b - 6)
+                        and not any(x0 - 4 < vx < x0 + w_now + 4 for vx in vlines if abs(vx - x_now) > 0.5)):
+                    got = (0, "현재", anchor_now, x0 if anchor_now == "start" else x0 + w_now)
+                    now_y = plot_b - 6
+                    break
+        if got is None:
+            got = place(x_now, ["현재"], 5.0, ("end", "start"), avoid_lines=False)
+            now_y = row_y(got[0]) if got is not None else None
+        if got is not None and now_y is not None:
+            _, _, anchor_now, tx = got
+            lbl_g.append(f'<text class="tai-lbl tai-strong" x="{_f1(tx)}" y="{_f1(now_y)}" '
+                         f'font-size="{lab_fs:g}" text-anchor="{anchor_now}">현재</text>')
+    for x, texts in sorted(cp_marks, key=lambda m: m[0]):
+        got = place(x, texts, 10.0)
+        if got is None:
             continue
-        lbl_g.append(f'<text class="tai-lbl" x="{_f1(tx)}" y="{_f1(plot_t + lab_fs + 4 + r * (lab_fs + 6))}" '
+        r, text, anchor, tx = got
+        lbl_g.append(f'<text class="tai-lbl" x="{_f1(tx)}" y="{_f1(row_y(r))}" '
                      f'font-size="{lab_fs:g}" text-anchor="{anchor}">{_esc(text)}</text>')
+    ref_v = max(abs(ymin), abs(ymax))
+    for x, v, above in sorted(spikes, key=lambda s: -abs(s[1])):
+        txt = _fmt_axis_value(v, max(abs(v), ref_v))
+        if above:
+            got = place(x, [txt], 8.0)
+            if got is None:
+                continue
+            r, _, anchor, tx = got
+            ty = row_y(r)
+        else:
+            w = _text_width(txt, lab_fs)
+            anchor, tx = ("start", x + 8) if x + 8 + w <= plot_r - 2 else ("end", x - 8)
+            ty = plot_b - 4
+        lbl_g.append(f'<text class="tai-lbl tai-spkl" x="{_f1(tx)}" y="{_f1(ty)}" '
+                     f'font-size="{lab_fs:g}" text-anchor="{anchor}">{_esc(txt)}</text>')
     parts.append("<g>" + "".join(lbl_g) + "</g>")
 
     # legend
@@ -1275,7 +1508,6 @@ def render_text(report: TrendReport, width: int = 78) -> str:
     m = a.metrics
     freq = str(a.freq)
     d = _ChartData(report)
-    unit = PERIOD_KO.get(freq, "기간")
     lines: list[str] = []
     heavy, light = "═" * width, "─" * width
 
@@ -1284,7 +1516,7 @@ def render_text(report: TrendReport, width: int = 78) -> str:
     phase = a.phase
     conf = _finite(getattr(phase, "confidence", None))
     head = [f"[{_term(_phase_ko(phase.label))}]" + (f" 신뢰도 {conf * 100:.0f}%" if conf is not None else ""),
-            f"{FREQ_KO.get(freq, freq)} 단위 {len(d.hist_y)}개",
+            f"{UNIT_KO.get(freq, FREQ_KO.get(freq, freq))} 단위 {len(d.hist_y)}개",
             f"{_fmt_date(m.start, freq)} ~ {_fmt_date(m.end, freq)}"]
     lines += _wrap_segments(head, width)
     lines.append(light)
@@ -1341,8 +1573,9 @@ def render_text(report: TrendReport, width: int = 78) -> str:
 
     # outlook
     direction = str(getattr(o, "direction", "flat"))
+    fut_basis, cur_basis = _change_basis(report, d)
     out_seg = [f"전망 {DIRECTION_ARROW.get(direction, '')} {DIRECTION_KO.get(direction, _term(direction))}".replace("  ", " "),
-               f"예측 변화 {_fmt_pct(o.expected_change_pct)} ({fc.horizon}{unit} 후)",
+               f"예측 변화 {_fmt_pct(o.expected_change_pct)} ({fut_basis}, {cur_basis} 대비)",
                f"상승 확률 {_fmt_prob(o.prob_increase)}",
                f"신뢰도 {CONFIDENCE_KO.get(str(o.confidence), _term(o.confidence))}"]
     lines += _wrap_segments(out_seg, width)
@@ -1357,7 +1590,7 @@ def render_text(report: TrendReport, width: int = 78) -> str:
     lines += _wrap_segments(extra, width)
     cps = list(a.changepoints or [])
     if cps:
-        segs = [f"{_fmt_date(cp.date, freq)} {CHANGEPOINT_KO.get(cp.kind, _term(cp.kind))}" for cp in cps[:4]]
+        segs = [f"{_fmt_date(cp.date, freq)} {_term(_cp_kind(cp)[0])}" for cp in cps[:4]]
         if len(cps) > 4:
             segs.append(f"외 {len(cps) - 4}개")
         segs[0] = "변곡점: " + segs[0]
@@ -1365,7 +1598,15 @@ def render_text(report: TrendReport, width: int = 78) -> str:
     lines.append(light)
     method = _term(fc.method)
     bm = _finite(fc.backtest_mase)
-    lines.append(_fit(f"방법: {method}" + (f" (백테스트 MASE {bm:.2f})" if bm is not None else ""), width))
+    lines.append(_fit(f"방법: {method}", width))
+    skill = _skill_value(fc)
+    acc = [f"정확도: {_SKILL_LABEL} {_rel_error_text(skill)}"]
+    if skill is not None:
+        acc.append("단순 예측보다 정확" if skill <= 0.95 else ("단순 예측과 비슷" if skill <= 1.0
+                                                             else "단순 예측보다 부정확"))
+    if bm is not None:
+        acc.append(f"MASE {bm:.2f}")
+    lines += _wrap_segments(acc, width)
     scores = list(fc.model_scores or [])[:3]
     if scores:
         segs = [f"{_term(s.name)} {_fmt_num(s.mase, 2)}" for s in scores]
@@ -1457,8 +1698,9 @@ box-shadow:var(--shadow);min-width:0}
 @media (max-width:860px){.grid-2,.grid-even{grid-template-columns:minmax(0,1fr)}}
 .narr h3{font-size:15px;margin:20px 0 6px;font-weight:700}.narr h3:first-child,.narr h4:first-child{margin-top:0}
 .narr h4{font-size:14px;margin:16px 0 4px}
-.narr ul{margin:0 0 10px;padding-left:20px}.narr li{margin:4px 0}.narr p{margin:0 0 10px}
-.narr strong{font-weight:700;color:var(--ink)}
+.narr ul,.narr ol{margin:0 0 10px;padding-left:20px}.narr ol{padding-left:24px}.narr li{margin:4px 0}.narr p{margin:0 0 10px}
+.narr li>ul,.narr li>ol{margin:4px 0 2px}.narr li ul{list-style:circle}.narr p+ul,.narr p+ol{margin-top:-4px}
+.narr strong{font-weight:700;color:var(--ink)}.narr em{font-style:italic}
 .src{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:2px 9px;border-radius:999px;
 background:var(--surface-2);color:var(--ink-2);border:1px solid var(--border)}
 .src.llm{background:var(--accent-soft);color:var(--accent);border-color:transparent}
@@ -1480,7 +1722,12 @@ th.num,td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .wbar .mid{position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;background:var(--ink-3);opacity:.5}
 .kind{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;white-space:nowrap}
 .kind .dot{width:7px;height:7px;border-radius:50%}
-.mname{font-weight:600;overflow-wrap:anywhere}.mdesc{display:block;font-size:12px;color:var(--ink-3);font-weight:400}
+.mname{font-weight:600;overflow-wrap:break-word}.mdesc{display:block;font-size:12px;color:var(--ink-3);font-weight:400}
+.sname{font-weight:600;overflow-wrap:anywhere}
+.cpn{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;
+border-radius:999px;background:var(--c-cp);color:#fff;font-size:11px;font-weight:700;margin-right:8px;vertical-align:1px}
+th abbr,.facts dt abbr{text-decoration:underline dotted;text-underline-offset:3px;cursor:help}
+td .unit{font-size:11.5px;color:var(--ink-3);font-weight:400;margin-left:1px}
 tr.inens td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;background:var(--surface-2);
 padding:2px 6px;border-radius:6px;overflow-wrap:anywhere}
@@ -1576,52 +1823,106 @@ def _signed_html(x: Any, text: str) -> str:
     return f'<span class="{cls}"><span class="arrow" aria-hidden="true">{arrow}</span>{_esc(text)}</span>'
 
 
+_MD_BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
+# single-asterisk emphasis: not inside a word on the left (so "a*b*c" and "2 * 3" stay literal),
+# but Korean particles may follow directly ("*강조*입니다")
+_MD_EM = re.compile(r"(?<![\w*])\*(?=[^\s*])([^*]+?)(?<=[^\s*])\*(?!\*)")
+_MD_CODE = re.compile(r"`([^`]+)`")
+_MD_ITEM = re.compile(r"^([-*•+]|(\d{1,3})[.)])\s+(.*)$")
+_MD_HEAD = re.compile(r"^(#{1,6})\s+(.*)$")
+_MD_RULE = re.compile(r"^(?:-{3,}|\*{3,}|_{3,})$")
+
+
 def _md_inline(s: str) -> str:
+    """Escape ``s``, then render ``**bold**``, ``*italic*`` and ```code``` (markup only from the escaped text)."""
     e = _esc(s)
-    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", e)
+    e = _MD_CODE.sub(r"<code>\1</code>", e)
+    e = _MD_BOLD.sub(r"<strong>\1</strong>", e)
+    return _MD_EM.sub(r"<em>\1</em>", e)
 
 
 def _markdown_lite(text: Any) -> str:
-    """Escape first, then render ``## `` headings, ``- `` bullets, ``**bold**`` and paragraphs."""
+    """Render the narrative's Markdown-lite as safe HTML.
+
+    Supported: ``#``–``######`` headings, ``-``/``*``/``•``/``+`` bullets and
+    ``1.``/``1)`` numbered items (``<ul>`` / ``<ol>``), nested lists by
+    indentation (2+ spaces deeper than the parent item; tabs count 4), indented
+    continuation lines of an item, paragraphs, ``**bold**``, ``*italic*`` and
+    ```code```.  Every piece of text is HTML-escaped *before* any markup is
+    added, so the input can never inject tags or attributes.
+    """
     src = "" if text is None else str(text)
     if not src.strip():
         return '<p class="empty">해석이 제공되지 않았습니다.</p>'
     out: list[str] = []
     para: list[str] = []
-    items: list[str] = []
+    stack: list[list[Any]] = []  # open lists: [indent, tag]; each has an open <li>
 
     def flush_para() -> None:
         if para:
             out.append("<p>" + " ".join(para) + "</p>")
             para.clear()
 
-    def flush_list() -> None:
-        if items:
-            out.append("<ul>" + "".join(f"<li>{i}</li>" for i in items) + "</ul>")
-            items.clear()
+    def close_level() -> None:
+        _, tag = stack.pop()
+        out.append(f"</li></{tag}>")
+
+    def close_lists() -> None:
+        while stack:
+            close_level()
+
+    def open_list(indent: int, tag: str, num: Optional[str]) -> None:
+        start = f' start="{int(num)}"' if tag == "ol" and num is not None and int(num) != 1 else ""
+        out.append(f"<{tag}{start}><li>")
+        stack.append([indent, tag])
 
     for raw in src.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        line = raw.strip()
+        expanded = raw.expandtabs(4)
+        line = expanded.strip()
+        indent = len(expanded) - len(expanded.lstrip(" "))
         if not line:
             flush_para()
-            flush_list()
+            close_lists()
             continue
-        mh = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if _MD_RULE.match(line):
+            flush_para()
+            close_lists()
+            continue
+        mh = _MD_HEAD.match(line)
         if mh:
             flush_para()
-            flush_list()
+            close_lists()
             tag = "h3" if len(mh.group(1)) <= 2 else "h4"
             out.append(f"<{tag}>{_md_inline(mh.group(2))}</{tag}>")
             continue
-        mb = re.match(r"^(?:[-*•]|\d+[.)])\s+(.*)$", line)
+        mb = _MD_ITEM.match(line)
         if mb:
             flush_para()
-            items.append(_md_inline(mb.group(1)))
+            tag = "ol" if mb.group(2) is not None else "ul"
+            if not stack:
+                open_list(indent, tag, mb.group(2))
+            else:
+                # dedent: close the levels this item is not part of (an item still indented
+                # past its grandparent's marker stays in the current sub-list)
+                while len(stack) > 1 and indent < stack[-1][0] and indent < stack[-2][0] + 2:
+                    close_level()
+                if indent >= stack[-1][0] + 2:          # deeper: a sub-list inside the open item
+                    open_list(indent, tag, mb.group(2))
+                elif stack[-1][1] != tag:               # same level, other list type
+                    close_level()
+                    open_list(indent, tag, mb.group(2))
+                else:                                   # next item of the same list
+                    stack[-1][0] = min(stack[-1][0], indent)
+                    out.append("</li><li>")
+            out.append(_md_inline(mb.group(3)))
             continue
-        flush_list()
+        if stack and indent > stack[-1][0]:            # indented continuation of the open item
+            out.append(" " + _md_inline(line))
+            continue
+        close_lists()
         para.append(_md_inline(line))
     flush_para()
-    flush_list()
+    close_lists()
     return "".join(out)
 
 
@@ -1659,7 +1960,7 @@ def _header_html(report: TrendReport, d: _ChartData) -> str:
     chips = [
         _badge(str(a.phase.label), conf),
         f'<span class="chip">기간 {_esc(_fmt_date(m.start, freq))} ~ {_esc(_fmt_date(m.end, freq))}</span>',
-        f'<span class="chip">{_esc(FREQ_KO.get(freq, freq))} 단위 · 관측 {len(d.hist_y):,}개</span>',
+        f'<span class="chip">{_esc(UNIT_KO.get(freq, FREQ_KO.get(freq, freq)))} 단위 · 관측 {len(d.hist_y):,}개</span>',
         f'<span class="chip">예측 {int(report.forecast.horizon):,}{_esc(PERIOD_KO.get(freq, "기간"))}</span>',
     ]
     return (
@@ -1673,9 +1974,10 @@ def _header_html(report: TrendReport, d: _ChartData) -> str:
 
 
 def _kpis_html(report: TrendReport, d: _ChartData) -> str:
-    m, o, fc = report.analysis.metrics, report.outlook, report.forecast
+    m, o = report.analysis.metrics, report.outlook
     freq = d.freq
     unit = PERIOD_KO.get(freq, "기간")
+    fut_basis, cur_basis = _change_basis(report, d)
     # analysis.compute_metrics: lag = data.season_length(freq) (1 for yearly), capped at n - 1
     try:
         season = _season_length(freq)
@@ -1686,7 +1988,6 @@ def _kpis_html(report: TrendReport, d: _ChartData) -> str:
     dd = _finite(m.drawdown_pct)
     peak_sub = (f"최고점 대비 {_fmt_pct(dd)}" if dd is not None and dd < -0.05
                 else "현재 최고 수준")
-    end_fc = _fmt_date(d.fc_dates[-1], freq) if len(d.fc_dates) else _DASH
     p = _finite(o.prob_increase)
     meter = (f'<div class="meter" role="img" aria-label="상승 확률 {_fmt_prob(p)}">'
              f'<span style="width:{(min(1.0, max(0.0, p)) * 100) if p is not None else 0:.0f}%"></span></div>')
@@ -1699,7 +2000,7 @@ def _kpis_html(report: TrendReport, d: _ChartData) -> str:
         _kpi("연평균 성장률 CAGR", _signed_html(m.cagr_pct, _fmt_pct(m.cagr_pct)), "연 환산 복리 성장률"),
         _kpi("최근 변화", _signed_html(m.recent_change_pct, _fmt_pct(m.recent_change_pct)), _esc(recent_span)),
         _kpi("예측 변화", _signed_html(o.expected_change_pct, _fmt_pct(o.expected_change_pct)),
-             f'향후 {int(fc.horizon):,}{_esc(unit)} · <span class="nw">{_esc(end_fc)}까지</span>'),
+             f'{_esc(fut_basis)} · <span class="nw">{_esc(cur_basis)} 대비</span>'),
         _kpi("상승 확률", f"<span>{_esc(_fmt_prob(p))}</span>",
              f"예측 신뢰도 {_esc(CONFIDENCE_KO.get(str(o.confidence), str(o.confidence)))}", extra=meter),
     ]
@@ -1713,7 +2014,10 @@ def _chart_card(report: TrendReport, d: _ChartData) -> str:
     band_txt = ", ".join(f"{lv}%" for lv, _, _ in sorted(d.bands, key=lambda b: b[0]))
     desc = "실선은 실제값, 점선은 추세, 주황선은 예측 평균"
     desc += f"이며 음영은 {band_txt} 예측 구간입니다." if n_b else "입니다."
-    desc += " 세로 점선이 현재 시점입니다."
+    desc += " 세로 점선이 현재 시점이고, 번호 표시는 아래 변곡점 표의 번호입니다." if report.analysis.changepoints \
+        else " 세로 점선이 현재 시점입니다."
+    if d.spikes_clipped():
+        desc += " 축 범위를 크게 벗어난 이상치는 위·아래 가장자리에 ▲와 값으로 표시했습니다."
     return (f'<section class="card chart-card"><h2>과거 · 현재 · 미래</h2><p class="desc">{_esc(desc)}</p>'
             f"{charts}</section>")
 
@@ -1767,20 +2071,27 @@ def _outlook_card(report: TrendReport, d: _ChartData) -> str:
             segs.append(f'<div class="rl" style="left:{lab_pos:.1f}%">현재 수준 {_esc(_fmt_short(cur))}</div>')
         range_html = (f'<div class="range" role="img" aria-label="시나리오 범위와 현재 수준">{"".join(segs)}</div>')
     peak = _ts(o.forecast_peak_date)
-    facts = [
-        ("상승 확률", _fmt_prob(o.prob_increase)),
-        ("예측 변화", _fmt_pct(o.expected_change_pct)),
-        ("미래 단계", _phase_ko(o.future_phase)),
-        ("예측 신뢰도", CONFIDENCE_KO.get(str(o.confidence), str(o.confidence))),
-        ("예측 정점", _fmt_date(peak, freq) if peak is not None else "예측 기간 내 없음"),
+    skill = _skill_value(fc)
+    fut_basis, cur_basis = _change_basis(report, d)
+    facts: list[tuple[str, str, str, str]] = [  # (label, value, tooltip, value class)
+        ("상승 확률", _fmt_prob(o.prob_increase), "", ""),
+        ("예측 변화", _fmt_pct(o.expected_change_pct), f"{fut_basis}을 {cur_basis}과 비교한 변화율", ""),
+        ("미래 단계", _phase_ko(o.future_phase), "", ""),
+        ("예측 신뢰도", CONFIDENCE_KO.get(str(o.confidence), str(o.confidence)), "", ""),
+        (_SKILL_LABEL, _rel_error_text(skill), _SKILL_TIP, _rel_error_class(skill)),
+        ("예측 정점", _fmt_date(peak, freq) if peak is not None else "예측 기간 내 없음", "", ""),
     ]
-    facts_html = "".join(f"<dt>{_esc(k)}</dt><dd>{_esc(v)}</dd>" for k, v in facts)
+    facts_html = "".join(
+        (f'<dt><abbr title="{_esc(tip)}">{_esc(k)}</abbr></dt>' if tip else f"<dt>{_esc(k)}</dt>")
+        + (f'<dd class="{vc}">{_esc(v)}</dd>' if vc else f"<dd>{_esc(v)}</dd>")
+        for k, v, tip, vc in facts)
     arrow = DIRECTION_ARROW.get(direction, "")
     return (
         '<section class="card"><h2>미래 전망</h2>'
         f'<p class="desc">{_esc(end_fc)}까지 · 향후 {int(fc.horizon):,}{_esc(unit)}</p>'
         f'<div class="dir"><span class="big {cls}">{_esc(arrow)} {_esc(dir_ko)}</span>'
         f'<span class="lab">{_esc(_fmt_pct(o.expected_change_pct))} 예상</span></div>'
+        f'<p class="desc" style="margin:-8px 0 14px">변화율은 {_esc(fut_basis)}을 {_esc(cur_basis)}과 비교한 값입니다.</p>'
         f'<h3 class="sub">시나리오 ({_esc(end_fc)})</h3><div class="scen">{sc_html}</div>{range_html}'
         f'<dl class="facts">{facts_html}</dl></section>'
     )
@@ -1791,9 +2102,16 @@ def _diagnosis_card(report: TrendReport, d: _ChartData) -> str:
     m = a.metrics
     freq = d.freq
     conf = _finite(getattr(a.phase, "confidence", None))
-    reasons = [str(r) for r in (a.phase.reasons or [])]
-    reasons_html = ("<ul class=\"reasons\">" + "".join(f"<li>{_esc(r)}</li>" for r in reasons) + "</ul>"
-                    if reasons else "")
+    reasons = [str(r) for r in (a.phase.reasons or []) if str(r).strip()]
+    # the rule-based narrative quotes the reasons as "근거:" bullets in the card next to this one
+    narr = " ".join(str(report.narrative or "").split())
+    shown = [r for r in reasons if " ".join(r.split()) not in narr]
+    reasons_html = ("<ul class=\"reasons\">" + "".join(f"<li>{_esc(r)}</li>" for r in shown) + "</ul>"
+                    if shown else "")
+    desc = "수명주기 단계와 판단 근거"
+    if reasons and len(shown) < len(reasons):
+        desc = ("수명주기 단계와 주요 지표 · 판단 근거는 ‘AI 트렌드 해석’의 현재 항목에 있습니다" if not shown
+                else "수명주기 단계와 판단 근거 · 나머지 근거는 ‘AI 트렌드 해석’에 있습니다")
     vol = _finite(m.volatility)
     mom = _fmt_num(m.momentum, 2, signed=True)
     facts = [
@@ -1807,7 +2125,7 @@ def _diagnosis_card(report: TrendReport, d: _ChartData) -> str:
     facts_html = "".join(f"<dt>{_esc(k)}</dt><dd>{_esc(v)}</dd>" for k, v in facts)
     return (
         '<section class="card"><h2>현재 진단</h2>'
-        f'<p class="desc">수명주기 단계와 판단 근거</p>{_badge(str(a.phase.label), conf)}{reasons_html}'
+        f'<p class="desc">{_esc(desc)}</p>{_badge(str(a.phase.label), conf)}{reasons_html}'
         f'<dl class="facts" style="margin-top:16px">{facts_html}</dl></section>'
     )
 
@@ -1819,18 +2137,18 @@ def _events_card(report: TrendReport, d: _ChartData) -> str:
     cps = list(a.changepoints or [])
     if cps:
         rows = []
-        for cp in cps:
-            kind = str(cp.kind)
-            color = KIND_COLOR.get(kind, "#898781")
+        for num, cp in enumerate(cps, 1):
+            kind_ko, color = _cp_kind(cp)
             rows.append(
-                f"<tr><td class=\"num\" style=\"text-align:left\">{_esc(_fmt_date(cp.date, freq))}</td>"
+                f'<tr><td class="num" style="text-align:left"><span class="cpn" aria-label="변곡점 {num}">{num}</span>'
+                f"{_esc(_fmt_date(cp.date, freq))}</td>"
                 f'<td><span class="kind"><span class="dot" style="background:{color}"></span>'
-                f"{_esc(CHANGEPOINT_KO.get(kind, kind))}</span></td>"
+                f"{_esc(kind_ko)}</span></td>"
                 f"<td class=\"num\">{_esc(_fmt_num(cp.slope_before, signed=True))} → "
                 f"{_esc(_fmt_num(cp.slope_after, signed=True))}</td>"
-                f"<td class=\"num\">{_esc(_fmt_num(cp.magnitude, 2))}</td></tr>")
+                f"<td class=\"num hide-sm\">{_esc(_fmt_num(cp.magnitude, 2))}</td></tr>")
         cp_html = (f'<div class="table-wrap"><table><thead><tr><th>날짜</th><th>유형</th>'
-                   f'<th class="num">기울기 (/{_esc(unit)}) 전 → 후</th><th class="num">크기</th></tr></thead>'
+                   f'<th class="num">기울기 (/{_esc(unit)}) 전 → 후</th><th class="num hide-sm">크기</th></tr></thead>'
                    f'<tbody>{"".join(rows)}</tbody></table></div>')
     else:
         cp_html = '<p class="empty">뚜렷한 구조 변화(변곡점)가 감지되지 않았습니다.</p>'
@@ -1860,37 +2178,68 @@ def _events_card(report: TrendReport, d: _ChartData) -> str:
 def _models_card(report: TrendReport) -> str:
     fc = report.forecast
     scores = list(fc.model_scores or [])
+    skill = _skill_value(fc)
     if scores:
         max_w = max([_finite(s.weight) or 0.0 for s in scores] + [0.0])
+        # per-model error versus the best naive benchmark on the same backtest windows
+        # (the same ratio as ForecastResult.skill, row by row)
+        naive_name, naive_mae = _best_naive_mae(scores)
         rows = []
         for i, s in enumerate(scores, 1):
             w = _finite(s.weight) or 0.0
             desc = _model_desc(s.name)
             fill = (w / max_w * 100) if max_w > 0 else 0.0
+            mae = _finite(s.mae)
+            if naive_mae is None or mae is None or mae < 0:
+                rel_html = _DASH
+            elif str(s.name) == naive_name:
+                rel_html = '<span class="muted">기준</span>'
+            elif naive_mae > 0:
+                ratio = mae / naive_mae
+                rel_cls = _rel_error_class(ratio)
+                rel_txt = _esc(_rel_error_text(ratio))
+                rel_html = f'<span class="{rel_cls}">{rel_txt}</span>' if rel_cls else rel_txt
+            else:
+                rel_html = _DASH
             rows.append(
                 f'<tr class="{"inens" if w > 0 else ""}"><td class="num" style="text-align:left">{i}</td>'
-                f'<td><span class="mname">{_esc(s.name)}</span>'
+                f'<td><span class="mname">{_model_html(s.name)}</span>'
                 f'{f"<span class=mdesc>{_esc(desc)}</span>" if desc else ""}</td>'
                 f'<td class="num">{_esc(_fmt_num(s.mase, 3))}</td>'
-                f'<td class="num">{_esc(_fmt_pct(s.smape, signed=False))}</td>'
+                f'<td class="num">{rel_html}</td>'
+                f'<td class="num hide-sm">{_esc(_fmt_pct(s.smape, signed=False))}</td>'
                 f'<td><div class="wbar"><div class="track"><div class="fill" style="width:{fill:.1f}%"></div></div>'
                 f'<span class="pct">{w * 100:.0f}%</span></div></td></tr>')
-        table = ('<div class="table-wrap"><table><thead><tr><th>#</th><th>모델</th><th class="num">MASE</th>'
-                 '<th class="num">sMAPE</th><th>앙상블 가중치</th></tr></thead>'
+        naive_ko = MODEL_KO.get(naive_name or "", "")
+        rel_tip = ("같은 백테스트 구간에서 가장 나은 단순 기준 예측"
+                   + (f"({naive_name}: {naive_ko})" if naive_name else "")
+                   + "보다 평균 절대 오차가 몇 % 작은지(−) 큰지(+)")
+        table = ('<div class="table-wrap"><table><thead><tr><th>#</th><th>모델</th>'
+                 f'<th class="num"><abbr title="{_esc(_MASE_TIP)}">MASE</abbr></th>'
+                 f'<th class="num"><abbr title="{_esc(rel_tip)}">단순 대비</abbr></th>'
+                 '<th class="num hide-sm">sMAPE</th><th>앙상블 가중치</th></tr></thead>'
                  f'<tbody>{"".join(rows)}</tbody></table></div>')
     else:
         table = '<p class="empty">백테스트 점수가 없습니다 (데이터가 짧아 단순 모델을 사용).</p>'
     bm = _finite(fc.backtest_mase)
-    if bm is None:
-        bm_txt = "백테스트 MASE를 계산할 수 없습니다."
+    if bm is None and skill is None:
+        acc_txt = "데이터가 짧아 백테스트로 정확도를 검증하지 못했습니다."
     else:
-        cmp_txt = "계절 단순 예측보다 정확" if bm < 1 else "계절 단순 예측과 비슷하거나 부정확"
-        bm_txt = f"최종 방법의 백테스트 MASE {bm:.2f} ({cmp_txt}; 1 미만일수록 좋음)"
+        acc_txt = _skill_sentence(skill)
+    skill_html = (f'<abbr title="{_esc(_SKILL_TIP)}">{_SKILL_LABEL}</abbr> '
+                  f'<strong class="{_rel_error_class(skill)}">{_esc(_rel_error_text(skill))}</strong>')
+    mase_note = ""
+    if bm is not None:
+        mase_note = (f"기술 참고: 최종 방법의 백테스트 MASE {bm:.2f}. MASE는 학습 구간에서 한 기 앞을 계절 단순 예측한 "
+                     "오차를 1로 둔 상대 오차라, 여러 기 앞을 내다보는 예측은 단순 예측보다 정확해도 1을 넘기 쉬우므로 "
+                     "단순 예측과의 우열은 위의 ‘단순 대비’로 판단합니다.")
     return (
         '<section class="card"><h2>모델 리더보드</h2>'
         '<p class="desc">롤링 원점 백테스트 성적(MASE 낮을수록 좋음). 왼쪽 강조선은 최종 앙상블에 포함된 모델입니다.</p>'
         f'{table}<p class="desc" style="margin:14px 0 0">최종 방법 <code>{_esc(fc.method)}</code></p>'
-        f'<p class="desc" style="margin:6px 0 0">{_esc(bm_txt)}</p></section>'
+        f'<p style="margin:8px 0 0;font-size:14px">{skill_html} · {_esc(acc_txt)}</p>'
+        + (f'<p class="desc" style="margin:6px 0 0">{_esc(mase_note)}</p>' if mase_note else "")
+        + "</section>"
     )
 
 
@@ -2021,6 +2370,9 @@ def render_compare_html(reports: list[TrendReport], ranking: pd.DataFrame,
         score = _finite(_cell(row, "score"))
         scores[nm] = score
         mom = _cell(row, "momentum")
+        mom_txt = _fmt_num(mom, 2, signed=True)
+        r_freq = str(getattr(getattr(by_name.get(nm), "analysis", None), "freq", ""))
+        mom_unit = f"%p{_PER_UNIT.get(r_freq, '')}" if mom_txt != _DASH else ""
         rc = _cell(row, "recent_change_pct")
         ec = _cell(row, "expected_change_pct")
         pi = _cell(row, "prob_increase")
@@ -2028,8 +2380,9 @@ def render_compare_html(reports: list[TrendReport], ranking: pd.DataFrame,
         badge = _badge(phase_s) if phase_s else _DASH
         rows_html.append(
             f'<tr><td class="num" style="text-align:left"><strong>{pos}</strong></td>'
-            f'<td><span class="mname">{_esc(nm)}</span></td><td class="hide-sm">{badge}</td>'
-            f'<td class="num hide-sm">{_signed_html(mom, _fmt_num(mom, 2, signed=True))}</td>'
+            f'<td><span class="sname">{_esc(nm)}</span></td><td class="hide-sm">{badge}</td>'
+            f'<td class="num hide-sm">{_signed_html(mom, mom_txt)}'
+            f'{f"<span class=unit>{_esc(mom_unit)}</span>" if mom_unit else ""}</td>'
             f'<td class="num hide-sm">{_signed_html(rc, _fmt_pct(rc))}</td>'
             f'<td class="num">{_signed_html(ec, _fmt_pct(ec))}</td>'
             f'<td class="num hide-sm">{_esc(_fmt_prob(pi))}</td>'
@@ -2037,7 +2390,9 @@ def render_compare_html(reports: list[TrendReport], ranking: pd.DataFrame,
             f'<span class="mid"></span></div><span class="pct score">{_esc(_fmt_num(score, 0))}</span></div></td></tr>')
     if rows_html:
         table = ('<div class="table-wrap"><table><thead><tr><th>순위</th><th>이름</th><th class="hide-sm">단계</th>'
-                 '<th class="num hide-sm">모멘텀</th><th class="num hide-sm">최근 변화</th><th class="num">예측 변화</th>'
+                 '<th class="num hide-sm"><abbr title="최근 추세 기울기 − 장기 기울기 (평균 수준 대비 %p, 기간당)">'
+                 '모멘텀 (%p/기간)</abbr></th>'
+                 '<th class="num hide-sm">최근 변화</th><th class="num">예측 변화</th>'
                  '<th class="num hide-sm">상승 확률</th><th class="th-score">상승 점수</th></tr></thead>'
                  f'<tbody>{"".join(rows_html)}</tbody></table></div>')
     else:

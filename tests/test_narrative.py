@@ -233,7 +233,8 @@ def test_daily_report_caveats_and_units():
 @pytest.mark.parametrize("freq,n,unit,datepat", [
     ("W", 156, "/주", r"\d{4}-\d{2}-\d{2}"),
     ("Q", 40, "/분기", r"\d{4}-Q[1-4]"),
-    ("Y", 30, "/년", r"\b\d{4}\b"),
+    # yearly dates are the bare year; Korean prose attaches the counter (2016년부터, 2028년 예측값)
+    ("Y", 30, "/년", r"\b\d{4}년"),
 ])
 def test_other_frequencies(freq, n, unit, datepat):
     rep = _make_report(freq, n=n, horizon=4, changepoints=False, forecast_peak=False)
@@ -242,6 +243,11 @@ def test_other_frequencies(freq, n, unit, datepat):
     assert re.search(datepat, text)
     for h in KO_HEADINGS:
         assert h in text
+    if freq == "Y":
+        assert not re.search(r"\d{4}-(?:\d{2}|Q)", text)          # no month / quarter part
+        assert not re.search(r"\b\d{4}(?:부터|까지|의|에) ", text)  # no bare year before a particle
+        en = rule_based_narrative(*_parts(rep), lang="en")
+        assert re.search(r"\b\d{4}\b", en) and "년" not in en
 
 
 def test_short_series_caveat():
@@ -600,7 +606,9 @@ def test_flat_direction_with_visible_change_is_explained(fake_report):
 ])
 def test_probability_wording_is_symmetric(fake_report, p, ko, en):
     rep = dataclasses.replace(fake_report, outlook=dataclasses.replace(fake_report.outlook, prob_increase=p))
-    assert f"약 **{p * 100:.0f}%**로, {ko}" in rule_based_narrative(*_parts(rep))
+    # a model probability of exactly 0 is shown as "<1%", never as a certain "0%" (see format_prob)
+    shown = "**<1%**" if p == 0.0 else f"약 **{p * 100:.0f}%**"
+    assert f"{shown}로, {ko}" in rule_based_narrative(*_parts(rep))
     assert en in rule_based_narrative(*_parts(rep), lang="en")
 
 
@@ -792,6 +800,323 @@ def test_payload_with_numpy_scalar_levels_is_json_serialisable():
 
 
 def test_mase_close_to_one_is_not_oversold(fake_report):
-    rep = dataclasses.replace(fake_report, forecast=dataclasses.replace(fake_report.forecast, backtest_mase=0.99))
+    # the naive comparison now comes from ForecastResult.skill (same backtest windows); a near-tie
+    # must still not be sold as "about 1 % lower error"
+    rep = dataclasses.replace(fake_report, forecast=dataclasses.replace(
+        fake_report.forecast, backtest_mase=0.99, skill=0.99))
     ko = rule_based_narrative(*_parts(rep))
-    assert "MASE 0.99: 단순 기준 예측과 비슷한 수준" in ko and "오차 약 1% 감소" not in ko
+    assert "비슷해(차이 5% 이내)" in ko and "약 1%" not in ko and "MASE 0.99" in ko
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "about the same as" in en and "about 1%" not in en
+    # without a skill a raw MASE of 0.99 supports no naive comparison at all
+    rep0 = dataclasses.replace(fake_report, forecast=dataclasses.replace(fake_report.forecast, backtest_mase=0.99))
+    ko0 = rule_based_narrative(*_parts(rep0))
+    assert "MASE 0.99" in ko0 and "단순 기준보다 나은지는 판단하지 않았습니다" in ko0
+    assert "비슷" not in ko0.split("- 정확도:")[1].split("\n")[0]
+
+
+# --------------------------------------------------------------------------- fixer round: regressions
+
+
+def _with_outlook(rep: TrendReport, **kw) -> TrendReport:
+    return dataclasses.replace(rep, outlook=dataclasses.replace(rep.outlook, **kw))
+
+
+def _with_forecast(rep: TrendReport, **kw) -> TrendReport:
+    return dataclasses.replace(rep, forecast=dataclasses.replace(rep.forecast, **kw))
+
+
+@pytest.mark.parametrize("p,shown", [
+    (1.0, ">99%"), (0.9987, ">99%"), (0.995, ">99%"), (0.994, "99%"), (0.9, "90%"),
+    (0.5, "50%"), (0.006, "1%"), (0.005, "<1%"), (0.0013, "<1%"), (0.0, "<1%"),
+])
+def test_probabilities_are_never_shown_as_certain(fake_report, p, shown):
+    assert nv.format_prob(p) == shown
+    rep = _with_outlook(fake_report, prob_increase=p)
+    ko = rule_based_narrative(*_parts(rep))
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert f"상승 확률 {shown}," in ko.splitlines()[0]
+    assert f"Probability of increase {shown}," in en.splitlines()[0]
+    approx = "" if shown[0] in "<>" else "약 "
+    assert f"높아질 확률은 {approx}**{shown}**로" in ko
+    for text in (ko, en):
+        assert "100%" not in text and not re.search(r"(?<![\d.])0%", text)
+    assert nv.format_prob(None) == "해당 없음" and nv.format_prob(float("nan"), "en") == "n/a"
+
+
+def test_sub_items_are_nested_bullets(fake_report):
+    s = fake_report.analysis.series
+    ans = [Anomaly(date=s.index[i], index=i, value=float(s.iloc[i]), expected=float(s.iloc[i]) - 1, zscore=z)
+           for i, z in ((20, 5.0), (40, -6.0))]
+    analysis = dataclasses.replace(fake_report.analysis, anomalies=ans)
+    for lang in ("ko", "en"):
+        lines = rule_based_narrative(analysis, fake_report.forecast, fake_report.outlook, lang=lang).splitlines()
+        intro = [i for i, ln in enumerate(lines) if ln.startswith("- ") and ln.endswith(":")]
+        assert len(intro) == 2                                    # changepoints + anomalies
+        for i in intro:
+            assert lines[i + 1].startswith("  - ")                # nested, two-space indent
+        nested = [ln for ln in lines if ln.startswith("  - ")]
+        assert len(nested) == 3                                   # 1 changepoint + 2 anomalies
+        # nothing else is indented, and the nested items follow their intro line directly
+        assert all(ln.startswith(("- ", "  - ", "## ", "**")) or not ln for ln in lines)
+    ko = rule_based_narrative(analysis, fake_report.forecast, fake_report.outlook)
+    assert "  - **2021-12**부터 성장 가속" in ko
+
+
+@pytest.mark.parametrize("stop,lang,note", [
+    ("max_tokens", "ko", "잘렸을 수 있습니다"),
+    ("max_tokens", "en", "may be cut off"),
+    ("model_context_window_exceeded", "en", "may be cut off"),
+])
+def test_truncated_llm_response_warns_and_says_so(fake_report, stop, lang, note):
+    client = FakeClient(_resp(_text("## 과거\n- 성장 중이며 최근"), stop_reason=stop))
+    with pytest.warns(RuntimeWarning, match=stop):
+        out = llm_narrative(*_parts(fake_report), lang=lang, client=client)
+    assert out.startswith("## 과거\n- 성장 중이며 최근") and out.rstrip().endswith(out.rstrip().splitlines()[-1])
+    assert note in out.splitlines()[-1]
+    with pytest.warns(RuntimeWarning, match=stop):
+        ans = ask(fake_report, "why?", lang=lang, client=FakeClient(_resp(_text("Because"), stop_reason=stop)))
+    assert ans.startswith("Because") and note in ans
+    with pytest.warns(RuntimeWarning, match=stop):
+        text, source = generate_narrative(*_parts(fake_report), use_llm=True, lang=lang, client=FakeClient(
+            _resp(_text("partial"), stop_reason=stop)))
+    assert source == "llm" and note in text
+
+
+def test_complete_llm_response_gets_no_truncation_note(fake_report):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = llm_narrative(*_parts(fake_report), client=FakeClient(_resp(_text("완결된 해설"))))
+    assert out == "완결된 해설"
+
+
+@pytest.mark.parametrize("mase,skill,ko,not_ko", [
+    # multi-step MASE > 1 while far better than naive (verifier: emerging 1.36 vs. naive benchmarks 2.4-4.4)
+    (1.36, 0.56, "보다 오차가 **약 44%** 작았습니다", ("낫지 않", "나은 성과를 보이지 못")),
+    # MASE far below 1 while only 3 % better than naive (verifier: 'policy', claimed 71 %)
+    (0.29, 0.97, "비슷해(차이 5% 이내)", ("71%", "작았습니다", "나은 성과를 보이지 못")),
+    (0.65, 0.65, "보다 오차가 **약 35%** 작았습니다", ("낫지 않", "나은 성과를 보이지 못")),
+    (0.80, 1.20, "보다 나은 성과를 보이지 못했습니다 (오차가 약 20% 더 큼)", ("작았습니다",)),
+    (0.80, 2.50, "(오차가 약 2.5배)", ("작았습니다",)),
+    (0.70, 0.001, "보다 오차가 **99% 이상** 작았습니다", ("100%",)),
+])
+def test_accuracy_is_judged_by_skill_not_raw_mase(fake_report, mase, skill, ko, not_ko):
+    rep = _with_forecast(fake_report, backtest_mase=mase, skill=skill)
+    text = rule_based_narrative(*_parts(rep))
+    assert ko in text
+    for bad in not_ko:
+        assert bad not in text
+    assert f"MASE {mase:.2f}" in text                              # kept as a technical note ...
+    acc = next(ln for ln in text.splitlines() if ln.startswith("- 정확도:"))
+    assert "기술 참고" in acc                                      # ... with a one-line explanation
+    beaten = "백테스트에서 단순 기준 예측보다 나은 성과를 보이지 못했습니다." in text.split("## 주의할 점")[1]
+    assert beaten == (skill > 1)                                   # caveat only when skill > 1
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert ("did not beat" in en) == (skill > 1)
+    assert "no better than" not in en and "seasonal-naive baseline" not in en
+
+
+def test_accuracy_without_skill_makes_no_naive_claim(fake_report):
+    for mase in (0.4, 1.6):
+        rep = _with_forecast(fake_report, backtest_mase=mase, skill=None)
+        ko = rule_based_narrative(*_parts(rep))
+        assert "단순 기준보다 나은지는 판단하지 않았습니다" in ko
+        for bad in ("작았습니다", "낫지 않", "나은 성과를 보이지 못", "감소"):
+            assert bad not in ko
+        assert "not assessed" in rule_based_narrative(*_parts(rep), lang="en")
+    rep = _with_forecast(fake_report, backtest_mase=None, skill=None)
+    assert "백테스트로 정확도를 검증하지 못했습니다" in rule_based_narrative(*_parts(rep))
+
+
+def test_payload_and_prompt_describe_skill_not_mase_below_one(fake_report):
+    payload = build_llm_payload(*_parts(_with_forecast(fake_report, skill=0.6123)))
+    assert payload["forecast"]["skill"] == 0.612
+    assert "same backtest windows" in payload["conventions"]["skill"]
+    assert "< 1 means more accurate" not in json.dumps(payload["conventions"])
+    assert "do not compare it with 1" in payload["conventions"]["mase"]
+    assert build_llm_payload(*_parts(fake_report))["forecast"]["skill"] is None
+    p = SYSTEM_PROMPT.lower()
+    assert "forecast.skill" in p and "below 1 = more accurate" not in p
+    assert ">99%" in SYSTEM_PROMPT and "never read the raw mase against 1" in p
+
+
+def test_real_engine_mase_above_one_is_not_called_worse_than_naive():
+    analysis_mod = pytest.importorskip("trendai.analysis")
+    forecast_mod = pytest.importorskip("trendai.forecast")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        a = analysis_mod.analyze(sample("emerging"), name="emerging")
+        f = forecast_mod.auto_forecast(a.series, freq=a.freq)
+        o = forecast_mod.compute_outlook(a, f)
+    text = rule_based_narrative(a, f, o)
+    assert "낫지 않음" not in text
+    if f.skill is not None and f.skill < 1:
+        assert "나은 성과를 보이지 못" not in text and "작았습니다" in text
+    assert "100%" not in text
+
+
+def test_expected_change_names_the_seasonal_adjustment():
+    # weekly data, 26-step horizon < 52-week season: compute_outlook removes the seasonal effect
+    rep = _make_report("W", n=156, horizon=26, changepoints=False, forecast_peak=False)
+    ko = rule_based_narrative(*_parts(rep))
+    line = next(ln for ln in ko.splitlines() if "변할 것으로 예상됩니다" in ln)
+    assert line.startswith("- 계절 효과를 보정한 향후 26주 예측 평균은 최근 52주 평균보다")
+    assert "계절 주기(52주)를 다 채우지 못해" in line
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "The seasonally adjusted average forecast over the next 26 weeks" in en
+    assert "A 26-week window covers only part of the 52-week seasonal cycle" in en
+    basis = build_llm_payload(*_parts(rep))["outlook"]["expected_change_basis"]
+    assert "last 26 forecast periods" in basis and "covers only part of the 52-period seasonal cycle" in basis
+    # whole seasons (monthly, 12-step horizon): plain averages, no adjustment wording
+    rep_m = _make_report("M", n=120, horizon=12, changepoints=False, forecast_peak=False)
+    ko_m = rule_based_narrative(*_parts(rep_m))
+    assert "향후 12개월 예측 평균은 최근 12개월 평균보다" in ko_m and "계절 효과를 보정한" not in ko_m
+    assert "covers only part" not in build_llm_payload(*_parts(rep_m))["outlook"]["expected_change_basis"]
+    # horizon longer than a season: the last season of the forecast
+    rep_l = _make_report("M", n=120, horizon=24, changepoints=False, forecast_peak=False)
+    assert "예측 마지막 12개월 평균은 최근 12개월 평균보다" in rule_based_narrative(*_parts(rep_l))
+
+
+def test_korean_wording_confidence_phase_shift_and_drawdown(fake_report):
+    ko = rule_based_narrative(*_parts(fake_report))
+    assert "예측 신뢰도는 **높은 편**입니다." in ko and "높음입니다" not in ko
+    for conf, word in (("medium", "보통 수준"), ("low", "낮은 편")):
+        t = rule_based_narrative(*_parts(_with_outlook(fake_report, confidence=conf)))
+        assert f"예측 신뢰도는 **{word}**입니다." in t
+    shift = rule_based_narrative(*_parts(_with_outlook(fake_report, future_phase="peaking")))
+    line = next(ln for ln in shift.splitlines() if "넘어갈 가능성" in ln)
+    assert line.count("국면") == 1 and "**성장기**에서 **정점/성숙기** 국면으로" in line
+    # drawdown tiers: −95 % is far more than "less than half", and "고점 대비" is not repeated
+    t = np.arange(48.0)
+    vals = np.r_[np.linspace(10, 100, 24), np.linspace(100, 5, 24)]
+    rep = _replace_metrics(_report_from_values(vals), drawdown_pct=-95.0, peak_value=100.0,
+                           peak_date=pd.Timestamp("2017-12-01"), last_value=5.0)
+    text = rule_based_narrative(*_parts(rep))
+    line = next(ln for ln in text.splitlines() if ln.startswith("- 최고치는"))
+    assert "고점보다 95.0% 낮아 고점의 1/10 이하로 급감했습니다" in line and "절반" not in line
+    assert line.count("고점 대비") == 0
+    assert "less than a tenth of the peak" in rule_based_narrative(*_parts(rep), lang="en")
+    for dd, word in ((-3.0, "여전히 고점 부근입니다"), (-12.0, "다소 내려와 있습니다"),
+                     (-35.0, "상당히 내려와 있습니다"), (-60.0, "고점의 절반 이하로"), (-85.0, "1/5 이하로")):
+        r = _replace_metrics(rep, drawdown_pct=dd)
+        assert word in rule_based_narrative(*_parts(r))
+    del t
+
+
+def test_yearly_dates_read_naturally_in_korean():
+    rep = _make_report("Y", n=8, horizon=5, changepoints=False, forecast_peak=False)
+    ko = rule_based_narrative(*_parts(rep))
+    y0, y1 = rep.analysis.series.index[0].year, rep.analysis.series.index[-1].year
+    assert f"{y0}년부터 {y1}년까지" in ko
+    assert re.search(r"최고치는 \d{4}년의 ", ko)
+    end = rep.forecast.mean.index[-1].year
+    assert f"{end}년 예측값은" in ko and f"예측 종료 {end}년" in ko
+    assert format_date(rep.forecast.mean.index[-1], "Y") == str(end)      # public helper unchanged
+    assert build_llm_payload(*_parts(rep))["series"]["end"] == str(y1)    # payload keeps bare years
+
+
+def _seasonal_low_report(lang_reasons=None) -> TrendReport:
+    """A flat, strongly seasonal monthly series that ends in its seasonal low (December)."""
+    n = 120
+    idx = pd.date_range("2016-01-01", periods=n, freq="MS")
+    seas = 8.0 * np.cos(2 * np.pi * (idx.month.to_numpy() - 3) / 12)   # high in March, low in September
+    seas = seas - seas.mean()
+    trend = 50.0 + 0.002 * np.arange(n)
+    y = trend + seas
+    y[-1] = trend[-1] + seas.min()                                      # the latest value at a seasonal low
+    s = pd.Series(y, index=idx, name="seasonal")
+    rep = _report_from_values(y, name="seasonal")
+    dec = Decomposition(trend=pd.Series(trend, index=idx), seasonal=pd.Series(y - trend, index=idx),
+                        resid=pd.Series(np.zeros(n), index=idx), period=12)
+    peak_i = int(np.argmax(y))
+    metrics = dataclasses.replace(rep.analysis.metrics, seasonal_strength=0.95, peak_date=idx[peak_i],
+                                  peak_value=float(y[peak_i]), last_value=float(y[-1]),
+                                  drawdown_pct=float((y[-1] - y[peak_i]) / y[peak_i] * 100))
+    phase = LifecyclePhase(label="stable", confidence=0.8, reasons=lang_reasons or ["추세 없음"])
+    analysis = dataclasses.replace(rep.analysis, series=s, decomposition=dec, metrics=metrics, phase=phase)
+    return dataclasses.replace(rep, analysis=analysis)
+
+
+def test_seasonal_low_is_not_framed_as_a_fall_from_the_peak():
+    rep = _seasonal_low_report()
+    dd = rep.analysis.metrics.drawdown_pct
+    assert dd < -20                                                    # raw: well below the peak
+    ko = rule_based_narrative(*_parts(rep))
+    line = next(ln for ln in ko.splitlines() if ln.startswith("- 최고치는"))
+    assert "계절적으로 낮은 시기" in line and "계절 요인을 뺀 추세선 기준으로는" in line
+    assert "여전히 고점 부근입니다" in line and "상당히 내려와" not in line
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "seasonal low" in en and "still close to the high" in en
+    # the English evidence for 'stable' never argues with the distance from the peak
+    evidence = [ln for ln in en.splitlines() if ln.startswith("- Evidence:")]
+    assert evidence and not any("peak" in ln for ln in evidence)
+    assert all(ln.rstrip().endswith(".") for ln in evidence)          # full sentences, not fragments
+    # a non-seasonal series keeps the plain drawdown sentence
+    plain = _replace_metrics(rep, seasonal_strength=0.1)
+    assert "계절 요인을 뺀" not in rule_based_narrative(*_parts(plain))
+
+
+def test_english_evidence_translates_the_analysis_reasons():
+    reasons = ["Mann-Kendall 검정에서 전체 기간의 뚜렷한 추세가 확인되지 않습니다 (p = 0.215).",
+               "추세의 변동 폭(최고-최저)이 최고 수준 대비 4.7%에 그칩니다.",
+               "계절성 강도가 0.96로 주기적 변동이 뚜렷합니다."]
+    rep = _seasonal_low_report(reasons)
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    evidence = [ln[len("- Evidence: "):] for ln in en.splitlines() if ln.startswith("- Evidence: ")]
+    assert evidence == [
+        "The Mann-Kendall test finds no clear trend over the whole period (p = 0.215).",
+        "The trend's range (high minus low) is only 4.7% of its highest level.",
+        "Seasonal strength is 0.96: a clear recurring cycle.",
+    ]
+    ko = rule_based_narrative(*_parts(rep))
+    assert [ln[len("- 근거: "):] for ln in ko.splitlines() if ln.startswith("- 근거: ")] == reasons
+
+
+@pytest.mark.parametrize("ko,en", [
+    ("최근 18개월 동안 추세가 +143.4% 변했습니다.", "Over the last 18 months the trend changed by +143.4%."),
+    ("최근 1주 동안 추세 기울기는 −0.5/주입니다.", "Over the last 1 week the trend slope was −0.5 per week."),
+    ("현재 추세는 고점(2021-07)보다 94.6% 낮은 수준입니다.", "The trend is 94.6% below its peak (2021-07)."),
+    ("2022-12-04에 수준이 한 단계 높아졌습니다 (약 +29.6%).", "On 2022-12-04 the level stepped up (about +29.6%)."),
+    ("2024-Q2에 구조 변화(하락 전환)가 감지되었습니다.", "A structural break (turn downward) was detected in 2024-Q2."),
+    ("Mann-Kendall 검정에서 전체 기간의 상승 추세가 유의합니다 (τ = 0.69, p < 0.001).",
+     "The Mann-Kendall test finds a significant upward trend over the whole period (τ = 0.69, p < 0.001)."),
+    ("고점(2021-07) 이후 하락해 2023-01에 저점을 찍은 뒤 추세 규모의 12.0%만큼 반등했습니다.",
+     "After the peak (2021-07) it fell to a low in 2023-01, then rebounded by 12.0% of the trend's scale."),
+    ("Already English.", "Already English."),
+    ("처음 보는 근거 문장입니다.", None),
+    ("", None),
+])
+def test_translate_reason(ko, en):
+    assert nv.translate_reason(ko) == en
+
+
+def test_real_engine_english_evidence_matches_korean_reasons():
+    analysis_mod = pytest.importorskip("trendai.analysis")
+    for name in ("seasonal", "fad", "emerging", "volatile"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            a = analysis_mod.analyze(sample(name), name=name)
+        translated = [nv.translate_reason(r) for r in a.phase.reasons]
+        assert all(translated), (name, a.phase.reasons)
+        f = ForecastResult(mean=pd.Series([1.0], index=future_index(a.series.index[-1], a.freq, 1)),
+                           lower={}, upper={}, horizon=1, levels=(), model_scores=[], method="naive")
+        o = Outlook(direction="flat", expected_change_pct=0.0, prob_increase=0.5, scenarios={},
+                    forecast_peak_date=None, future_phase=a.phase.label, confidence="low")
+        en = rule_based_narrative(a, f, o, lang="en")
+        assert [ln[len("- Evidence: "):] for ln in en.splitlines() if ln.startswith("- Evidence: ")] \
+            == translated[:4]
+
+
+def test_fallback_evidence_is_phase_aware_and_complete(fake_report):
+    # reasons that cannot be translated -> metric evidence; distance from the peak only backs a
+    # declining / peaking / reviving call
+    rep = _replace_metrics(fake_report, drawdown_pct=-40.0)
+    for label, has_peak in (("declining", True), ("stable", False), ("growing", False)):
+        phase = LifecyclePhase(label=label, confidence=0.7, reasons=["번역할 수 없는 근거"])
+        r = dataclasses.replace(rep, analysis=dataclasses.replace(rep.analysis, phase=phase))
+        en = rule_based_narrative(*_parts(r), lang="en")
+        evidence = [ln for ln in en.splitlines() if ln.startswith("- Evidence: ")]
+        assert 2 <= len(evidence) <= 4 and all(ln.endswith(".") for ln in evidence)
+        assert any("below the peak" in ln for ln in evidence) == has_peak
+        assert any("Over the last 12 months the trend changed by +35.0%." in ln for ln in evidence)
+        assert not HANGUL.search(en.replace(r.name, ""))

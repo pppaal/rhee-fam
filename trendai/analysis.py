@@ -71,6 +71,7 @@ _STALL_RATIO = 0.35       # recent slope < 35% of the best past slope = stalled
 _EMERGING_MULTIPLE = 2.5  # now >= 2.5x the long-run base level = small base
 _VOLATILE_CV = 0.20       # unstructured series with CV >= 20% is "volatile"
 _T_SIG = 2.5              # |t| of the recent slope needed to call it a real move
+_EDGE_SHRINK = 4.0        # edge LOESS keeps the narrow one-sided fit only if (D / sd_D)^2 >> this
 
 
 # =========================================================================== helpers
@@ -270,11 +271,60 @@ def _kernel_noise_factors(window: int) -> tuple[float, float]:
     return 1.0 / tot, float(np.sum(k * k)) / tot ** 2
 
 
+def _local_fit(y: np.ndarray, w_all: np.ndarray, i: np.ndarray, q: int, want_weights: bool = False
+               ) -> tuple[np.ndarray, np.ndarray, Optional[tuple[np.ndarray, np.ndarray]]]:
+    """Local-linear (tricube x robustness weights) fit at evaluation points ``i``.
+
+    The window holds the ``q`` nearest points (one-sided at the edges).
+    Returns ``(fit, ok, W)``: the fitted values, a mask of well-posed fits (a
+    degenerate design falls back to the weighted, else plain, window mean) and,
+    if ``want_weights``, ``W = (idx, L)``: the window positions and the
+    equivalent-kernel weights over them (``fit = (L * y[idx]).sum(axis=1)``),
+    used for variance calculations.
+    """
+    n = len(y)
+    lo = np.clip(i - (q - 1) // 2, 0, n - q)
+    idx = lo[:, None] + np.arange(q)[None, :]
+    dx = (idx - i[:, None]).astype(float)
+    d = np.abs(dx)
+    h = d.max(axis=1, keepdims=True) + 1.0
+    k = (1.0 - (d / h) ** 3) ** 3 * w_all[idx]
+    yy = y[idx]
+    s0 = k.sum(axis=1)
+    s1 = (k * dx).sum(axis=1)
+    s2 = (k * dx * dx).sum(axis=1)
+    det = s0 * s2 - s1 * s1
+    ok = (det > 1e-10 * np.maximum(s0 * s2, _TINY)) & (s0 > _TINY)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lw = np.where(ok[:, None], k * (s2[:, None] - s1[:, None] * dx)
+                      / np.where(ok, det, 1.0)[:, None],
+                      k / np.where(s0 > _TINY, s0, 1.0)[:, None])
+    fit = (lw * yy).sum(axis=1)
+    bad = ~np.isfinite(fit) | (s0 <= _TINY)
+    if bad.any():  # all weights vanished: plain mean of the window
+        fit[bad] = yy[bad].mean(axis=1)
+        lw[bad] = 1.0 / q
+    return fit, ok, ((idx, lw) if want_weights else None)
+
+
 def _loess(y: np.ndarray, window: int, weights: Optional[np.ndarray] = None) -> np.ndarray:
     """Local-linear LOESS with tricube kernel over ``window`` nearest points.
 
     At the edges the window becomes one-sided, i.e. the trend is extrapolated
-    with a local linear fit -- no NaNs anywhere.  As in STL, the local fit is
+    with a local linear fit -- no NaNs anywhere.  A one-sided local-linear fit
+    is very noisy at the very end (its variance is ~3x that of the interior
+    fit: the end value follows the last few observations), so near the edges
+    it is shrunk towards a three times wider one-sided local-linear fit.  The
+    shrinkage is adaptive (positive-part James-Stein): the difference ``D`` of
+    the two fits is compared with its noise variance ``V`` (white noise of the
+    size of the second differences of ``y``), the narrow fit is kept with
+    weight ``max(0, 1 - c V / D^2)`` -- i.e. genuine curvature at the end (an
+    S-curve take-off, a fad's collapse) is kept, while a noise-driven end
+    hook is replaced by the steadier wide fit -- and the shrinkage fades out
+    with the asymmetry of the window (0 in the interior, full at the end
+    point).  The James-Stein factor is applied with a 4x noise variance
+    (:data:`_EDGE_SHRINK`): the narrow fit only starts to count once ``D``
+    exceeds 2 noise SDs.  Straight lines stay exact.  As in STL, the local fit is
     evaluated at every ``max(1, window // 10)``-th point (and both ends) and
     linearly interpolated in between, which keeps long series fast.
     """
@@ -283,36 +333,44 @@ def _loess(y: np.ndarray, window: int, weights: Optional[np.ndarray] = None) -> 
     if n <= 2:
         return y.copy()
     q = int(max(2, min(window, n)))
+    q_wide = int(min(n, 3 * q - 2))
+    hw = (q - 1) / 2.0
     w_all = np.ones(n) if weights is None else np.asarray(weights, dtype=float)
     jump = max(1, q // 10)
     at = np.arange(n) if jump == 1 else np.unique(np.r_[np.arange(0, n, jump), n - 1])
     out = np.empty(len(at))
-    offs = np.arange(q)
     chunk = max(1, 2_000_000 // q)
     for start in range(0, len(at), chunk):
         pos = np.arange(start, min(len(at), start + chunk))
-        i = at[pos]
-        lo = np.clip(i - (q - 1) // 2, 0, n - q)
-        idx = lo[:, None] + offs[None, :]
-        dx = (idx - i[:, None]).astype(float)
-        d = np.abs(dx)
-        h = d.max(axis=1, keepdims=True) + 1.0
-        k = (1.0 - (d / h) ** 3) ** 3 * w_all[idx]
-        yy = y[idx]
-        s0 = k.sum(axis=1)
-        s1 = (k * dx).sum(axis=1)
-        s2 = (k * dx * dx).sum(axis=1)
-        t0 = (k * yy).sum(axis=1)
-        t1 = (k * dx * yy).sum(axis=1)
-        det = s0 * s2 - s1 * s1
-        ok = (det > 1e-10 * np.maximum(s0 * s2, _TINY)) & (s0 > _TINY)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            fit = np.where(ok, (s2 * t0 - s1 * t1) / np.where(ok, det, 1.0),
-                           t0 / np.where(s0 > _TINY, s0, 1.0))
-        bad = ~np.isfinite(fit) | (s0 <= _TINY)
-        if bad.any():  # all weights vanished: plain mean of the window
-            fit[bad] = yy[bad].mean(axis=1)
+        fit, _, _ = _local_fit(y, w_all, at[pos], q)
         out[pos] = fit
+    if q_wide > q and n >= 5:
+        lo = np.clip(at - (q - 1) // 2, 0, n - q)
+        asym = np.clip(np.abs(at - (lo + hw)) / max(hw, 1.0), 0.0, 1.0)
+        edge = np.flatnonzero(asym > 1e-9)
+        if len(edge):
+            ie = at[edge]
+            f1, ok1, W1 = _local_fit(y, w_all, ie, q, want_weights=True)
+            f3, ok3, W3 = _local_fit(y, w_all, ie, q_wide, want_weights=True)
+            # white-noise variance from second differences (robust to trend and spikes)
+            sig2 = (_robust_sd(np.diff(y, 2)) ** 2) / 6.0 if n >= 5 else 0.0
+            dlt = f1 - f3
+            # the narrow (one-sided) window is nested in the wide one at an edge
+            idx1, lw1 = W1  # type: ignore[misc]
+            idx3, lw3 = W3  # type: ignore[misc]
+            diff_w = -lw3.copy()
+            np.put_along_axis(diff_w, np.clip(idx1 - idx3[:, :1], 0, q_wide - 1),
+                              np.take_along_axis(diff_w, np.clip(idx1 - idx3[:, :1], 0, q_wide - 1),
+                                                 axis=1) + lw1, axis=1)
+            var_d = sig2 * np.sum(diff_w ** 2, axis=1)
+            d2 = dlt * dlt
+            with np.errstate(divide="ignore", invalid="ignore"):
+                g = np.where(d2 > _TINY * _TINY,
+                             np.clip(1.0 - _EDGE_SHRINK * var_d / np.where(d2 > 0, d2, 1.0), 0.0, 1.0),
+                             1.0)
+            lam = 1.0 - asym[edge] * (1.0 - g)
+            good = ok1 & ok3 & np.isfinite(f3) & np.isfinite(lam)
+            out[edge] = np.where(good, f3 + lam * dlt, out[edge])
     if jump == 1:
         return out
     return np.interp(np.arange(n, dtype=float), at.astype(float), out)
@@ -346,8 +404,15 @@ def _bisquare(r: np.ndarray, wide: bool = False) -> np.ndarray:
 
 
 def _initial_trend(y: np.ndarray, p: int) -> np.ndarray:
-    """Centred (2x)p moving average, edges extended by local linear fits."""
+    """Centred (2x)p moving average, edges extended by local linear fits.
+
+    Series shorter than ``p + 2`` (possible for a segment between two level
+    shifts) get an OLS line instead.
+    """
     n = len(y)
+    if n < p + 2:
+        a, b = _ols(y)
+        return a + b * np.arange(n, dtype=float)
     if p % 2 == 0:
         kern = np.r_[0.5, np.ones(p - 1), 0.5] / p
     else:
@@ -373,8 +438,9 @@ def _seasonal_pattern(d: np.ndarray, p: int, w: np.ndarray, median: bool = False
     ``median=True`` (first pass, before robustness weights exist) uses
     per-phase medians; otherwise bisquare-weighted means.
 
-    The pattern is shrunk towards zero by a positive-part James-Stein factor
-    whose noise estimate is the cycle-to-cycle disagreement of each phase.  A
+    The pattern is shrunk towards zero by a positive-part (method-of-moments)
+    factor ``1 - E[noise energy] / energy`` whose noise estimate is the
+    cycle-to-cycle disagreement of each phase.  A
     genuine seasonal pattern repeats in every cycle and is left (almost)
     untouched; noise and trend misfit that differ between cycles -- the main
     failure mode with only 2-3 cycles -- are pushed back to trend/residual.
@@ -404,13 +470,164 @@ def _seasonal_pattern(d: np.ndarray, p: int, w: np.ndarray, median: bool = False
         var_mean = within / k                      # variance of a phase mean
         energy = float(np.mean(pat * pat))
         if energy > _TINY:
-            shrink = max(0.0, 1.0 - (p - 3) / p * var_mean / energy)
+            # (p - 1) / p * var_mean is the expected energy of a centred pattern of
+            # pure noise: subtracting it is the method-of-moments estimate of the
+            # signal energy (stronger than James-Stein's (p - 3) / p, which left
+            # visible noise-only patterns for p = 4 or 2-3 cycles)
+            shrink = max(0.0, 1.0 - (p - 1) / p * var_mean / energy)
             pat = pat * shrink
     return pat
 
 
-def decompose(series: pd.Series, period: int) -> Decomposition:
-    """Robust additive decomposition ``series = trend + seasonal + resid``.
+def _segment_bounds(n: int, breaks: Optional[list[int]]) -> list[tuple[int, int]]:
+    """``[(start, stop), ...]`` of the stretches between ``breaks`` (each >= 4 points)."""
+    cuts = sorted({int(b) for b in (breaks or []) if 4 <= int(b) <= n - 4})
+    out: list[tuple[int, int]] = []
+    a = 0
+    for b in cuts:
+        if b - a >= 4:
+            out.append((a, b))
+            a = b
+    if out and n - a < 4:          # merge a too-short tail into the previous stretch
+        a = out.pop()[0]
+    out.append((a, n))
+    return out
+
+
+def _trend_fit(y: np.ndarray, window: int, w: Optional[np.ndarray],
+               bounds: list[tuple[int, int]]) -> np.ndarray:
+    """LOESS trend, fitted separately on every stretch of ``bounds`` (level shifts)."""
+    if len(bounds) == 1:
+        return _loess(y, window, w)
+    out = np.empty(len(y))
+    for a, b in bounds:
+        ww = None if w is None else w[a:b]
+        out[a:b] = _loess(y[a:b], min(window, b - a), ww)
+    return out
+
+
+def _nonneg_floor(trend: np.ndarray, z: np.ndarray, window: int,
+                  bounds: list[tuple[int, int]]) -> np.ndarray:
+    """Keep the trend of a non-negative series >= 0 and inside the data at the edges.
+
+    A local-linear extrapolation of a steep fall can end below zero (a short
+    fad: trend -1 while the last value is 8).  In the interior the LOESS is a
+    positive-weight average and cannot do that; within half a window of each
+    end (of every stretch between level shifts) the trend is floored at the
+    lowest deseasonalised value ``z`` of the edge window (and at 0).
+    """
+    out = np.maximum(trend, 0.0)
+    for a, b in bounds:
+        m = b - a
+        q = int(max(2, min(window, m)))
+        hw = (q - 1) // 2
+        if m < 3 or hw < 1:
+            continue
+        zz = np.maximum(z[a:b], 0.0)
+        # every point within hw of an end has the same (one-sided) window
+        out[a:a + hw] = np.maximum(out[a:a + hw], float(np.min(zz[:q])))
+        out[b - hw:b] = np.maximum(out[b - hw:b], float(np.min(zz[m - q:])))
+    return out
+
+
+def _decompose_core(yn: np.ndarray, p: int, use_season: bool, window: int, wide: bool,
+                    bounds: list[tuple[int, int]]) -> tuple[np.ndarray, np.ndarray]:
+    """``(trend, seasonal)`` of ``yn`` (additive; see :func:`decompose`)."""
+    n = len(yn)
+    if not use_season:
+        trend = _trend_fit(yn, window, None, bounds)
+        for _ in range(2):
+            w = _bisquare(yn - trend, wide)
+            trend = _trend_fit(yn, window, w, bounds)
+        return trend, np.zeros(n)
+    if len(bounds) == 1:
+        trend = _initial_trend(yn, p)
+    else:
+        trend = np.empty(n)
+        for a, b in bounds:
+            trend[a:b] = _initial_trend(yn[a:b], p)
+    w = np.ones(n)
+    seasonal = np.zeros(n)
+    for outer in range(3):
+        for _ in range(2):
+            pattern = _seasonal_pattern(yn - trend, p, w, median=(outer == 0))
+            seasonal = pattern[np.arange(n) % p]
+            trend = _trend_fit(yn - seasonal, window, w, bounds)
+        if outer < 2:
+            w = _bisquare(yn - trend - seasonal, wide)
+    return trend, seasonal
+
+
+def _prefer_multiplicative(yn: np.ndarray, trend_a: np.ndarray, seas_a: np.ndarray,
+                           t_log: Optional[np.ndarray] = None,
+                           s_log: Optional[np.ndarray] = None) -> bool:
+    """Does the seasonal swing scale with the level (use the log-space decomposition)?
+
+    Seasonality proportional to the level (sales, page views) cannot be
+    described by a fixed additive pattern: on a growing level the pattern is
+    too weak at the end and too strong at the start, and the misfit leaks into
+    trend and residual (false anomalies at every December peak, a trend that
+    rises at the end of a declining series).  If the data are multiplicative,
+    the additive residual is ``r ~ s * (T - mean T) / mean T`` (``s`` the
+    additive seasonal pattern), so ``r`` is regressed on that interaction
+    term: the slope ``beta`` is ~1 for multiplicative and ~0 for additive
+    seasonality.  The log-space decomposition is used when ``beta >= 0.35``
+    with ``t >= 3.5``, the level moves enough (max/min of the trend >= 1.25)
+    and its (winsorised) remainder is also smaller than the additive one
+    (without ``t_log`` / ``s_log`` only the first, cheap part is checked).
+    """
+    n = len(yn)
+    if np.min(trend_a) <= 0 or float(np.max(trend_a) / np.min(trend_a)) < 1.25:
+        return False
+    r_a = yn - trend_a - seas_a
+    sd = _robust_sd(r_a)
+    if sd <= _TINY * float(np.max(np.abs(yn))):
+        return False
+    med = float(np.median(r_a))
+    rw = np.clip(r_a - med, -4.0 * sd, 4.0 * sd)
+    tm = float(np.mean(trend_a))
+    x = seas_a * (trend_a - tm) / tm
+    sxx = float(np.sum(x * x))
+    if sxx <= _TINY * _TINY:
+        return False
+    beta = float(np.sum(x * rw)) / sxx
+    res = rw - beta * x
+    se = math.sqrt(float(np.sum(res * res)) / max(n - 2, 1) / sxx)
+    if not (beta >= 0.35 and se > 0 and beta / se >= 3.5):
+        return False
+    if t_log is None or s_log is None:     # evidence only (the log fit is not done yet)
+        return True
+    r_m = yn - np.exp(t_log + s_log)
+    if not np.all(np.isfinite(r_m)):
+        return False
+    rm = np.clip(r_m - float(np.median(r_m)), -4.0 * sd, 4.0 * sd)
+    return bool(float(np.sum(rm * rm)) < float(np.sum(rw * rw)))
+
+
+def _is_multiplicative(dec: Decomposition) -> bool:
+    """True if ``dec`` came from the multiplicative (log-space) branch of :func:`decompose`.
+
+    The additive seasonal component is exactly periodic; the multiplicative
+    one is ``trend * (exp(s) - 1)`` with a periodic ``s``, i.e. ``seasonal /
+    trend`` is periodic while ``seasonal`` itself is not.
+    """
+    p = int(dec.period)
+    if p <= 1:
+        return False
+    tr = dec.trend.to_numpy(dtype=float)
+    se = dec.seasonal.to_numpy(dtype=float)
+    n = len(tr)
+    if n < 2 * p or np.any(tr <= 0) or np.any(tr + se <= 0):
+        return False
+    big = float(np.max(np.abs(se)))
+    if big <= 0 or float(np.max(np.abs(se[p:] - se[:-p]))) <= 1e-9 * max(big, float(np.max(tr))):
+        return False
+    ratio = se / tr
+    return bool(float(np.max(np.abs(ratio[p:] - ratio[:-p]))) <= 1e-8 * (1.0 + float(np.max(np.abs(ratio)))))
+
+
+def decompose(series: pd.Series, period: int, breaks: Optional[list[int]] = None) -> Decomposition:
+    """Robust decomposition ``series = trend + seasonal + resid`` (exact, no NaNs).
 
     STL-like: the seasonal component is a per-phase robust average of the
     detrended series (a fixed pattern centred to sum to 0 over each period,
@@ -418,8 +635,23 @@ def decompose(series: pd.Series, period: int) -> Decomposition:
     :func:`_seasonal_pattern`); the trend is a local-linear LOESS of the
     deseasonalised series (window ~n/10, at least min(1.5*period, n/8)).  Two
     bisquare robustness iterations down-weight outliers.  The trend is
-    extrapolated at both ends with one-sided local-linear fits, so there are
-    no NaNs anywhere.
+    extrapolated at both ends with one-sided local-linear fits (stabilised
+    towards a wider fit when the end hook is not significant, see
+    :func:`_loess`), so there are no NaNs anywhere.
+
+    *Multiplicative seasonality*: for a strictly positive series with at
+    least three full periods whose seasonal swing grows/shrinks with the
+    level, the decomposition is done on ``log(series)`` and transformed back:
+    ``trend = exp(t)``, ``seasonal = exp(t + s) - exp(t)`` (so the seasonal
+    swing scales with the trend and no longer sums to exactly 0 per period),
+    ``resid = series - trend - seasonal`` (see :func:`_prefer_multiplicative`).
+
+    *Non-negative series* keep a non-negative trend (see :func:`_nonneg_floor`).
+
+    ``breaks`` (optional): positions where the level may jump (level shifts
+    found by :func:`detect_changepoints`); the trend is then fitted separately
+    on each stretch so that it does not smooth across the step (which would
+    otherwise turn the observations next to the step into false anomalies).
 
     If ``period <= 1`` or the series holds fewer than two full periods, the
     seasonal component is zero and ``Decomposition.period`` is 1.
@@ -434,40 +666,38 @@ def decompose(series: pd.Series, period: int) -> Decomposition:
     p = int(period) if period else 1
     use_season = p > 1 and n >= 2 * p
     window = _trend_window(n, p if use_season else 1)
+    bounds = _segment_bounds(n, breaks)
     # work in units of max|y| so that the numeric tolerances are scale-free
     c = _unit(y)
     yn = y / c
     wide = _heavy_ties(yn)        # zero-inflated / step data: lenient robustness
 
-    if not use_season:
-        trend = _loess(yn, window)
-        for _ in range(2):
-            w = _bisquare(yn - trend, wide)
-            trend = _loess(yn, window, w)
-        seasonal = np.zeros(n)
-        p_used = 1
-    else:
-        trend = _initial_trend(yn, p)
-        w = np.ones(n)
-        seasonal = np.zeros(n)
-        for outer in range(3):
-            for _ in range(2):
-                pattern = _seasonal_pattern(yn - trend, p, w, median=(outer == 0))
-                seasonal = pattern[np.arange(n) % p]
-                trend = _loess(yn - seasonal, window, w)
-            if outer < 2:
-                w = _bisquare(yn - trend - seasonal, wide)
-        p_used = p
+    trend, seasonal = _decompose_core(yn, p, use_season, window, wide, bounds)
+    trend = np.where(np.isfinite(trend), trend, yn)
+    seasonal = np.where(np.isfinite(seasonal), seasonal, 0.0)
+    multiplicative = False
+    if (use_season and n >= 3 * p and bool(np.all(yn > 0))
+            and _prefer_multiplicative(yn, trend, seasonal)):
+        with np.errstate(all="ignore"):
+            ly = np.log(yn)
+            t_log, s_log = _decompose_core(ly, p, True, window, _heavy_ties(ly), bounds)
+        if (np.all(np.isfinite(t_log)) and np.all(np.isfinite(s_log))
+                and _prefer_multiplicative(yn, trend, seasonal, t_log, s_log)):
+            multiplicative = True
+            trend = np.exp(t_log)
+            seasonal = np.exp(t_log + s_log) - trend
+    if not multiplicative and float(np.min(yn)) >= 0.0:
+        trend = _nonneg_floor(trend, yn - seasonal, window, bounds)
 
-    trend = np.where(np.isfinite(trend), trend, yn) * c
-    seasonal = np.where(np.isfinite(seasonal), seasonal, 0.0) * c
+    trend = trend * c
+    seasonal = seasonal * c
     resid = y - trend - seasonal
     name = series.name
     return Decomposition(
         trend=pd.Series(trend, index=idx, name=name),
         seasonal=pd.Series(seasonal, index=idx, name=name),
         resid=pd.Series(resid, index=idx, name=name),
-        period=int(p_used),
+        period=int(p if use_season else 1),
     )
 
 
@@ -531,19 +761,13 @@ def _kendall_s(y: np.ndarray) -> int:
     return s
 
 
-def mann_kendall(y: np.ndarray) -> tuple[float, float]:
-    """Mann-Kendall trend test with tie correction.
-
-    Returns ``(tau, p)`` where ``tau = S / (n(n-1)/2)`` (Kendall's tau-a
-    against time) and ``p`` is the two-sided p-value of the normal
-    approximation with continuity correction.  Degenerate input (n < 3 or all
-    values tied) gives ``(0.0, 1.0)``.
-    """
+def _mk_z(y: np.ndarray) -> tuple[float, float, int]:
+    """``(tau, z, n)`` of the Mann-Kendall test (tie- and continuity-corrected ``z``)."""
     y = np.asarray(y, dtype=float).ravel()
     y = y[np.isfinite(y)]
     n = len(y)
     if n < 3:
-        return 0.0, 1.0
+        return 0.0, 0.0, n
     s = _kendall_s(y)
     _, counts = np.unique(y, return_counts=True)
     counts = counts[counts > 1].astype(float)
@@ -551,15 +775,298 @@ def mann_kendall(y: np.ndarray) -> tuple[float, float]:
     var = (n * (n - 1) * (2 * n + 5) - tie) / 18.0
     tau = s / (n * (n - 1) / 2.0)
     if var <= 0:
-        return _finite(tau), 1.0
+        return _finite(tau), 0.0, n
     if s > 0:
         z = (s - 1) / math.sqrt(var)
     elif s < 0:
         z = (s + 1) / math.sqrt(var)
     else:
         z = 0.0
+    return _finite(tau), _finite(z), n
+
+
+def mann_kendall(y: np.ndarray) -> tuple[float, float]:
+    """Mann-Kendall trend test with tie correction.
+
+    Returns ``(tau, p)`` where ``tau = S / (n(n-1)/2)`` (Kendall's tau-a
+    against time) and ``p`` is the two-sided p-value of the normal
+    approximation with continuity correction.  Degenerate input (n < 3 or all
+    values tied) gives ``(0.0, 1.0)``.  This is the classical test that
+    assumes independent observations; :func:`compute_metrics` reports the
+    serial-dependence-corrected version (:func:`_trend_test`).
+    """
+    tau, z, _ = _mk_z(y)
     p = math.erfc(abs(z) / math.sqrt(2.0))
     return _finite(tau), float(min(1.0, max(0.0, _finite(p, 1.0))))
+
+
+# =========================================================================== serial dependence
+#
+# Real series (page views, prices, KPIs) rarely have white noise around their
+# trend: deviations persist (AR-like) or accumulate (random walks).  Tests
+# that assume independence then call noise a significant trend.  The noise
+# around the trend is modelled as AR(1) with coefficient ``phi`` in [0, 1]
+# (``phi = 1``: random walk); the trend tests below use it.
+
+
+def _variogram_phi(rc: np.ndarray, ok: Optional[np.ndarray] = None) -> float:
+    """Raw ``V(2) / V(1) - 1`` of a residual; > 1 means smooth (positively correlated) increments.
+
+    Only pairs whose both points are flagged ``ok`` (not outlying) are used,
+    so the misfit around a sharp feature does not pass for persistent noise.
+    """
+    if ok is None:
+        ok = np.ones(len(rc), dtype=bool)
+    m1 = ok[1:] & ok[:-1]
+    m2 = ok[2:] & ok[:-2]
+    if m1.sum() < 4 or m2.sum() < 4:
+        return 0.0
+    v1 = float(np.mean((rc[1:] - rc[:-1])[m1] ** 2))
+    v2 = float(np.mean((rc[2:] - rc[:-2])[m2] ** 2))
+    if v1 <= 0.0:
+        return 0.0
+    return v2 / v1 - 1.0
+
+
+def _ar1_phi(r: np.ndarray, max_block: Optional[int] = None) -> float:
+    """AR(1) coefficient of the noise ``r`` from its variogram: ``phi = V(2) / V(1) - 1``.
+
+    For AR(1) noise ``V(k) = E[(r_t - r_{t-k})^2] ~ 1 - phi^k``, so the ratio
+    is ``1 + phi``; for a random walk ``V(k) ~ k`` (ratio 2, ``phi = 1``).
+    Variogram increments are insensitive to a slowly varying misfit of the
+    trend (it adds ~k^2 terms that are tiny at lags 1-2), unlike the lag-1
+    autocorrelation.  Points beyond 3.5 robust SDs (spikes, the misfit of a
+    sharp feature) are left out of the variogram.  The estimate is
+    significance-gated: below ~1.6 standard errors of the white-
+    noise estimate (``sd ~ 1.8 / sqrt(n)``) it fades to 0, so white noise
+    keeps ``phi = 0`` and the classical tests.
+
+    *Smooth* short-range noise (interpolated gaps, rolling averages,
+    oversampled data) looks like a random walk at the finest scale.  Two
+    guards: (1) a ratio clearly above 2 (positively correlated increments)
+    thins the residual (every m-th point, m = 2, 4, ... 16) until its
+    increments look rough, with ``phi >= (m-1)/(m+1)`` (an effective sample
+    size of ``n / m``); (2) a near-unit-root estimate (>= 0.8) is checked at
+    coarse scales: the long-run variance inflation ``I(b) = b var(block means
+    of size b) / var`` keeps growing for a random walk, but saturates for
+    noise with a finite memory -- then ``phi = (I - 1) / (I + 1)`` (the AR(1)
+    with the same inflation).  ``max_block`` caps the block size (the scale
+    up to which the caller's residual retains persistent noise).
+    Clipped to [0, 1].
+    """
+    r = np.asarray(r, dtype=float)
+    r = r[np.isfinite(r)]
+    n = len(r)
+    if n < 12:
+        return 0.0
+    sd = _winsorized_sd(r)
+    if sd <= _TINY * max(1.0, float(np.max(np.abs(r)))):
+        return 0.0
+    dev = r - float(np.median(r))
+    ok = np.abs(dev) <= 3.5 * sd
+    rc = np.clip(dev, -3.5 * sd, 3.5 * sd)
+    if float(np.mean(np.diff(rc) ** 2)) <= _TINY * sd * sd:
+        return 0.0
+    m = 1
+    raw = _variogram_phi(rc, ok)
+    while raw > 1.4 and m < 16 and len(rc[::2 * m]) >= 24:
+        m *= 2
+        raw = _variogram_phi(rc[::m], ok[::m])
+    phi = float(np.clip(raw, 0.0, 1.0))
+    gate = 3.0 / math.sqrt(len(rc[::m]))
+    phi *= _ramp(phi, 0.5 * gate, gate)
+    if m > 1:
+        phi = max(phi ** (1.0 / m), (m - 1.0) / (m + 1.0))
+    if phi >= 0.8:
+        cap = n // 16 if max_block is None else int(min(n // 16, max(1, max_block)))
+        var0 = float(np.var(rc))
+        infl = []
+        b = 1
+        while b <= cap and var0 > 0:
+            k = n // b
+            bm = rc[:k * b].reshape(k, b).mean(axis=1)
+            infl.append(b * float(np.var(bm)) / var0)
+            b *= 2
+        if len(infl) >= 3 and infl[-1] <= 1.3 * infl[-2]:
+            i_lr = max(infl[-1], 1.0)
+            phi = min(phi, (i_lr - 1.0) / (i_lr + 1.0))
+    return float(min(1.0, max(0.0, phi)))
+
+
+def _unit_root_push(phi: float) -> float:
+    """Push an estimated ``phi`` towards 1 when it is already close to a unit root.
+
+    Near ``phi = 1`` every correction explodes (``(1 + phi) / (1 - phi)``) and
+    the estimate is too imprecise to tell AR(0.9) from a random walk, which
+    has no trend at all; erring on the random-walk side keeps random walks
+    from being reported as significant trends.  Linear ramp: unchanged below
+    0.6, 1.0 from 0.85 on (the estimate's sampling SD is ~0.1-0.2 at n = 100-300).
+    """
+    return float(min(1.0, phi + (1.0 - phi) * _ramp(phi, 0.6, 0.85)))
+
+
+def _noise_model(z: np.ndarray, period: int,
+                 resid: Optional[np.ndarray] = None) -> tuple[float, float]:
+    """``(phi, d1_var)`` of the noise around the trend of the deseasonalised ``z``.
+
+    The noise is the residual of a robust LOESS with three times the
+    decomposition's trend window: a narrow smoother absorbs persistent noise
+    into the trend and biases ``phi`` down.  A wide smoother, however, leaves
+    the misfit of sharp features (a spike-shaped fad near an edge) in its
+    residual, which looks like persistent noise too; so when the narrow
+    residual ``resid`` (the decomposition's) shows less than half that
+    persistence, its own estimate is used.  ``phi`` is then pushed towards a
+    unit root by :func:`_unit_root_push`.  ``d1_var`` is the (winsorised) mean
+    squared first difference of the noise (``2 sigma^2 (1 - phi)`` for AR(1)
+    noise of variance ``sigma^2``; the innovation variance of a random walk).
+    """
+    z = np.asarray(z, dtype=float)
+    n = len(z)
+    if n < 12:
+        return 0.0, 0.0
+    key = (int(period), z.tobytes(), None if resid is None else np.asarray(resid, dtype=float).tobytes())
+    hit = _NOISE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = _noise_model_uncached(z, period, resid)
+    if len(_NOISE_CACHE) >= 8:
+        _NOISE_CACHE.pop(next(iter(_NOISE_CACHE)))
+    _NOISE_CACHE[key] = out
+    return out
+
+
+_NOISE_CACHE: dict = {}
+
+
+def _noise_model_uncached(z: np.ndarray, period: int,
+                          resid: Optional[np.ndarray]) -> tuple[float, float]:
+    """Implementation of :func:`_noise_model` (which memoises the last few calls)."""
+    n = len(z)
+    q = _trend_window(n, period)
+    qw = min(n, 3 * q)
+    tw = _loess(z, qw)
+    for _ in range(2):                    # robust: isolated outliers are not "noise"
+        tw = _loess(z, qw, _bisquare(z - tw))
+    r = z - tw
+    phi = _ar1_phi(r, max_block=max(2, q // 2))
+    if resid is not None and phi > 0.0:
+        rn = np.asarray(resid, dtype=float)
+        phi_n = _ar1_phi(rn, max_block=max(1, q // 3))
+        if phi_n < 0.5 * phi:
+            phi, r = phi_n, rn
+    phi = _unit_root_push(phi)
+    sd = _winsorized_sd(r)
+    rc = np.clip(r - float(np.median(r)), -3.5 * sd, 3.5 * sd) if sd > _TINY else r
+    return phi, float(np.mean(np.diff(rc) ** 2))
+
+
+def _ar_gamma_like(phi: float, k: np.ndarray) -> np.ndarray:
+    """``(1 - phi^k) / (1 - phi^2)`` (``k / 2`` at ``phi = 1``): minus the AR(1)
+    autocovariance (unit innovations) up to a constant -- well defined at the
+    unit root and enough for contrasts (weights summing to 0)."""
+    k = np.asarray(k, dtype=float)
+    if phi >= 1.0 - 1e-9:
+        return k / 2.0
+    return (1.0 - phi ** k) / (1.0 - phi * phi)
+
+
+def _ols_slope_var(h: int, phi: float, sig_e2: float) -> float:
+    """Variance of the OLS slope over ``h`` consecutive points under AR(1) noise.
+
+    ``sig_e2`` is the innovation variance; ``phi = 0`` gives the textbook
+    ``sigma^2 / sxx`` and ``phi = 1`` the random-walk value.  Exact:
+    ``a' Gamma a / sxx^2`` with ``a = x - mean(x)`` (computed with the
+    contrast form of :func:`_ar_gamma_like`, O(h)).
+    """
+    if h < 3 or sig_e2 <= 0.0:
+        return 0.0
+    m = (h - 1) / 2.0
+    k = np.arange(1, h, dtype=float)
+    nk = h - k                                    # number of pairs at lag k
+    # c_k = sum_{i=0}^{h-1-k} (i - m)(i + k - m)
+    s_sq = (nk - 1) * nk * (2 * nk - 1) / 6.0 - 2 * m * (nk - 1) * nk / 2.0 + nk * m * m
+    s_lin = (nk - 1) * nk / 2.0 - nk * m
+    ck = s_sq + k * s_lin
+    sxx = h * (h * h - 1) / 12.0
+    quad = -2.0 * float(np.sum(ck * _ar_gamma_like(phi, k)))
+    return float(max(quad, 0.0) * sig_e2 / (sxx * sxx))
+
+
+def _ar_path_var(phi: float, n: int) -> float:
+    """Expected sample variance of an AR(1) path of length ``n`` (unit innovations).
+
+    ``(2 / n^2) sum_k (n - k) g(k)`` with ``g`` from :func:`_ar_gamma_like`:
+    ``~1 / (1 - phi^2)`` for a short memory, ``~n / 6`` for a random walk.
+    """
+    if n < 2:
+        return 0.0
+    k = np.arange(1, n, dtype=float)
+    return float(2.0 / (n * n) * np.sum((n - k) * _ar_gamma_like(phi, k)))
+
+
+def _mk_variance_ratio(phi: float, n: int) -> float:
+    """Inflation of Var(S) of Mann-Kendall under AR(1) noise (Hamed & Rao 1998).
+
+    ``1 + 2 / (n (n-1) (n-2)) sum_k (n-k)(n-k-1)(n-k-2) rho_k`` with the rank
+    autocorrelation of Gaussian AR(1) noise ``rho_k = (6 / pi) asin(phi^k / 2)``.
+    """
+    if phi <= 0.0 or n < 4:
+        return 1.0
+    k = np.arange(1, n - 2, dtype=float)
+    rho = (6.0 / math.pi) * np.arcsin(np.clip(phi ** k, 0.0, 1.0) / 2.0)
+    w = (n - k) * (n - k - 1) * (n - k - 2)
+    return float(max(1.0, 1.0 + 2.0 / (n * (n - 1.0) * (n - 2.0)) * float(np.sum(w * rho))))
+
+
+def _drift_pvalue(z: np.ndarray) -> float:
+    """Two-sided p-value of a non-zero drift of a random walk ``z``.
+
+    t-test of the mean first difference (winsorised at 4 robust SDs) with a
+    Newey-West (Bartlett) long-run variance, bandwidth ``4 (n/100)^(2/9)``.
+    """
+    d = np.diff(np.asarray(z, dtype=float))
+    d = d[np.isfinite(d)]
+    n = len(d)
+    if n < 5:
+        return 1.0
+    sd = _robust_sd(d)
+    if sd <= _TINY * max(1.0, float(np.max(np.abs(z)))):
+        mu = float(np.mean(d))
+        return 0.0 if abs(mu) > _TINY else 1.0
+    med = float(np.median(d))
+    dc = med + np.clip(d - med, -4.0 * sd, 4.0 * sd)
+    mu = float(np.mean(dc))
+    e = dc - mu
+    lag = int(min(n - 1, max(1, math.floor(4.0 * (n / 100.0) ** (2.0 / 9.0)))))
+    lrv = float(np.mean(e * e))
+    for j in range(1, lag + 1):
+        lrv += 2.0 * (1.0 - j / (lag + 1.0)) * float(np.mean(e[j:] * e[:-j]))
+    lrv = max(lrv, 0.25 * float(np.mean(e * e)))
+    if lrv <= 0:
+        return 1.0
+    t = mu / math.sqrt(lrv / n)
+    return float(min(1.0, max(0.0, math.erfc(abs(t) / math.sqrt(2.0)))))
+
+
+def _trend_test(z: np.ndarray, phi: float) -> tuple[float, float]:
+    """Mann-Kendall ``(tau, p)`` of ``z`` corrected for AR(1) noise ``phi``.
+
+    The variance of S is inflated by :func:`_mk_variance_ratio` (Hamed-Rao).
+    Near a unit root (``phi >= 0.9``) a trend can only be a drift, so the
+    smaller of that p-value and the drift test on the first differences
+    (:func:`_drift_pvalue`) is used (never below the classical p-value).
+    ``phi = 0`` gives the classical :func:`mann_kendall`.
+    """
+    tau, zc, n = _mk_z(z)
+    p = float(min(1.0, max(0.0, math.erfc(abs(zc) / math.sqrt(2.0)))))
+    if phi <= 0.0 or n < 4:
+        return tau, p
+    za = abs(zc) / math.sqrt(_mk_variance_ratio(phi, n))
+    p_ar = math.erfc(za / math.sqrt(2.0))
+    if phi >= 0.9:
+        y = np.asarray(z, dtype=float)
+        p_ar = min(p_ar, _drift_pvalue(y[np.isfinite(y)]))
+    return tau, float(min(1.0, max(p, p_ar)))
 
 
 # =========================================================================== changepoints
@@ -642,7 +1149,11 @@ def _segment(z: np.ndarray, max_cp: int, min_seg: int, penalty_factor: float = 4
     spurious breaks in ~15% of white-noise series of length 8-20.
     ``extra_dof`` counts parameters already fitted to ``z`` before (``p - 1``
     for a deseasonalised series); a ``k`` that leaves no degrees of freedom is
-    not considered.  ``abs_floor`` is a noise-variance floor in the units of
+    not considered.  With serially dependent noise (AR(1) ``phi`` of the
+    residual of the most flexible fit, see :func:`_ar1_phi`) the likelihood
+    term is scaled by the effective-sample-size factor ``(1 - phi) / (1 + phi)``
+    -- otherwise random walks and persistent noise get the maximum number of
+    breaks.  ``abs_floor`` is a noise-variance floor in the units of
     ``z`` so that float dust on a (nearly) noise-free series is not segmented.
     """
     n = len(z)
@@ -666,6 +1177,31 @@ def _segment(z: np.ndarray, max_cp: int, min_seg: int, penalty_factor: float = 4
         backs.append(arg)
         rss.append(d_cur[n])
         d_prev = d_cur
+    def breaks_for(k: int) -> list[int]:
+        out: list[int] = []
+        end = n
+        for j in range(k, 0, -1):
+            start = int(backs[j - 1][end])
+            out.append(start)
+            end = start
+        return sorted(out)
+
+    # Serially dependent noise: n correlated points carry the information of
+    # ~n (1 - phi) / (1 + phi) independent ones, so the likelihood term is
+    # scaled down (penalty unchanged).  phi comes from the residual of the
+    # most flexible fit (k_max breaks), which is ~pure noise when the breaks
+    # are real; for a random walk it stays ~1 and no break survives.
+    k_top = max((k for k, r in enumerate(rss) if math.isfinite(r)), default=0)
+    eff = 1.0
+    if k_top >= 1 and n >= 24:
+        bnd = [0] + breaks_for(k_top) + [n]
+        res = np.empty(n)
+        for a, b in zip(bnd[:-1], bnd[1:], strict=True):
+            xs = np.arange(a, b, dtype=float)
+            ic, sl = _ols(zs[a:b], xs)
+            res[a:b] = zs[a:b] - (ic + sl * xs)
+        phi = _unit_root_push(_ar1_phi(res, max_block=max(2, min_seg // 4)))
+        eff = (1.0 - phi) / (1.0 + phi)
     # zs has unit variance: ignore improvements below 0.1% noise (or abs_floor)
     floor = n * max(1e-6, abs_floor / (sd * sd))
     best_k, best_crit = 0, math.inf
@@ -675,16 +1211,10 @@ def _segment(z: np.ndarray, max_cp: int, min_seg: int, penalty_factor: float = 4
         dof = n - (3 * k + 2) - max(0, int(extra_dof))
         if dof < 1:
             continue
-        crit = n * math.log(max(r, floor) / dof) + penalty_factor * k * math.log(n)
+        crit = eff * n * math.log(max(r, floor) / dof) + penalty_factor * k * math.log(n)
         if crit < best_crit - 1e-9:
             best_k, best_crit = k, crit
-    breaks: list[int] = []
-    end = n
-    for k in range(best_k, 0, -1):
-        start = int(backs[k - 1][end])
-        breaks.append(start)
-        end = start
-    return sorted(breaks)
+    return breaks_for(best_k)
 
 
 def _classify_break(s1: float, s2: float, se1: float, se2: float, jump: float,
@@ -830,7 +1360,9 @@ def detect_anomalies(series: pd.Series, decomposition: Decomposition,
     period.  The scale never collapses onto a point mass: it is at least
     ``0.5 * q90 / 1.645`` of the absolute deviations (the full ``q90 / 1.645``
     for heavily tied data such as zero-inflated counts, where otherwise every
-    ordinary non-zero count would be flagged).  Sorted by date.
+    ordinary non-zero count would be flagged).  For a multiplicative
+    decomposition (see :func:`decompose`) the residual is taken in log space,
+    ``log(value / expected)``, i.e. the z-scores are relative.  Sorted by date.
     """
     y = _clean_values(series)
     r = decomposition.resid.to_numpy(dtype=float)
@@ -839,8 +1371,15 @@ def detect_anomalies(series: pd.Series, decomposition: Decomposition,
         return []
     y, r = y[:n], r[:n]
     r = np.where(np.isfinite(r), r, 0.0)
+    expected = (decomposition.trend.to_numpy(dtype=float)[:n]
+                + decomposition.seasonal.to_numpy(dtype=float)[:n])
     c = _unit(y, r)                       # scale-free tolerances
     rn = r / c
+    if len(decomposition.trend) == n and _is_multiplicative(decomposition) and np.all(y > 0):
+        with np.errstate(all="ignore"):
+            rel = np.log(y / expected)
+        if np.all(np.isfinite(rel)):
+            rn = rel
     med = float(np.median(rn))
     sd = _robust_sd(rn)
     # point-mass guard (see _robust_sd): scale >= q_coef * q90(|dev|).  For
@@ -861,8 +1400,6 @@ def detect_anomalies(series: pd.Series, decomposition: Decomposition,
         local = np.where(np.isfinite(local), local, sd)
         scale = np.maximum(local, 0.25 * sd)
     zs = (rn - med) / scale
-    expected = (decomposition.trend.to_numpy(dtype=float)[:n]
-                + decomposition.seasonal.to_numpy(dtype=float)[:n])
     out = []
     for i in np.flatnonzero(np.abs(zs) >= threshold):
         out.append(Anomaly(date=pd.Timestamp(series.index[i]), index=int(i),
@@ -880,6 +1417,25 @@ def _recent_window(n: int, freq: str) -> int:
     return int(max(1, min(max(3, min(sl, n // 4)), n - 1)))
 
 
+def _winsorize(r: np.ndarray, k: float = 3.5) -> np.ndarray:
+    """``r`` clipped at ``median +- k`` robust SDs (the anomaly threshold).
+
+    Summary statistics computed from the residual (volatility, trend and
+    seasonal strength) must not be dominated by the very spikes that are
+    reported as anomalies: four one-day news spikes used to turn a clear
+    weekly pattern into "almost no seasonality" and 11% noise into 63%.
+    For Gaussian residuals only ~0.05% of the points are touched.
+    """
+    r = np.asarray(r, dtype=float)
+    if len(r) < 3:
+        return r
+    sd = _robust_sd(r)
+    med = float(np.median(r))
+    if sd <= _TINY * max(1.0, float(np.max(np.abs(r)))):
+        return r
+    return med + np.clip(r - med, -k * sd, k * sd)
+
+
 def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition) -> TrendMetrics:
     """Descriptive statistics of the past and present (see :class:`TrendMetrics`).
 
@@ -890,6 +1446,18 @@ def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition) 
     mean level per period minus ``slope_pct``.  ``acceleration`` is the change of
     that %-slope between the previous and the latest window.  ``slope``,
     ``mk_*`` and ``direction`` are computed on the deseasonalised series.
+
+    * ``mk_pvalue`` is corrected for serial dependence of the noise around the
+      trend (AR(1) variance inflation, drift test near a unit root; see
+      :func:`_trend_test`): persistent noise and random walks are not reported
+      as significant trends.  ``mk_tau`` is the plain Kendall tau.
+    * ``volatility`` and the strengths use the residual winsorised at 3.5
+      robust SDs (:func:`_winsorize`), so isolated spikes do not dominate them;
+      for a multiplicative decomposition the strengths are computed on the log
+      components (``log trend``, ``log(1 + seasonal / trend)``, log residual).
+    * ``peak_value`` / ``peak_date`` / ``drawdown_pct`` ignore isolated upward
+      spikes flagged by :func:`detect_anomalies` (a one-day spike is reported
+      as an anomaly, not as the level the series fell from).
     """
     y_raw = _clean_values(series)
     n = len(y_raw)
@@ -941,20 +1509,37 @@ def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition) 
     else:
         accel = 0.0
 
-    vol = float(np.std(resid)) / level if n >= 2 else 0.0
-    var_r = float(np.var(resid))
-    var_tr = float(np.var(trend + resid))
-    var_sr = float(np.var(seas + resid))
+    resid_w = _winsorize(resid)
+    vol = float(np.std(resid_w)) / level if n >= 2 else 0.0
+    tt, ss, rr = trend, seas, resid_w
+    if _is_multiplicative(decomposition) and np.all(y > 0):
+        with np.errstate(all="ignore"):
+            lt = np.log(trend)
+            ls = np.log1p(seas / trend)
+            lr = np.log(y / (trend + seas))
+        if np.all(np.isfinite(lt)) and np.all(np.isfinite(ls)) and np.all(np.isfinite(lr)):
+            tt, ss, rr = lt, ls, _winsorize(lr)
+    var_r = float(np.var(rr))
+    var_tr = float(np.var(tt + rr))
+    var_sr = float(np.var(ss + rr))
     t_strength = max(0.0, 1.0 - var_r / var_tr) if var_tr > _TINY else 0.0
     s_strength = (max(0.0, 1.0 - var_r / var_sr)
                   if (var_sr > _TINY and decomposition.period > 1) else 0.0)
 
-    tau, p = mann_kendall(z)
+    phi, _ = _noise_model(z, decomposition.period, resid)
+    tau, p = _trend_test(z, phi)
     direction = "flat"
     if p < 0.05:
         direction = "up" if tau > 0 else ("down" if tau < 0 else "flat")
 
-    i_peak = int(np.argmax(y))
+    # peak / drawdown on the observations, ignoring isolated upward spikes
+    cand = np.ones(n, dtype=bool)
+    if n >= 8:
+        spikes = [a.index for a in detect_anomalies(series, decomposition) if a.zscore > 0]
+        cand[[i for i in spikes if 0 <= i < n]] = False
+        if not cand.any():
+            cand[:] = True
+    i_peak = int(np.flatnonzero(cand)[int(np.argmax(y[cand]))])
     peak_n = float(y[i_peak])
     denom = abs(peak_n) if abs(peak_n) > _TINY else (abs_ref if abs_ref > _TINY else 1.0)
     drawdown = min(0.0, (float(y[-1]) - peak_n) / denom * 100.0)
@@ -1012,11 +1597,22 @@ def _phase_features(series: pd.Series, dec: Decomposition) -> dict:
         d_sd /= math.sqrt(max(1.0 - (dec.period - 1) / max(n, 1), 0.25))
         noise_sd = max(noise_sd, d_sd)
 
+    # serial dependence of the noise (AR(1) phi; 1 = random walk) -> innovation
+    # variance; phi = 0 reproduces the white-noise formulas exactly
+    phi, d1 = _noise_model(z, dec.period, R) if n >= 12 else (0.0, 0.0)
+    sig_e2 = max(noise_sd ** 2 * (1.0 - phi * phi), phi * d1 * (1.0 + phi) / 2.0)
+    # spread of the noise process over the sample (random walks wander far)
+    path_var = _ar_path_var(phi, n)
+    marg_var = min(1.0 / (1.0 - phi * phi) if phi < 1.0 else math.inf, path_var)
+    noise_eff = max(noise_sd, math.sqrt(max(sig_e2 * marg_var, 0.0)))
+
     h = int(min(n - 1, max(3, min(6, n // 3), round(0.15 * n))))
     xs = np.arange(h, dtype=float)
     icpt, s_rec = _ols(zc[-h:], xs)
     sxx = float(np.sum((xs - xs.mean()) ** 2))
-    se_rec = noise_sd / math.sqrt(sxx) if (sxx > _TINY and noise_sd > _TINY) else math.inf
+    var_slope = _ols_slope_var(h, phi, sig_e2) if phi > 0.0 else (
+        noise_sd ** 2 / sxx if sxx > _TINY else 0.0)
+    se_rec = math.sqrt(var_slope) if (sxx > _TINY and noise_sd > _TINY and var_slope > 0) else math.inf
     t_rec = s_rec / se_rec if math.isfinite(se_rec) and se_rec > 0 else (
         math.copysign(99.0, s_rec) if abs(s_rec) > _TINY else 0.0)
     chg_rec = s_rec * (h - 1)
@@ -1057,18 +1653,22 @@ def _phase_features(series: pd.Series, dec: Decomposition) -> dict:
     multiple = t_last / base if (base > 0.01 * ref and t_last > 0) else 0.0
 
     lvl = float(np.mean(np.abs(z)))
-    # noise relative to the level ("coefficient of variation" of the noise)
-    cv = noise_sd / lvl if lvl > _TINY else (0.0 if noise_sd <= _TINY else 1e6)
+    # noise relative to the level ("coefficient of variation" of the noise);
+    # for persistent noise its spread over the sample, not the one-step noise
+    cv = noise_eff / lvl if lvl > _TINY else (0.0 if noise_eff <= _TINY else 1e6)
 
-    # variance ratio: trend variance vs. what smoothed white noise would give
+    # variance ratio: trend variance vs. what smoothed noise would give
+    # (white: v * sigma^2; AR(1): v * sigma_e^2 / (1 - phi)^2, at most the
+    # spread of the noise path itself -- a random walk is all "trend")
     var_t = float(np.var(T))
     if noise_sd > _TINY:
-        f_ratio = var_t / (v * noise_sd ** 2)
+        smooth_var = v / (1.0 - phi) ** 2 if phi < 1.0 else math.inf
+        f_ratio = var_t / (sig_e2 * min(smooth_var, path_var)) if phi > 0.0 else var_t / (v * noise_sd ** 2)
     else:
         f_ratio = 1e6 if var_t > _TINY * max(ref, 1.0) ** 2 else 0.0
 
     return dict(
-        unit=c, f_ratio=float(min(f_ratio, 1e6)), noise_sd=noise_sd,
+        unit=c, f_ratio=float(min(f_ratio, 1e6)), noise_sd=noise_sd, phi=phi, sig_e2=sig_e2,
         n=n, h=h, sigma=sigma, ref=ref, s_rec=s_rec, t_rec=float(t_rec), chg_rec=chg_rec,
         rel_rec=chg_rec / ref, start_level=start_level,
         i_max=i_max, t_max=t_max, t_last=t_last, t_min=t_min, amp=amp,
@@ -1078,6 +1678,76 @@ def _phase_features(series: pd.Series, dec: Decomposition) -> dict:
         settled=settled, s_max_up=s_max_up, s_rec_t=s_rec_t, stall_ratio=stall_ratio,
         avg_slope=avg_slope, base=base, multiple=multiple, cv=cv,
         g_tot=(t_last - float(T[0])) / ref,
+    )
+
+
+_MINUS = "\u2212"   # typographic minus used in all user-facing numbers
+
+
+def _txt(x: float, spec: str) -> str:
+    """``format(x, spec)`` with the typographic minus (U+2212) instead of ``-``."""
+    return format(_finite(x), spec).replace("-", _MINUS)
+
+
+def _pct_txt(pct: float, decimals: int = 1) -> str:
+    """Signed percentage, e.g. ``+12.5%`` / ``\u221242.3%``."""
+    return _txt(pct, f"+.{decimals}f") + "%"
+
+
+def _p_txt(p: float) -> str:
+    """p-value as in the narrative: ``p < 0.001`` or ``p = 0.034``."""
+    p = _finite(p, 1.0)
+    return "p < 0.001" if p < 0.001 else f"p = {p:.3f}"
+
+
+def _post_shift(series: pd.Series, dec: Decomposition, changepoints: list[Changepoint],
+                f: dict, freq: str) -> Optional[dict]:
+    """The stretch after the latest level shift, if it is long and flat.
+
+    A step (policy change, re-basing, a one-off jump) followed by a flat
+    stretch is a *stable* series at a new level, not a growing one, even
+    though the whole-period Mann-Kendall test is significant.  Returns
+    ``None`` unless the latest structural break is a level shift, at least
+    ``max(8, h, min(season, n // 5))`` points have passed since, and the
+    stretch since has no significant trend (serial-dependence-corrected
+    Mann-Kendall p >= 0.05 and |t| < 2 for its OLS slope).  Otherwise a dict
+    with the p-value, the length and two Korean reasons.
+    """
+    if not changepoints:
+        return None
+    last = max(changepoints, key=lambda c: c.index)
+    if last.kind != "level_shift":
+        return None
+    n = int(f["n"])
+    k = int(last.index)
+    length = n - k
+    if length < max(8, int(f["h"]), min(_data.season_length(freq), n // 5)) or k < 4:
+        return None
+    c = f["unit"]
+    z = (dec.trend.to_numpy(dtype=float) + dec.resid.to_numpy(dtype=float)) / c
+    seg = z[k:]
+    phi = float(f["phi"])
+    _, p = _trend_test(seg, phi)
+    xs = np.arange(length, dtype=float)
+    _, slope = _ols(seg, xs)
+    var_s = _ols_slope_var(length, phi, f["sig_e2"]) if phi > 0 else f["noise_sd"] ** 2 / float(
+        np.sum((xs - xs.mean()) ** 2))
+    t = slope / math.sqrt(var_s) if var_s > 0 else 0.0
+    if p < 0.05 or abs(t) >= 2.0:
+        return None
+    unit = _UNIT_KO.get(freq, "기간")
+    before = float(np.median(z[max(0, k - length):k]))
+    after = float(np.median(seg))
+    pct = _pct_change(after, before, f["ref"])
+    up = after >= before
+    jump = (f" (약 {_pct_txt(pct)})" if pct is not None
+            else f" (약 {_txt((after - before) * c, '+,.4g')})")
+    when = _fmt_date(last.date, freq)
+    return dict(
+        p=float(p), length=int(length),
+        shift_sentence=f"{when}에 수준이 한 단계 {'높아졌습니다' if up else '낮아졌습니다'}{jump}.",
+        flat_sentence=(f"그 이후 {length}{unit} 동안은 뚜렷한 추세 없이 새 수준에서 안정되어 있습니다 "
+                       f"(해당 구간 Mann-Kendall {_p_txt(p)})."),
     )
 
 
@@ -1108,9 +1778,10 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
         reasons = [f"관측치가 {n}개뿐이라 추세를 판단하기에 데이터가 부족합니다."]
         pct = _pct_change(float(yn[-1]), float(yn[0]), lvl) if len(yn) >= 2 else None
         if pct is not None:
-            reasons.append(f"관측 기간 동안 값이 {y[0]:,.4g}에서 {y[-1]:,.4g}로 {pct:+.1f}% 변했습니다.")
+            reasons.append(f"관측 기간 동안 값이 {_txt(y[0], ',.4g')}에서 {_txt(y[-1], ',.4g')}로 "
+                           f"{_pct_txt(pct)} 변했습니다.")
         else:
-            reasons.append(f"현재 값은 {metrics.last_value:,.4g}입니다.")
+            reasons.append(f"현재 값은 {_txt(metrics.last_value, ',.4g')}입니다.")
         reasons.append(f"직선 추세 대비 잡음 비율은 {noise_cv * 100:.1f}%입니다.")
         return LifecyclePhase(label=label, confidence=float(min(0.3, 0.1 + 0.025 * n)),
                               reasons=reasons)
@@ -1132,8 +1803,8 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
     def recent_sentence() -> str:
         pct = _pct_change(f["start_level"] + f["chg_rec"], f["start_level"], f["ref"])
         if pct is not None:
-            return f"최근 {h}{unit} 동안 추세가 {pct:+.1f}% 변했습니다."
-        return f"최근 {h}{unit} 동안 추세 기울기는 {_finite(f['s_rec'] * f['unit']):+.3g}/{unit}입니다."
+            return f"최근 {h}{unit} 동안 추세가 {_pct_txt(pct)} 변했습니다."
+        return f"최근 {h}{unit} 동안 추세 기울기는 {_txt(f['s_rec'] * f['unit'], '+.3g')}/{unit}입니다."
 
     def peak_sentence() -> str:
         pct = _pct_change(f["t_last"], f["t_max"], f["ref"])
@@ -1142,32 +1813,48 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
         return (f"추세 고점({peak_date}) 대비 현재 수준이 추세 규모(최대 절댓값)의 "
                 f"{f['drop_from_peak'] * 100:.1f}%만큼 낮습니다.")
 
+    at_top = f["i_max"] >= n - 1
+
     def rise_sentence() -> str:
         pct = _pct_change(f["t_max"], f["t_low"], f["ref"])
-        if pct is not None:
-            return f"추세는 저점 대비 {pct:+.0f}% 오른 뒤 {peak_date}에 고점을 형성했습니다."
-        return (f"추세는 저점 대비 추세 규모의 {f['rise_to_peak'] * 100:.0f}%만큼 오른 뒤 "
-                f"{peak_date}에 고점을 형성했습니다.")
+        rise = (f"저점 대비 {_pct_txt(pct, 0)}" if pct is not None
+                else f"저점 대비 추세 규모의 {f['rise_to_peak'] * 100:.0f}%만큼")
+        if at_top:   # the maximum is the latest point: no peak has "formed" yet
+            return f"추세는 {rise} 올라 현재 역대 최고 수준입니다."
+        return f"추세는 {rise} 오른 뒤 {peak_date}에 고점을 형성했습니다."
 
     def mk_sentence() -> str:
         if metrics.mk_pvalue < 0.05:
             word = "상승" if metrics.mk_tau > 0 else "하락"
             return (f"Mann-Kendall 검정에서 전체 기간의 {word} 추세가 유의합니다 "
-                    f"(tau={metrics.mk_tau:.2f}, p={metrics.mk_pvalue:.3g}).")
+                    f"(τ = {_txt(metrics.mk_tau, '.2f')}, {_p_txt(metrics.mk_pvalue)}).")
         return (f"Mann-Kendall 검정에서 전체 기간의 뚜렷한 추세가 확인되지 않습니다 "
-                f"(p={metrics.mk_pvalue:.2f}).")
+                f"({_p_txt(metrics.mk_pvalue)}).")
 
     label: str
     strength: float
     reasons: list[str]
 
-    if not structured:
+    # random-walk-like noise (phi ~ 1): moves accumulate, so a large swing is
+    # not evidence of a trend by itself (see _noise_model)
+    walk = f["phi"] >= 0.9
+    walk_sentence = ("변화가 누적되는 무작위 행보(random walk)에 가까운 움직임이라, "
+                     "추세처럼 보이는 등락도 우연일 수 있습니다.")
+
+    # a level shift followed by a flat stretch: judge the period since the step
+    post = _post_shift(series, decomposition, changepoints, f, freq)
+
+    if post is not None:
+        label = "stable"
+        strength = 0.5 * _ramp(post["p"], 0.05, 0.5) + 0.5 * _ramp(post["length"] / n, 0.15, 0.4)
+        reasons = [post["shift_sentence"], post["flat_sentence"]]
+    elif not structured:
         if f["cv"] >= _VOLATILE_CV:
             label = "volatile"
             strength = 0.5 * _ramp(f["cv"], _VOLATILE_CV, 2 * _VOLATILE_CV) + 0.5 * _ramp(
                 metrics.mk_pvalue, 0.01, 0.3)
             reasons = [
-                f"잡음이 커서(변동계수 {f['cv'] * 100:.0f}%) 뚜렷한 방향성이 없습니다.",
+                f"잡음이 커서(추정 잡음 수준이 평균의 {f['cv'] * 100:.0f}%) 뚜렷한 방향성이 없습니다.",
                 mk_sentence(),
             ]
         else:
@@ -1186,7 +1873,7 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
         strength = 0.5 * _ramp(f["rebound"] / max(f["decline_before_trough"], _TINY), 0.25, 0.6) \
             + 0.5 * _ramp(f["t_rec"], _T_SIG, 3 * _T_SIG)
         reb_pct = _pct_change(f["t_last"], f["t_tr"], f["ref"])
-        reb_txt = (f"{reb_pct:+.1f}%" if reb_pct is not None
+        reb_txt = (_pct_txt(reb_pct) if reb_pct is not None
                    else f"추세 규모의 {f['rebound'] * 100:.1f}%만큼")
         reasons = [
             f"고점({peak_date}) 이후 하락해 {trough_date}에 저점을 찍은 뒤 {reb_txt} 반등했습니다.",
@@ -1207,7 +1894,7 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
             strength = 0.6 * _ramp(f["drop_from_peak"], _FAR_BELOW_PEAK, 0.7) + 0.4 * _ramp(
                 -f["t_rec"], -1.0, _T_SIG)
             reasons = [peak_sentence(), recent_sentence()]
-            if f["settled"] >= 0.25 * n:
+            if f["settled"] >= 0.25 * n and not falling and abs(f["rel_rec"]) < 0.05:
                 reasons.append(f"최근 {f['settled']}{unit} 동안은 낮은 수준에서 정체되어 있습니다.")
             elif mk_down:
                 reasons.append(mk_sentence())
@@ -1227,7 +1914,8 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
             reasons = [
                 f"현재 추세 수준이 과거 기반 수준의 {f['multiple']:.1f}배로, 낮은 기반에서 빠르게 성장 중입니다.",
                 recent_sentence(),
-                f"최근 기울기가 장기 평균 기울기의 {f['s_rec_t'] / max(f['avg_slope'], _TINY):.1f}배로 가속되고 있습니다.",
+                f"최근 상승 속도가 전체 기간 평균 속도(추세선 처음→끝)의 "
+                f"{f['s_rec_t'] / max(f['avg_slope'], _TINY):.1f}배로 가속되고 있습니다.",
             ]
         else:
             label = "growing"
@@ -1272,23 +1960,61 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
         strength = 0.2
         reasons = [mk_sentence(), recent_sentence()]
         if label == "volatile":
-            reasons.append(f"잡음이 커서(변동계수 {f['cv'] * 100:.0f}%) 방향성이 불분명합니다.")
+            reasons.append(f"잡음이 커서(추정 잡음 수준이 평균의 {f['cv'] * 100:.0f}%) 방향성이 불분명합니다.")
 
+    if walk and label in ("volatile", "stable") and len(reasons) < 4:
+        reasons.append(walk_sentence)
     # a recent structural break supports the explanation
     recent_cps = [c for c in changepoints if c.index >= n - max(h, 2 * _data.season_length(freq))]
-    if recent_cps and len(reasons) < 4:
+    if recent_cps and len(reasons) < 4 and post is None:
         c = recent_cps[-1]
         reasons.append(f"{_fmt_date(c.date, freq)}에 구조 변화({_KIND_KO.get(c.kind, c.kind)})가 감지되었습니다.")
+    if walk and label not in ("volatile", "stable") and len(reasons) < 4:
+        reasons.append(walk_sentence)
     if len(reasons) < 2:
         reasons.append(mk_sentence())
     reasons = reasons[:4]
 
     confidence = (0.45 + 0.5 * float(min(1.0, max(0.0, strength)))) * length_factor
+    # random-walk-like series: any phase verdict is much less reliable
+    confidence *= 1.0 - 0.4 * _ramp(f["phi"], 0.8, 1.0)
     return LifecyclePhase(label=label, confidence=float(min(1.0, max(0.0, confidence))),
                           reasons=reasons)
 
 
 # =========================================================================== orchestration
+
+
+def _decompose_with_shifts(s: pd.Series, period: int, dec: Decomposition,
+                           shifts: list[int]) -> tuple[Decomposition, list[int]]:
+    """Re-decompose with the trend allowed to jump at the level shifts that need it.
+
+    A break is kept only if the piecewise trend fits the neighbourhood of the
+    step clearly better (residual sum of squares within one trend window on
+    either side < 70% of the smooth decomposition's): a genuine step leaves a
+    large S-shaped residual around it in the smooth fit, whereas a "level
+    shift" found on a smooth curve (piecewise-linear segmentation of an
+    exponential decay) does not need, and would be hurt by, a jump.
+    Returns the decomposition and the breaks it uses.
+    """
+    n = len(s)
+    win = _trend_window(n, dec.period)
+    r0 = dec.resid.to_numpy(dtype=float)
+    keep = list(shifts)
+    for _ in range(2):
+        if not keep:
+            return dec, []
+        cand = decompose(s, period, breaks=keep)
+        r1 = cand.resid.to_numpy(dtype=float)
+        good = []
+        for k in keep:
+            a, b = max(0, k - win), min(n, k + win)
+            if float(np.sum(r1[a:b] ** 2)) < 0.7 * float(np.sum(r0[a:b] ** 2)):
+                good.append(k)
+        if good == keep:
+            return cand, keep
+        keep = good
+    return dec, []
 
 
 def analyze(series: pd.Series, freq: Optional[str] = None,
@@ -1297,7 +2023,10 @@ def analyze(series: pd.Series, freq: Optional[str] = None,
 
     The input is cleaned/regularised with :func:`trendai.data.prepare`, then
     decomposed; changepoints, anomalies, metrics and the lifecycle phase are
-    computed.  Works for as few as 3 observations (degrading gracefully).
+    computed.  If level shifts are found, the series is decomposed again with
+    the trend allowed to jump there (``decompose(..., breaks=...)``, see
+    :func:`_decompose_with_shifts`), and that decomposition is the one
+    returned and used for anomalies, metrics and the phase.  Works for as few as 3 observations (degrading gracefully).
     """
     s, freq = _data.prepare(series, freq=freq, name=name)
     n = len(s)
@@ -1305,6 +2034,22 @@ def analyze(series: pd.Series, freq: Optional[str] = None,
     dec = decompose(s, sl)
     z = (dec.trend + dec.resid).to_numpy(dtype=float)
     cps = _changepoints_from(z, pd.DatetimeIndex(s.index), sl, 5, None) if n >= 8 else []
+    shifts = [c.index for c in cps if c.kind == "level_shift"]
+    if shifts:
+        # let the trend jump at level shifts (no smoothing across the step, which
+        # would make the points next to it look like spikes/dips)
+        dec, kept = _decompose_with_shifts(s, sl, dec, shifts)
+        # a "level shift" that the data do not need as a jump (a kink in a smooth
+        # curve) is reported by its slope change instead
+        for c in cps:
+            if c.kind == "level_shift" and c.index not in kept:
+                s1, s2 = c.slope_before, c.slope_after
+                if s2 > 0 >= s1:
+                    c.kind = "reversal_up"
+                elif s2 < 0 <= s1:
+                    c.kind = "reversal_down"
+                else:
+                    c.kind = "acceleration" if abs(s2) > abs(s1) else "deceleration"
     anomalies = detect_anomalies(s, dec) if n >= 8 else []
     metrics = compute_metrics(s, freq, dec)
     phase = lifecycle_phase(s, freq, dec, metrics, cps)

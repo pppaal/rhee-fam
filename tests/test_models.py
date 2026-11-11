@@ -268,6 +268,35 @@ def test_extreme_magnitudes_stay_finite():
             assert np.all(np.isfinite(f)), nm
 
 
+def test_extreme_magnitudes_are_exact_scale_equivariant_without_warnings():
+    # regression: analog_knn computed raw window variances (inf at |y| ~ 1e300 -> NaN forecast), and
+    # _standardize / _is_seasonal squared raw values (overflow -> crude scale; underflow at 1e-200 ->
+    # seasonality silently dropped, so forecasts differed by up to 9 % from the rescaled series)
+    import warnings
+    rng = np.random.default_rng(13)
+    t = np.arange(60.0)
+    cases = (1e300 * (1 + rng.random(40)), -1e300 * (1 + rng.random(40)), 1e-300 * (1 + rng.random(40)),
+             1e-200 * (5 + rng.random(40)), 1e300 * (2 + np.sin(2 * np.pi * t / 12) + 0.1 * rng.random(60)))
+    for y in cases:
+        ref = np.abs(y).max()
+        for nm in ALL_NAMES:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # no overflow / underflow / invalid notes at all
+                f = M.make_model(nm).fit(y, 12).predict(6)
+            unit = M.make_model(nm).fit(y / ref, 12).predict(6) * ref
+            assert np.all(np.isfinite(f)), nm
+            assert np.allclose(f, unit, rtol=1e-9, atol=0.0), (nm, y[0])
+
+
+def test_analog_knn_ties_resolve_to_earliest_analogues():
+    # every window of a perfect line is an equally good analogue; rounding noise must not pick
+    # windows near the end (few future points -> damped continuation that bends the line)
+    for slope in (0.5, 0.1, 1.0 / 3.0):
+        y = 10 + slope * np.arange(60.0)
+        f = _fit_predict("analog_knn", y, 1, 12)
+        assert np.allclose(f, 10 + slope * np.arange(60.0, 72.0), rtol=1e-12, atol=1e-9), slope
+
+
 def test_log_wrapper_handles_non_positive_gracefully():
     y = np.r_[0.0, -1.0, np.arange(1.0, 40.0)]
     for nm in ("holt_damped@log", "holt_winters@log", "linear_trend@log", "logistic_growth"):
@@ -279,6 +308,43 @@ def test_log_wrapper_matches_manual_log_fit():
     f = M.make_model("linear_trend@log").fit(y, 12).predict(12)
     manual = np.exp(M.make_model("linear_trend").fit(np.log(y), 12).predict(12))
     assert np.allclose(f, manual)
+
+
+@pytest.mark.parametrize("name", ["holt_damped@log", "holt_winters@log", "linear_trend@log"])
+def test_log_models_do_not_explode_on_short_explosive_history(name):
+    # regression: emerging D n=20 grows x8 over its last 6 points; the log-slope compounded to ~21000
+    # after 30 steps (data max 67) and auto_forecast ended at ~6800
+    y = sample("emerging", freq="D", n=20, seed=7).to_numpy()
+    f = _fit_predict(name, y, 7, 30)
+    max_growth = y.max() / y.min()  # largest growth anywhere in the history (x16)
+    first = max(y[-1], f[0])
+    assert np.all(f <= first * max_growth * (1 + 1e-9)), f
+    assert np.all(f >= y.min()), f
+    if name != "holt_winters@log":
+        assert f[-1] > y[-1]  # still a growth forecast, just not a compounding one
+
+
+def test_log_growth_guard_leaves_steady_exponential_trends_alone():
+    # the guard only bounds moves larger than anything observed: a clean exponential trend
+    # (horizon longer than the guard's recent window) is extrapolated as before
+    t = np.arange(40.0)
+    y = 10 * np.exp(0.02 * t)
+    for name, inner in (("linear_trend@log", "linear_trend"), ("holt_damped@log", "holt_damped")):
+        f = _fit_predict(name, y, 7, 30)
+        manual = np.exp(M.make_model(inner).fit(np.log(y), 7).predict(30))
+        assert np.allclose(f, manual, rtol=1e-9), name
+    assert np.allclose(_fit_predict("linear_trend@log", y, 7, 30), 10 * np.exp(0.02 * np.arange(40.0, 70.0)),
+                       rtol=1e-6)
+
+
+def test_log_move_bounds():
+    ly = np.log(np.r_[np.full(10, 5.0), 5.0 * 2.0 ** np.arange(1, 6)])  # flat, then doubling 5 times
+    up, down = M._log_move_bounds(ly, 1, 30)
+    assert up.shape == down.shape == (30,)
+    assert np.all(np.diff(up) >= 0) and np.all(np.diff(down) >= 0)
+    assert np.allclose(up[:5], np.log(2.0) * np.arange(1, 6))  # recent pace (window = last 8 points)
+    assert np.allclose(up[14:], 5 * np.log(2.0))  # never more than the whole history's growth
+    assert np.allclose(down, 0.0)  # it never fell
 
 
 def test_holt_winters_degrades_to_holt_damped():
@@ -318,6 +384,32 @@ def test_seasonality_detection():
     assert not M._is_seasonal(rng.normal(size=120), 12)
     assert not M._is_seasonal(np.full(48, 3.0), 12)
     assert not M._is_seasonal(np.arange(10.0), 12)
+
+
+def test_weekly_seasonality_test_rejects_random_walks():
+    # regression: the phase ANOVA assumed white noise, but the moving-average remainder of a random
+    # walk is smooth, so 13-20 % of pure random walks with m = 52 and 3-6 seasons were "seasonal"
+    # (about 3 % with the effective-df correction)
+    for n in (156, 208, 260, 312):
+        hits = sum(M._is_seasonal(100 + np.cumsum(np.random.default_rng(500 + s).normal(size=n)), 52)
+                   for s in range(100))
+        assert hits <= 7, (n, hits)
+    for n in (60, 120):  # monthly random walks: was 4-6 %
+        hits = sum(M._is_seasonal(100 + np.cumsum(np.random.default_rng(900 + s).normal(size=n)), 12)
+                   for s in range(100))
+        assert hits <= 5, (n, hits)
+
+
+def test_weekly_seasonality_still_detected():
+    # real weekly-yearly seasonality (smooth annual cycle) on stable / trending levels, every seed
+    for n in (130, 156, 208, 312):
+        for kind in ("seasonal", "growing", "declining"):
+            for seed in range(5):
+                assert M._is_seasonal(sample(kind, n=n, freq="W", seed=seed).to_numpy(), 52), (kind, n, seed)
+    rng = np.random.default_rng(7)
+    t = np.arange(208.0)
+    weak = 100 + 2.0 * np.sin(2 * np.pi * t / 52) + rng.normal(size=208)  # amplitude 2 sd, white noise
+    assert M._is_seasonal(weak, 52)
 
 
 def _scalar_ets(y, a, b, g, p, l0, b0, s0, trend, season):
@@ -486,6 +578,38 @@ def test_logistic_growth_saturates_on_peaking(seed):
     train, _ = _holdout("peaking", seed)
     f2 = _fit_predict("logistic_growth", train, 12, 12)
     assert np.all(f2 >= 0.7 * train.max()) and np.all(f2 <= 1.6 * train.max())
+
+
+def test_logistic_growth_has_no_phantom_step_on_white_noise():
+    # regression: a step placed just after the last observation (t0 > 1, |k| ~ 100) fitted that one
+    # recency-weighted point while its far asymptote was constrained by no data: on N(100, 1) noise
+    # forecasts of 13.9 (seed 30000, n=12) and ~20-30 % of fits beyond 10 sd at every length
+    y = 100 + np.random.default_rng(30000).standard_normal(12)
+    f = _fit_predict("logistic_growth", y, 1, 4)
+    assert np.all(np.abs(f - 100) < 3), f
+    for n in (12, 16, 36, 120, 300):
+        worst = 0.0
+        for s in range(40):
+            y = 100 + np.random.default_rng(31000 + s).standard_normal(n)
+            model = M.make_model("logistic_growth").fit(y, 1)
+            worst = max(worst, float(np.max(np.abs(model.predict(12) - 100))))
+            p = model.params_
+            if "t0" in p:  # the fitted transition is (at least 30 %) inside the data
+                c = 1 / (1 + np.exp(-abs(p["k"]) * (np.array([0.0, 1.0]) - p["t0"])))
+                assert c[1] - c[0] >= 0.3 - 1e-9, (n, s, p)
+        assert worst < 10, (n, worst)
+
+
+def test_logistic_admissible_transitions():
+    adm = M.LogisticGrowth._admissible
+    t0 = np.array([1.0375, 0.5, 1.09, 1.0, 0.5])
+    k = np.array([-101.4, 12.0, 10.0, -24.0, 200.0])
+    ok = adm(t0, k, 12, 4, 0.3)
+    # phantom step just after the end (2 % of it observed) | full S-curve | early growth phase with
+    # only 29 % of the transition observed (< 30 %) | step resolved by only 2 observations | sub-step jump
+    assert ok.tolist() == [False, True, False, False, False]
+    # the same early growth phase is fine once enough of it is observed and resolved
+    assert adm(np.array([1.09]), np.array([10.0]), 120, 4, 0.25).tolist() == [True]
 
 
 def test_logistic_growth_respects_saturation_cap():

@@ -3,12 +3,42 @@
 Everything downstream expects a *regular* series: a float ``pd.Series`` with a
 sorted ``DatetimeIndex`` on one of the canonical frequencies below, no
 duplicates and no NaNs.  :func:`prepare` turns almost any user input into that.
+
+File loading (:func:`load_table`) is built for the files people actually have:
+
+* encodings: UTF-8 (with/without BOM), UTF-16 (Excel "Unicode text"), CP949 /
+  EUC-KR (Korean Excel and public-data portals);
+* separators: ``,`` ``;`` tab ``|`` (sniffed), quoted fields;
+* dates: ISO (``2024-01-05``, ``2024-01``), ``2024.01`` / ``2024. 1. 5.``
+  (KOSIS / Korean Excel), ``202401`` / ``20240105`` (ECOS), ``2024년 1월``,
+  ``2024년 1분기``, ``2024 Q1`` / ``2024Q1`` / ``Q1 2024``, ISO weeks
+  (``2024-W01``), ``01.02.2024`` / ``02/01/2024`` (day/month order inferred
+  once for the whole column), plain years in any order, Unix seconds / ms,
+  timestamps with UTC offsets (the local wall time is kept);
+* numbers: ``1,234``, ``1.234,5`` (decimal comma), ``12%``, ``$1,234``,
+  ``1,234원``, ``(1,234)`` (negative), ``1.2억`` / ``3,400만`` / ``12K``;
+* wide tables whose dates run across the columns (KOSIS default layout);
+* row-number columns (``Unnamed: 0`` written by ``DataFrame.to_csv``, ``id``,
+  ``번호`` ...) are ignored.
+
+Problems are never silent: unreadable values, dropped rows, interpolated gaps
+and ambiguous date orders are reported with a Korean :class:`DataWarning` /
+:class:`DataNotice`; input that cannot be used raises :class:`DataError`
+(Korean message that names the CLI flag / argument to use).
 """
 
 from __future__ import annotations
 
+import csv
+import io
+import json
+import re
+import warnings
+import zipfile
+from collections import Counter
+from datetime import date
 from pathlib import Path
-from typing import Iterable, Optional, Union
+from typing import Any, Iterable, Iterator, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -16,7 +46,7 @@ import pandas as pd
 # canonical frequency code -> pandas offset alias used for resampling / future dates
 PANDAS_FREQ: dict[str, str] = {
     "D": "D",
-    "W": "W-SUN",
+    "W": "W-SUN",  # default anchor; weekly data keeps its own weekday (see regularize)
     "M": "MS",
     "Q": "QS",
     "Y": "YS",
@@ -27,10 +57,24 @@ FREQ_KO: dict[str, str] = {"D": "일", "W": "주", "M": "월", "Q": "분기", "Y
 _SEASON_LENGTH = {"D": 7, "W": 52, "M": 12, "Q": 4, "Y": 1}
 _PERIODS_PER_YEAR = {"D": 365.25, "W": 52.1775, "M": 12.0, "Q": 4.0, "Y": 1.0}
 _DEFAULT_HORIZON = {"D": 30, "W": 26, "M": 12, "Q": 8, "Y": 5}
+_STEP_DAYS = {"D": 1.0, "W": 7.0, "M": 30.436875, "Q": 91.310625, "Y": 365.2425}
+_WEEKDAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 
 
 class DataError(ValueError):
-    """Raised when input data cannot be turned into a usable series."""
+    """Raised when input data cannot be turned into a usable series (Korean message)."""
+
+
+class DataWarning(UserWarning):
+    """The data was changed in a way the user should know about (values dropped, gaps filled...)."""
+
+
+class DataNotice(UserWarning):
+    """Informational note about how the input was interpreted (ignored columns, date order...)."""
+
+
+def _warn(msg: str, category: type = DataWarning) -> None:
+    warnings.warn(msg, category, stacklevel=3)
 
 
 def season_length(freq: str) -> int:
@@ -39,6 +83,7 @@ def season_length(freq: str) -> int:
 
 
 def periods_per_year(freq: str) -> float:
+    """Average number of periods of ``freq`` in one calendar year."""
     return _PERIODS_PER_YEAR[_check_freq(freq)]
 
 
@@ -49,20 +94,24 @@ def default_horizon(freq: str) -> int:
 
 def _check_freq(freq: str) -> str:
     if freq not in PANDAS_FREQ:
-        raise DataError(f"unknown frequency {freq!r}; expected one of {list(PANDAS_FREQ)}")
+        raise DataError(f"알 수 없는 주기 {freq!r}입니다. D/W/M/Q/Y 중 하나를 지정하세요.")
     return freq
 
 
+def _days(index: pd.DatetimeIndex) -> np.ndarray:
+    """Timestamps as float days (resolution-agnostic; pandas 3 stores ``us``)."""
+    return pd.DatetimeIndex(index).to_numpy().astype("datetime64[s]").astype(np.int64) / 86400.0
+
+
 def infer_freq(index: pd.DatetimeIndex) -> str:
-    """Infer the canonical frequency code from the median spacing of ``index``."""
+    """Infer the canonical frequency code from the spacing of ``index``."""
     if len(index) < 2:
-        raise DataError("need at least 2 timestamps to infer a frequency")
+        raise DataError("주기를 추정하려면 날짜가 2개 이상 필요합니다.")
     idx = pd.DatetimeIndex(index).sort_values()
-    # resolution-agnostic (pandas >= 2 may store s/ms/us/ns)
-    diffs = np.diff(idx.to_numpy().astype("datetime64[s]").astype(np.int64)) / 86400.0  # days
+    diffs = np.diff(_days(idx))
     diffs = diffs[diffs > 0]
     if len(diffs) == 0:
-        raise DataError("all timestamps are identical")
+        raise DataError("모든 날짜가 같습니다. 날짜 열이 올바른지 확인하세요 (--date-col).")
     # a low quantile (not the median) so that gappy data still maps to its native spacing
     d = float(np.quantile(diffs, 0.25))
     if d <= 1.5:
@@ -76,15 +125,41 @@ def infer_freq(index: pd.DatetimeIndex) -> str:
     return "Y"
 
 
-def future_index(last_date: pd.Timestamp, freq: str, horizon: int) -> pd.DatetimeIndex:
-    """The ``horizon`` timestamps that follow ``last_date`` at ``freq``."""
-    if horizon < 1:
-        raise DataError("horizon must be >= 1")
+def _weekly_alias(index: pd.DatetimeIndex) -> str:
+    """``W-<DAY>`` anchored on the most common weekday of ``index`` (ties: latest obs)."""
+    idx = pd.DatetimeIndex(index)
+    if len(idx) == 0:
+        return PANDAS_FREQ["W"]
+    counts = Counter(int(d) for d in idx.dayofweek)
+    top = max(counts.values())
+    candidates = {d for d, c in counts.items() if c == top}
+    anchor = int(idx.max().dayofweek) if int(idx.max().dayofweek) in candidates else min(candidates)
+    return f"W-{_WEEKDAYS[anchor]}"
+
+
+def _alias_for(freq: str, index: Optional[pd.DatetimeIndex] = None) -> str:
     alias = PANDAS_FREQ[_check_freq(freq)]
-    rng = pd.date_range(start=pd.Timestamp(last_date), periods=horizon + 1, freq=alias)
-    if rng[0] != pd.Timestamp(last_date):  # last_date not on the grid: date_range rolled forward
-        rng = pd.date_range(start=pd.Timestamp(last_date), periods=horizon + 2, freq=alias)
-        rng = rng[rng > pd.Timestamp(last_date)]
+    if freq == "W" and index is not None and len(index):
+        alias = _weekly_alias(index)
+    return alias
+
+
+def future_index(last_date: pd.Timestamp, freq: str, horizon: int) -> pd.DatetimeIndex:
+    """The ``horizon`` timestamps that follow ``last_date`` at ``freq``.
+
+    Weekly series continue on the weekday of ``last_date`` (a Monday-anchored
+    history gets Monday forecast dates).
+    """
+    if int(horizon) < 1:
+        raise DataError("예측 기간(horizon)은 1 이상이어야 합니다.")
+    last = pd.Timestamp(last_date)
+    alias = PANDAS_FREQ[_check_freq(freq)]
+    if freq == "W":
+        alias = f"W-{_WEEKDAYS[int(last.dayofweek)]}"
+    rng = pd.date_range(start=last, periods=horizon + 1, freq=alias)
+    if rng[0] != last:  # last_date not on the grid: date_range rolled forward
+        rng = pd.date_range(start=last, periods=horizon + 2, freq=alias)
+        rng = rng[rng > last]
         return pd.DatetimeIndex(rng[:horizon])
     return pd.DatetimeIndex(rng[1:])
 
@@ -95,14 +170,15 @@ def regularize(series: pd.Series, freq: Optional[str] = None, how: str = "mean")
     * duplicates / sub-period observations are aggregated with ``how``
       (``'mean'`` or ``'sum'``),
     * interior gaps are linearly interpolated in time,
-    * leading / trailing missing periods are dropped.
+    * leading / trailing missing periods are dropped,
+    * weekly data keeps the weekday it was recorded on (``W-MON``...).
     """
     s = _clean(series)
     if freq is None:
         freq = infer_freq(s.index)
-    alias = PANDAS_FREQ[_check_freq(freq)]
+    alias = _alias_for(freq, s.index)
     if how not in ("mean", "sum"):
-        raise DataError("how must be 'mean' or 'sum'")
+        raise DataError("how 는 'mean' 또는 'sum' 이어야 합니다.")
     r = s.resample(alias)
     out = r.mean() if how == "mean" else r.sum(min_count=1)
     out = out.astype(float)
@@ -118,119 +194,1013 @@ def regularize(series: pd.Series, freq: Optional[str] = None, how: str = "mean")
     return out
 
 
+# --------------------------------------------------------------------------- numbers
+
+_MISSING_TOKENS = frozenset({
+    "", "-", "--", "---", "—", "–", "−", ".", "..", "...", "…", "?", "*", "x",
+    "na", "n/a", "n.a.", "nan", "null", "none", "nil", "nd", "n.d.", "missing",
+    "#n/a", "#na", "#value!", "#div/0!", "#ref!", "#num!", "#name?", "#null!",
+    "없음", "해당없음", "미상", "자료없음", "결측",
+})
+_MULTIPLIERS = {"천": 1e3, "만": 1e4, "억": 1e8, "조": 1e12, "k": 1e3, "K": 1e3, "M": 1e6,
+                "mn": 1e6, "mil": 1e6, "B": 1e9, "bn": 1e9}
+_NUM_RE = r"^(-?)(\d[\d.,]*(?:[eE]-?\d+)?|[.,]\d+(?:[eE]-?\d+)?)(.*)$"
+_UNIT_RE = re.compile(r"^[A-Za-z가-힣/°℃℉㎏㎡㎞²³µ]{1,8}$")
+
+
+def _decimal_votes(num: pd.Series) -> tuple[int, int]:
+    """(votes for a decimal comma, votes for a decimal point) among number strings."""
+    has_c = num.str.contains(",", regex=False)
+    has_d = num.str.contains(".", regex=False)
+    both = has_c & has_d
+    last_c = num.str.rfind(",")
+    last_d = num.str.rfind(".")
+    comma = int((both & (last_c > last_d)).sum())
+    comma += int(num.str.fullmatch(r"-?\d{1,3}(?:\.\d{3}){2,}(?:,\d+)?").sum())
+    comma += int(num.str.fullmatch(r"-?\d+,(?:\d{1,2}|\d{4,})").sum())
+    dot = int((both & (last_d > last_c)).sum())
+    dot += int(num.str.fullmatch(r"-?\d{1,3}(?:,\d{3}){2,}(?:\.\d+)?").sum())
+    dot += int(num.str.fullmatch(r"-?\d+\.(?:\d{1,2}|\d{4,})").sum())
+    return comma, dot
+
+
+def parse_numbers(col: pd.Series, decimal: Optional[str] = None,
+                  prefer_decimal_comma: bool = False) -> tuple[pd.Series, int, list[str]]:
+    """Convert a column of numbers written as text into floats.
+
+    Handles thousands separators (``1,234`` / ``1.234,5`` / ``1 234``), decimal
+    commas (auto-detected for the whole column, or ``decimal=','``), ``%`` and
+    currency marks (``$ € £ ¥ ₩ 원``), trailing unit words (``명``, ``kg``),
+    multipliers (``1.2억``, ``3,400만``, ``12K``, ``1.5M``), accounting
+    negatives ``(1,234)`` and the usual missing-value markers (``-``, ``NA``,
+    ``#N/A`` ...).  ``prefer_decimal_comma`` breaks ties for files that use
+    ``;`` as the separator.
+
+    Returns ``(values, n_unreadable, examples)`` where ``n_unreadable`` counts
+    non-empty cells that could not be read (they become NaN).
+    """
+    if pd.api.types.is_bool_dtype(col):
+        return col.astype(float), 0, []
+    if pd.api.types.is_numeric_dtype(col):
+        return pd.to_numeric(col, errors="coerce").astype(float), 0, []
+    raw = col.astype("string").str.strip()
+    missing = raw.isna() | raw.str.lower().isin(_MISSING_TOKENS)
+    plain = pd.to_numeric(raw.where(~missing), errors="coerce").astype(float)
+    if bool((plain.notna() | missing).all()):  # fast path: ordinary numbers only
+        out = pd.Series(plain.to_numpy(dtype=float), index=col.index, name=col.name)
+        out[~np.isfinite(out.to_numpy())] = np.nan
+        bad = (~missing.to_numpy()) & out.isna().to_numpy()
+        return out, int(bad.sum()), [str(v) for v in raw[bad].head(3)]
+    t = raw.where(~missing)
+    t = t.str.replace("\u2212", "-", regex=False)
+    t = t.str.replace(r"[\s\u00a0\u202f\u2009'’]", "", regex=True)
+    neg = t.str.fullmatch(r"\(.+\)").fillna(False).astype(bool)
+    t = t.str.replace(r"^\((.+)\)$", r"\1", regex=True)
+    t = t.str.replace(r"(?i)^(?:usd|krw|eur|jpy|cny|rmb|gbp)|(?:usd|krw|eur|jpy|cny|rmb|gbp)$", "",
+                      regex=True)
+    t = t.str.replace(r"[$€£¥₩￦%‰+]", "", regex=True)
+    t = t.str.replace(r"^-(?=\D*$)", "", regex=True)  # lone sign left over
+    parts = t.str.extract(_NUM_RE)
+    sign = parts[0].fillna("")
+    num = parts[1]
+    suffix = parts[2].fillna("")
+    if decimal not in (",", ".") and not bool(num.str.contains(",", regex=False).any()) \
+            and not bool((num.str.count(r"\.") >= 2).any()):
+        decimal = "."  # no comma anywhere and no 1.234.567 grouping: a plain decimal point
+    if decimal not in (",", "."):
+        comma, dot = _decimal_votes(num.dropna())
+        if comma > dot:
+            decimal = ","
+        elif dot > comma:
+            decimal = "."
+        else:
+            decimal = "," if (prefer_decimal_comma and bool(num.str.contains(",", regex=False).any())) else "."
+    if decimal == ",":
+        num = num.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    else:
+        num = num.str.replace(",", "", regex=False)
+    val = pd.to_numeric(num, errors="coerce").astype(float)
+    mult = pd.Series(1.0, index=col.index)
+    has_suffix = suffix.str.len() > 0
+    if bool(has_suffix.any()):
+        mult = suffix.map(lambda u: _MULTIPLIERS.get(u, 1.0 if (u == "" or _UNIT_RE.match(u)) else np.nan))
+        mult = mult.astype(float)
+    sgn = np.where(sign.to_numpy() == "-", -1.0, 1.0) * np.where(neg.to_numpy(), -1.0, 1.0)
+    out = pd.Series(val.to_numpy(dtype=float) * mult.to_numpy(dtype=float) * sgn, index=col.index,
+                    name=col.name)
+    out[~np.isfinite(out.to_numpy())] = np.nan
+    bad = (~missing.to_numpy()) & out.isna().to_numpy()
+    examples = [str(v) for v in raw[bad].head(3)]
+    return out, int(bad.sum()), examples
+
+
+# --------------------------------------------------------------------------- dates
+
+_TIME = r"(?:(?:\s+|T)(\d{1,2}):(\d{2})(?::(\d{2})(?:[.,]\d+)?)?)?"
+_TZ_SUFFIX = re.compile(r"(\d{1,2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?)\s*(?:Z|UTC|GMT|[+-]\d{2}(?::?\d{2})?)$",
+                        re.IGNORECASE)
+_DOW_SUFFIX = r"\s*\((?:[월화수목금토일](?:요일)?|mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?\)$"
+_DATE_NAME_EXACT = frozenset({
+    "date", "dates", "time", "timestamp", "datetime", "day", "week", "month", "year", "period",
+    "quarter", "ts", "dt", "ds", "yyyymm", "yyyymmdd", "ym", "ymd", "yearmonth", "날", "일", "주",
+    "월", "년", "연", "분기", "주차",
+})
+_DATE_NAME_PART = ("date", "time", "period", "날짜", "일자", "일시", "시점", "기간", "연도", "년도",
+                   "연월", "년월", "기준일", "기준월", "기준년", "기준연", "조사일", "발표일")
+
+
+def _name_looks_like_date(name: Any) -> bool:
+    n = re.sub(r"[\s_\-./()]+", "", str(name)).lower()
+    return n in _DATE_NAME_EXACT or any(p in n for p in _DATE_NAME_PART)
+
+
+def _to_float(x: pd.Series) -> pd.Series:
+    """Numeric float64 Series from strings / nullable dtypes (missing -> NaN, never pd.NA)."""
+    return pd.to_numeric(x.astype(object).where(x.notna(), np.nan), errors="coerce").astype(float)
+
+
+def _from_parts(year: Any, month: Any = 1, day: Any = 1, hour: Any = None, minute: Any = None,
+                second: Any = None, index: Optional[pd.Index] = None) -> pd.Series:
+    """Vectorised Timestamp construction from (string/int) components; invalid -> NaT."""
+    def num(x: Any, default: Optional[float]) -> Any:
+        if isinstance(x, pd.Series):
+            v = _to_float(x)
+            return v if default is None else v.fillna(default)
+        return default if x is None else x
+
+    parts = {"year": num(year, None), "month": num(month, 1), "day": num(day, 1)}
+    if hour is not None:
+        parts.update(hour=num(hour, 0), minute=num(minute, 0), second=num(second, 0))
+    frame = pd.DataFrame(parts, index=index if index is not None else getattr(year, "index", None))
+    try:
+        res = pd.to_datetime(frame, errors="coerce")
+    except (ValueError, OverflowError, TypeError):  # pragma: no cover - defensive
+        return pd.Series(pd.NaT, index=frame.index, dtype="datetime64[us]")
+    return pd.Series(res, index=frame.index)
+
+
+def _two_digit_year(yy: pd.Series) -> pd.Series:
+    y = _to_float(yy)
+    return y.where(y >= 100, np.where(y < 69, 2000 + y, 1900 + y))
+
+
+def _naive(v: Any) -> pd.Timestamp:
+    """Timestamp in local wall time (offset dropped); NaT for missing."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return pd.NaT
+    ts = pd.Timestamp(v)
+    return ts.tz_localize(None) if ts.tzinfo is not None else ts
+
+
+def _coverage_score(ts: pd.Series) -> float:
+    """How plausible a parsed date column is: monotone order + density on its own grid."""
+    t = pd.DatetimeIndex(ts.dropna())
+    if len(t) < 2:
+        return 0.0
+    u = t.unique().sort_values()
+    if len(u) < 2:
+        return 0.0
+    try:
+        f = infer_freq(u)
+    except DataError:
+        return 0.0
+    span = float(_days(u[-1:])[0] - _days(u[:1])[0])
+    grid = span / _STEP_DAYS[f] + 1.0
+    cov = min(1.0, len(u) / max(grid, 1.0))
+    mono = 0.5 if (t.is_monotonic_increasing or t.is_monotonic_decreasing) else 0.0
+    return cov + mono
+
+
+class _Candidate:
+    """One whole-column interpretation of a date column."""
+
+    def __init__(self, label: str, values: pd.Series, kind: str = "normal",
+                 ambiguous: Optional[str] = None) -> None:
+        self.label = label
+        self.values = values
+        self.kind = kind            # 'normal' or 'weak' (needs a date-like name / monotone order)
+        self.ambiguous = ambiguous  # Korean note when another order was equally plausible
+
+
+def _pick_order(options: list[tuple[str, pd.Series]], tie_index: int) -> tuple[str, pd.Series, bool]:
+    """Choose between alternative field orders: most parsed, then most plausible.
+
+    Returns ``(label, values, tied)``; on a tie ``options[tie_index]`` wins.
+    """
+    keys = [(int(v.notna().sum()), round(_coverage_score(v), 6)) for _, v in options]
+    top = max(keys)
+    tied = keys.count(top) > 1
+    i = tie_index if (tied and keys[tie_index] == top) else keys.index(top)
+    return options[i][0], options[i][1], tied
+
+
+def _string_candidates(s: pd.Series) -> Iterator[_Candidate]:
+    """Whole-column interpretations of the (normalised, non-missing) strings ``s``, lazily."""
+    idx = s.index
+
+    def ext(pattern: str) -> pd.DataFrame:
+        return s.str.extract(pattern, flags=re.IGNORECASE)
+
+    # 2024-01-05, 2024/1/5, 2024.01.05, 2024. 1. 5., with optional time
+    m = ext(r"^(\d{4})\s*([-/.])\s*(\d{1,2})\s*\2\s*(\d{1,2})\.?" + _TIME + "$")
+    if m[0].notna().any():
+        sep = m[1].dropna().mode().iloc[0] if m[1].notna().any() else "-"
+        label = {"-": "YYYY-MM-DD", "/": "YYYY/MM/DD", ".": "YYYY.MM.DD"}[sep]
+        has_time = m[4].notna().any()
+        yield (_Candidate(label + (" hh:mm" if has_time else ""),
+                              _from_parts(m[0], m[2], m[3], m[4] if has_time else None, m[5], m[6],
+                                          index=idx)))
+    # 2024-01, 2024.01, 2024/1, 2024. 1.
+    m = ext(r"^(\d{4})\s*([-/.])\s*(\d{1,2})\.?$")
+    if m[0].notna().any():
+        sep = m[1].dropna().mode().iloc[0] if m[1].notna().any() else "-"
+        label = {"-": "YYYY-MM", "/": "YYYY/MM", ".": "YYYY.MM"}[sep]
+        yield (_Candidate(label, _from_parts(m[0], m[2], 1, index=idx),
+                              kind="weak" if sep == "." else "normal"))
+    # 2024년 1월 (5일)
+    m = ext(r"^(\d{4})\s*년\s*(\d{1,2})\s*월(?:\s*(\d{1,2})\s*일)?\.?$")
+    if m[0].notna().any():
+        yield (_Candidate("YYYY년 M월" + (" D일" if m[2].notna().any() else ""),
+                              _from_parts(m[0], m[1], m[2], index=idx)))
+    # quarters: 2024Q1, 2024-Q1, Q1 2024, 2024 1Q, 1Q 2024, 2024년 1분기, 2024 1/4분기, 2024.1/4
+    q_year = pd.Series(np.nan, index=idx)
+    q_num = pd.Series(np.nan, index=idx)
+    for pat, yi, qi in ((r"^(\d{4})\s*[-_./]?\s*Q\s*([1-4])$", 0, 1),
+                        (r"^Q([1-4])\s*[-_./]?\s*(\d{4})$", 1, 0),
+                        (r"^(\d{4})\s*[-_./]?\s*([1-4])\s*Q$", 0, 1),
+                        (r"^([1-4])\s*Q\s*[-_./]?\s*(\d{4})$", 1, 0),
+                        (r"^(\d{4})\s*(?:년|\.)?\s*([1-4])\s*(?:/\s*4)?\s*분기$", 0, 1),
+                        (r"^(\d{4})\s*[.]?\s*([1-4])\s*/\s*4$", 0, 1)):
+        m = ext(pat)
+        hit = m[0].notna() & q_year.isna()
+        if hit.any():
+            q_year[hit] = _to_float(m.loc[hit, yi])
+            q_num[hit] = _to_float(m.loc[hit, qi])
+    if q_year.notna().any():
+        yield (_Candidate("YYYY Qn (분기)", _from_parts(q_year, (q_num - 1) * 3 + 1, 1, index=idx)))
+    # ISO weeks: 2024-W01, 2024W01-3, 2024년 1주(차)
+    m = ext(r"^(\d{4})\s*-?\s*W\s*(\d{1,2})(?:\s*-?\s*([1-7]))?$")
+    m2 = ext(r"^(\d{4})\s*년\s*(\d{1,2})\s*주(?:차)?$")
+    if m[0].notna().any() or m2[0].notna().any():
+        y = m[0].fillna(m2[0])
+        w = m[1].fillna(m2[1])
+        d = m[2]
+        vals = []
+        for yy, ww, dd in zip(y, w, d):
+            try:
+                vals.append(pd.Timestamp(date.fromisocalendar(int(yy), int(ww), int(dd) if isinstance(dd, str) else 1)))
+            except (TypeError, ValueError):
+                vals.append(pd.NaT)
+        yield (_Candidate("YYYY-Www (ISO 주)", pd.Series(pd.DatetimeIndex(vals), index=idx)))
+    # compact: 20240105 / 202401
+    m = ext(r"^(\d{4})(\d{2})(\d{2})$")
+    if m[0].notna().any():
+        yield (_Candidate("YYYYMMDD", _from_parts(m[0], m[1], m[2], index=idx), kind="weak"))
+    m = ext(r"^(\d{4})(\d{2})$")
+    if m[0].notna().any():
+        yield (_Candidate("YYYYMM", _from_parts(m[0], m[1], 1, index=idx), kind="weak"))
+    # plain years (2024, 2024년)
+    m = ext(r"^(\d{4})\s*년?$")
+    if m[0].notna().any():
+        y = _to_float(m[0])
+        y = y.where((y >= 1000) & (y <= 2200))
+        yield (_Candidate("YYYY (연도)", _from_parts(y, 1, 1, index=idx), kind="weak"))
+    # Unix seconds (9-10 digits) / milliseconds (12-13 digits)
+    m = ext(r"^(\d{9,10}|\d{12,13})$")
+    if m[0].notna().any():
+        v = _to_float(m[0])
+        ms = v > 1e11
+        secs = v.where(~ms, v / 1000.0)
+        ok = (secs >= 1e8) & (secs <= 4.2e9)
+        ts = pd.to_datetime(secs.where(ok), unit="s", errors="coerce")
+        yield (_Candidate("Unix " + ("ms" if bool(ms.any()) else "초"), pd.Series(ts, index=idx),
+                              kind="epoch"))
+    # Excel serial day numbers (45292 = 2024-01-01), only for date-named / chosen columns
+    m = ext(r"^(\d{5})(?:\.0+)?$")
+    if m[0].notna().any():
+        v = _to_float(m[0])
+        v = v.where((v >= 20000) & (v <= 80000))
+        ts = pd.to_datetime(v, unit="D", origin="1899-12-30", errors="coerce")
+        yield (_Candidate("엑셀 날짜 일련번호", pd.Series(ts, index=idx), kind="serial"))
+    # day/month order: 05.01.2024 / 01/05/2024 / 5-1-24 (+ time)
+    m = ext(r"^(\d{1,2})\s*([-/.])\s*(\d{1,2})\s*\2\s*(\d{4}|\d{2})\.?" + _TIME + "$")
+    if m[0].notna().any():
+        sep = m[1].dropna().mode().iloc[0] if m[1].notna().any() else "/"
+        has_time = m[4].notna().any()
+        year = _two_digit_year(m[3])
+        tm = (m[4], m[5], m[6]) if has_time else (None, None, None)
+        dmy = _from_parts(year, m[2], m[0], *tm, index=idx)
+        mdy = _from_parts(year, m[0], m[2], *tm, index=idx)
+        s_ = sep
+        lab_d = f"DD{s_}MM{s_}YYYY" + (" hh:mm" if has_time else "")
+        lab_m = f"MM{s_}DD{s_}YYYY" + (" hh:mm" if has_time else "")
+        first, second = m[0].dropna(), m[2].dropna()
+        if first.nunique() == 1 and second.nunique() > 1:
+            tie = 0  # constant first field = the day of monthly data (01.02.2022, 01.03.2022 ...)
+        elif second.nunique() == 1 and first.nunique() > 1:
+            tie = 1
+        else:
+            tie = 0 if sep == "." else 1
+        label, vals, tied = _pick_order([(lab_d, dmy), (lab_m, mdy)], tie_index=tie)
+        note = None
+        if tied and first.nunique() > 1 and second.nunique() > 1:
+            note = (f"날짜의 일/월 순서가 모호해(모든 값이 12 이하) '{label}' 순서로 읽었습니다. "
+                    "다르다면 날짜를 YYYY-MM-DD 형식으로 바꿔 주세요.")
+        yield (_Candidate(label, vals, ambiguous=note))
+    # month/year: 01/2024, 1.2024
+    m = ext(r"^(\d{1,2})\s*[-/.]\s*(\d{4})$")
+    if m[0].notna().any():
+        yield (_Candidate("MM/YYYY", _from_parts(m[1], m[0], 1, index=idx)))
+    # two-digit year + month: 24-01 (or 01-24)
+    m = ext(r"^(\d{2})\s*([-/.])\s*(\d{2})$")
+    if m[0].notna().any():
+        ym = _from_parts(_two_digit_year(m[0]), m[2], 1, index=idx)
+        my = _from_parts(_two_digit_year(m[2]), m[0], 1, index=idx)
+        label, vals, tied = _pick_order([("YY-MM", ym), ("MM-YY", my)], tie_index=0)
+        note = None
+        if tied:
+            note = f"날짜 '{s.iloc[0]}'의 연/월 순서가 모호해 '{label}'로 읽었습니다."
+        yield (_Candidate(label, vals, kind="weak", ambiguous=note))
+
+
+def _mixed_candidate(s: pd.Series) -> Optional[_Candidate]:
+    """Last resort: pandas' per-element parser, with one day/month order for the column."""
+    opts = []
+    for dayfirst in (False, True):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                v = pd.to_datetime(s, errors="coerce", format="mixed", dayfirst=dayfirst)
+            except (ValueError, TypeError, OverflowError):
+                try:
+                    v = pd.to_datetime(s, errors="coerce", format="mixed", dayfirst=dayfirst, utc=True)
+                    v = v.dt.tz_localize(None)
+                except (ValueError, TypeError, OverflowError):
+                    continue
+        if getattr(v.dt, "tz", None) is not None:
+            v = v.dt.tz_localize(None)
+        opts.append(("기타 날짜 형식" + (" (일/월 순)" if dayfirst else ""), pd.Series(v, index=s.index)))
+    if not opts:
+        return None
+    label, vals, _ = _pick_order(opts, tie_index=0)
+    return _Candidate(label, vals)
+
+
+def _normalise_date_strings(col: pd.Series) -> pd.Series:
+    s = col.astype("string").str.strip()
+    s = s.str.replace(r"\s+", " ", regex=True)
+    s = s.str.replace(_DOW_SUFFIX, "", regex=True, flags=re.IGNORECASE)
+    s = s.str.replace(_TZ_SUFFIX, r"\1", regex=True)  # keep local wall time of offset timestamps
+    s = s.str.replace(r"\.$", "", regex=True).str.strip()
+    s = s.where(~s.str.lower().isin(_MISSING_TOKENS))
+    return s
+
+
+def _numeric_dates_as_strings(col: pd.Series) -> pd.Series:
+    """Numbers from Excel/JSON -> date-like text: 2024 -> '2024', 2021.1 -> '2021.10'."""
+    v = pd.to_numeric(col, errors="coerce").astype(float)
+    finite = v.notna() & np.isfinite(v)
+    out = pd.Series(pd.NA, index=col.index, dtype="string")
+    is_int = finite & (v % 1 == 0)
+    out[is_int] = v[is_int].map(lambda x: str(int(x)))
+    frac = finite & ~is_int
+    out[frac] = v[frac].map(lambda x: f"{x:.2f}")  # KOSIS '2021.10' read as 2021.1 -> October
+    return out
+
+
+def parse_dates(col: pd.Series, name_hint: bool = True,
+                allow_epoch: bool = True) -> tuple[Optional[pd.Series], str, Optional[str]]:
+    """Interpret ``col`` as dates with one format for the whole column.
+
+    Returns ``(timestamps, format_label, note)``; ``timestamps`` is ``None``
+    when fewer than 80 % of the non-empty cells can be read with any single
+    format.  ``name_hint=False`` (the column name does not look like a date)
+    makes the weak interpretations (plain years, ``YYYYMM``, ``YYYY.MM``) also
+    require a sorted column; epoch seconds need ``allow_epoch``.  ``note`` is
+    a Korean remark (ambiguous order, unreadable cells) or ``None``.
+    """
+    if isinstance(col.dtype, pd.DatetimeTZDtype):
+        return pd.Series(col.dt.tz_localize(None), index=col.index), "날짜/시간", None
+    if pd.api.types.is_datetime64_any_dtype(col):
+        return pd.Series(pd.to_datetime(col), index=col.index), "날짜/시간", None
+    if pd.api.types.is_bool_dtype(col):
+        return None, "", None
+    if col.dtype == object and len(col.dropna()) and all(
+            isinstance(v, (pd.Timestamp, date)) for v in col.dropna()):
+        return pd.Series(pd.DatetimeIndex([_naive(v) for v in col]), index=col.index), "날짜/시간", None
+    from_numbers = pd.api.types.is_numeric_dtype(col)
+    s = _numeric_dates_as_strings(col) if from_numbers else _normalise_date_strings(col)
+    present = s.notna()
+    n = int(present.sum())
+    if n == 0:
+        return None, "", None
+    sp = s[present]
+    best: Optional[_Candidate] = None
+    best_frac = 0.0
+    for cand in _string_candidates(sp):
+        vals = cand.values
+        frac = float(vals.notna().sum()) / n
+        if (cand.kind == "epoch" and not allow_epoch) or (cand.kind == "serial" and not name_hint):
+            continue
+        if cand.kind in ("weak", "epoch") and not name_hint:
+            v = pd.DatetimeIndex(vals.dropna())
+            if not (v.is_monotonic_increasing or v.is_monotonic_decreasing):
+                continue
+        if from_numbers and cand.label not in ("YYYY (연도)", "YYYYMM", "YYYYMMDD", "YYYY.MM",
+                                               "엑셀 날짜 일련번호") and not cand.label.startswith("Unix"):
+            continue
+        if frac > best_frac:
+            best, best_frac = cand, frac
+        if frac >= 1.0:
+            break
+    if best is None or best_frac < 0.8:
+        pure_numbers = bool(sp.str.fullmatch(r"[-+]?[\d.,]+").all())
+        has_letters = float(sp.str.contains(r"[A-Za-z]", regex=True).mean()) >= 0.8
+        if not from_numbers and not pure_numbers and (name_hint or has_letters):
+            mixed = _mixed_candidate(sp)
+            if mixed is not None:
+                frac = float(mixed.values.notna().sum()) / n
+                if frac > best_frac and frac >= 0.8:
+                    best, best_frac = mixed, frac
+    if best is None or best_frac < 0.8:
+        return None, "", None
+    full = pd.Series(pd.NaT, index=col.index, dtype="datetime64[us]")
+    full[present] = pd.DatetimeIndex(best.values).as_unit("us")
+    note = best.ambiguous
+    n_bad = n - int(best.values.notna().sum())
+    if n_bad:
+        bad_ex = ", ".join(repr(str(x)) for x in sp[best.values.isna()].head(3))
+        extra = f"날짜로 읽을 수 없는 값 {n_bad}개(예: {bad_ex})가 있는 행은 제외했습니다."
+        note = f"{note} {extra}" if note else extra
+    return full, best.label, note
+
+
+# --------------------------------------------------------------------------- series cleaning
+
+
+def _coerce_index(index: pd.Index) -> pd.DatetimeIndex:
+    """Turn any reasonable index into a naive DatetimeIndex (or raise a Korean DataError)."""
+    if isinstance(index, pd.DatetimeIndex):
+        return index.tz_localize(None) if index.tz is not None else index
+    if isinstance(index, pd.PeriodIndex):
+        return index.to_timestamp(how="start")
+    if len(index) and pd.api.types.is_numeric_dtype(index.dtype) and not pd.api.types.is_bool_dtype(index.dtype):
+        v = pd.to_numeric(pd.Series(index), errors="coerce").astype(float)
+        finite = v[np.isfinite(v)]
+        if len(finite) and bool(((finite % 1 == 0) & (finite >= 1000) & (finite <= 2200)).all()):
+            years = v.where(np.isfinite(v))
+            return pd.DatetimeIndex(_from_parts(years, 1, 1, index=pd.RangeIndex(len(v))).to_numpy())
+        lo, hi = (float(finite.min()), float(finite.max())) if len(finite) else (0.0, 0.0)
+        raise DataError(
+            f"인덱스가 날짜가 아니라 숫자({lo:g}~{hi:g})입니다. 날짜(DatetimeIndex)를 붙이거나 "
+            "trendai.from_values(values, start='2020-01-01', freq='M')로 만드세요. "
+            "연도라면 1000~2200 사이 정수여야 합니다.")
+    parsed, _, note = parse_dates(pd.Series(list(index), dtype=object), name_hint=True)
+    if parsed is None:
+        ex = ", ".join(repr(str(x)) for x in list(index[:3]))
+        raise DataError(f"인덱스를 날짜로 읽을 수 없습니다 (예: {ex}). 날짜 형식의 인덱스가 필요합니다.")
+    if note:
+        _warn(note, DataNotice)
+    return pd.DatetimeIndex(parsed.to_numpy())
+
+
 def _clean(series: pd.Series) -> pd.Series:
     if not isinstance(series, pd.Series):
-        raise DataError("expected a pandas Series")
+        raise DataError("pandas Series(날짜 인덱스 + 숫자 값)가 필요합니다. "
+                        "숫자 목록이라면 trendai.from_values(...)를 쓰세요.")
+    if series.empty:
+        raise DataError("시계열이 비어 있습니다.")
     s = series.copy()
-    if not isinstance(s.index, pd.DatetimeIndex):
-        try:
-            s.index = pd.to_datetime(s.index)
-        except (ValueError, TypeError) as exc:
-            raise DataError(f"index is not parseable as dates: {exc}") from exc
-    if s.index.tz is not None:
-        s.index = s.index.tz_localize(None)
-    s = pd.to_numeric(s, errors="coerce").astype(float)
-    s = s[np.isfinite(s.to_numpy())]
+    s.index = _coerce_index(s.index)
+    vals, n_bad, ex = parse_numbers(s)
+    if n_bad:
+        _warn(f"{_label(series)}숫자로 읽을 수 없는 값 {n_bad}개(예: {', '.join(map(repr, ex))})를 "
+              "결측으로 처리했습니다.")
+    s = pd.Series(vals.to_numpy(dtype=float), index=s.index, name=series.name)
+    arr = s.to_numpy()
+    n_inf = int(np.isinf(arr).sum())
+    if n_inf:
+        _warn(f"{_label(series)}무한대(inf) 값 {n_inf}개를 제외했습니다.")
+    s = s[np.isfinite(arr)]
     s = s[~s.index.isna()]
-    s = s.sort_index()
+    s = s.sort_index(kind="mergesort")
     if s.empty:
-        raise DataError("series has no finite values")
+        raise DataError(f"{_label(series)}유효한 숫자 값이 하나도 없습니다.")
     return s
+
+
+def _label(series: pd.Series) -> str:
+    return f"'{series.name}': " if series.name is not None else ""
+
+
+def _weekday_only(index: pd.DatetimeIndex) -> bool:
+    """Business-day data: no Saturday/Sunday observations over at least two weeks."""
+    idx = pd.DatetimeIndex(index)
+    if len(idx) < 10:
+        return False
+    if bool((idx.dayofweek >= 5).any()):
+        return False
+    span = float(_days(idx[-1:])[0] - _days(idx[:1])[0])
+    return span >= 14
+
+
+def _report_regularisation(raw: pd.Series, out: pd.Series, freq: str, how: str) -> None:
+    """Tell the user when regularisation filled or merged a noticeable share of the data."""
+    alias = _alias_for(freq, raw.index)
+    counts = raw.resample(alias).count()
+    counts = counts.reindex(out.index, fill_value=0)
+    observed = int((counts > 0).sum())
+    filled = len(out) - observed
+    merged = int(len(raw) - observed)
+    name = _label(raw)
+    unit = FREQ_KO[freq]
+    if freq == "D" and _weekday_only(raw.index):
+        _warn(f"{name}평일(영업일)에만 값이 있는 데이터입니다. 실제 관측 {len(raw)}개 사이의 주말 "
+              f"{filled}개를 선형 보간해 달력일 기준({len(out)}개)으로 분석하며, 예측 날짜에도 주말이 "
+              "포함됩니다. 주 단위로 보려면 --freq W (파이썬: freq='W')를 지정하세요.")
+    elif filled >= 3 and filled / max(len(out), 1) >= 0.2:
+        _warn(f"{name}{unit} 단위 격자에 맞추면서 빈 기간 {filled}개(전체 {len(out)}개 중 "
+              f"{filled / len(out):.0%})를 선형 보간했습니다. 실제 관측은 {observed}개입니다.")
+    if merged > 0 and merged / max(len(raw), 1) >= 0.05:
+        verb = "평균" if how == "mean" else "합계"
+        _warn(f"{name}같은 {unit} 단위 기간에 값이 여러 개 있어 {verb}으로 합쳤습니다 "
+              f"(관측 {len(raw)}개 → {observed}개 기간). 다른 주기로 보려면 --freq 를 지정하세요.")
 
 
 def prepare(series: pd.Series, freq: Optional[str] = None, name: Optional[str] = None,
             how: str = "mean") -> tuple[pd.Series, str]:
-    """Clean + regularise a raw series. Returns ``(series, freq)``."""
+    """Clean + regularise a raw series. Returns ``(series, freq)``.
+
+    Accepts a DatetimeIndex (tz-aware ok), PeriodIndex, integer years
+    (1000..2200) or date strings as the index, and numbers or number strings
+    (``'1,234'``) as values.  When the frequency is inferred, a
+    :class:`DataWarning` reports weekday-only data, large interpolated gaps or
+    merged duplicate periods.
+    """
     s = _clean(series)
     if len(s) < 2:
-        raise DataError("need at least 2 observations")
+        raise DataError(f"{_label(series)}관측치가 2개 이상 필요합니다 (유효한 값 {len(s)}개).")
+    inferred = freq is None
     if freq is None:
         freq = infer_freq(s.index)
     out = regularize(s, freq, how=how)
+    if inferred:
+        _report_regularisation(s, out, freq, how)
     if name is not None:
         out.name = name
     elif out.name is None:
         out.name = "series"
     if len(out) < 2:
-        raise DataError("need at least 2 observations after regularisation")
+        raise DataError(f"{_label(series)}{FREQ_KO[freq]} 단위로 정리하면 관측치가 {len(out)}개뿐입니다 "
+                        "(2개 이상 필요). 더 짧은 주기(--freq)를 지정하거나 데이터를 늘리세요.")
     return out, freq
 
 
-# --------------------------------------------------------------------------- CSV / Excel
+# --------------------------------------------------------------------------- tables
+
+_INDEX_NAME_RE = re.compile(
+    r"^(?:unnamed:?\s*\d*|index|idx|level_\d+|id|no\.?|#|seq|row|rownum|row_?id|순번|번호|연번|"
+    r"일련번호|행번호)$", re.IGNORECASE)
 
 
-def _looks_like_dates(col: pd.Series) -> bool:
-    if pd.api.types.is_datetime64_any_dtype(col):
-        return True
-    if pd.api.types.is_numeric_dtype(col):
-        # plain years like 1990, 1991, ... are dates; other numbers are values
-        vals = col.dropna()
-        return bool(len(vals) > 0 and ((vals % 1 == 0) & (vals >= 1000) & (vals <= 2200)).all()
-                    and vals.is_monotonic_increasing and vals.is_unique)
-    parsed = pd.to_datetime(col.astype(str), errors="coerce", format="mixed")
-    return parsed.notna().mean() >= 0.9
+def _is_step1_sequence(v: pd.Series) -> bool:
+    x = v.dropna().to_numpy(dtype=float)
+    if len(x) < 3 or len(x) != len(v) or not np.all(x % 1 == 0):
+        return False
+    d = np.diff(x)
+    return bool(np.all(d == 1.0) or np.all(d == -1.0))
 
 
-def _to_datetime(col: pd.Series) -> pd.DatetimeIndex:
-    if pd.api.types.is_numeric_dtype(col) and not pd.api.types.is_datetime64_any_dtype(col):
-        return pd.DatetimeIndex(pd.to_datetime(col.astype(int).astype(str), format="%Y"))
-    return pd.DatetimeIndex(pd.to_datetime(col.astype(str), errors="coerce", format="mixed"))
+def _clean_frame(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [re.sub(r"\s+", " ", str(c).replace("\ufeff", "")).strip() for c in df.columns]
+    if not df.empty:
+        blank = df.apply(lambda c: c.isna() | c.astype("string").str.strip().fillna("").eq(""))
+        df = df.loc[~blank.all(axis=1), ~blank.all(axis=0).to_numpy()]
+    return df
+
+
+def _find_date_column(df: pd.DataFrame) -> Optional[tuple[str, pd.Series, str, Optional[str]]]:
+    """First column (date-like names first) that reads as dates with one format."""
+    cols = list(df.columns)
+    hinted = [c for c in cols if _name_looks_like_date(c)]
+    for strict_pass, group in ((False, hinted), (True, [c for c in cols if c not in hinted])):
+        for c in group:
+            parsed, label, note = parse_dates(df[c], name_hint=not strict_pass,
+                                              allow_epoch=(not strict_pass) or c == cols[0])
+            if parsed is not None:
+                return c, parsed, label, note
+    return None
+
+
+def _wide_to_series(df: pd.DataFrame, prefer_decimal_comma: bool) -> Optional[dict[str, pd.Series]]:
+    """Dates across the columns (KOSIS layout): one series per row."""
+    names = pd.Series([str(c) for c in df.columns], dtype=object)
+    parsed, label, _ = parse_dates(names, name_hint=True, allow_epoch=False)
+    if parsed is None:  # some columns are labels (항목, 단위 ...): look only at the ones with digits
+        digits = names[names.str.contains(r"\d", regex=True)]
+        if len(digits) < 3:
+            return None
+        sub, label, _ = parse_dates(digits, name_hint=True, allow_epoch=False)
+        if sub is None:
+            return None
+        parsed = pd.Series(pd.NaT, index=names.index, dtype="datetime64[us]")
+        parsed[sub.index] = sub
+    is_date = parsed.notna().to_numpy()
+    if int(is_date.sum()) < 3:
+        return None
+    date_cols = [c for c, d in zip(df.columns, is_date) if d]
+    id_cols = [c for c, d in zip(df.columns, is_date) if not d]
+    dates = pd.DatetimeIndex(parsed[is_date].to_numpy())
+    out: dict[str, pd.Series] = {}
+    for i, (_, row) in enumerate(df.iterrows()):
+        label_parts = [str(row[c]).strip() for c in id_cols
+                       if pd.notna(row[c]) and str(row[c]).strip() not in ("", "nan")]
+        nm = " / ".join(label_parts) or f"행{i + 1}"
+        vals, _, _ = parse_numbers(row[date_cols].reset_index(drop=True),
+                                   prefer_decimal_comma=prefer_decimal_comma)
+        if int(vals.notna().sum()) < 2:
+            continue
+        base, k = nm, 2
+        while nm in out:
+            nm, k = f"{base} ({k})", k + 1
+        s = pd.Series(vals.to_numpy(dtype=float), index=dates, name=nm)
+        s.attrs["trendai"] = {"date_col": "(열 머리글)", "date_format": label, "n_rows": int(len(df))}
+        out[nm] = s
+    if not out:
+        return None
+    _warn(f"날짜가 열 방향으로 놓인 가로형 표로 보고 행마다 시계열 {len(out)}개로 읽었습니다 "
+          f"(날짜 형식: {label}).", DataNotice)
+    return out
+
+
+_MONTH_COL = frozenset({"월", "month", "mon", "mm", "m"})
+_QUARTER_COL = frozenset({"분기", "quarter", "qtr", "q"})
+
+
+def _combine_year_and_period(df: pd.DataFrame, date_col: str, parsed: pd.Series,
+                             label: str) -> Optional[tuple[pd.Series, str, str]]:
+    """Long tables with separate year and month/quarter columns (연도 | 월 | 값)."""
+    if not label.startswith("YYYY (") or parsed.dropna().is_unique:
+        return None
+    for c in df.columns:
+        if c == date_col:
+            continue
+        key = re.sub(r"[\s_]+", "", str(c)).lower()
+        if key in _MONTH_COL:
+            hi, step, what = 12, 1, "월"
+        elif key in _QUARTER_COL:
+            hi, step, what = 4, 3, "분기"
+        else:
+            continue
+        txt = df[c].astype("string").str.strip().str.replace(r"(?i)^q|q$|월$|분기$", "", regex=True)
+        num = _to_float(txt)
+        ok = num.notna() & (num % 1 == 0) & (num >= 1) & (num <= hi)
+        if float(ok.mean()) < 0.9:
+            continue
+        combined = _from_parts(parsed.dt.year.where(ok), (num.where(ok) - 1) * step + 1, 1,
+                               index=df.index)
+        return combined, f"YYYY + {what}", str(c)
+    return None
 
 
 def frame_to_series(df: pd.DataFrame, date_col: Optional[str] = None,
-                    value_cols: Optional[Iterable[str]] = None) -> dict[str, pd.Series]:
-    """Split a wide DataFrame (one date column + N value columns) into raw series."""
+                    value_cols: Optional[Iterable[str]] = None, *,
+                    decimal: Optional[str] = None,
+                    prefer_decimal_comma: bool = False) -> dict[str, pd.Series]:
+    """Split a table (one date column + N value columns) into raw series.
+
+    The date column is detected automatically (column names such as
+    ``date``/``날짜``/``기간`` are tried first) unless ``date_col`` is given;
+    value columns are all columns whose cells read as numbers (see
+    :func:`parse_numbers`), minus row-number columns.  A table whose dates run
+    across the columns is read row by row.  Each returned series carries
+    ``series.attrs['trendai']`` = ``{'date_col', 'date_format', 'n_rows'}``.
+    """
+    if df is None or df.empty:
+        raise DataError("표가 비어 있습니다 (읽을 행이 없습니다).")
+    df = _clean_frame(df)
     if df.empty:
-        raise DataError("table is empty")
-    if date_col is None:
-        for c in df.columns:
-            if _looks_like_dates(df[c]):
-                date_col = c
-                break
-        if date_col is None:
-            raise DataError("could not find a date column; pass date_col explicitly")
-    if date_col not in df.columns:
-        raise DataError(f"date column {date_col!r} not found; columns: {list(df.columns)}")
-    dates = _to_datetime(df[date_col])
-    if value_cols is None:
-        value_cols = []
-        for c in df.columns:
-            if c == date_col:
-                continue
-            num = pd.to_numeric(df[c], errors="coerce")
-            if num.notna().mean() >= 0.5:
-                value_cols.append(c)
-        if not value_cols:
-            raise DataError("no numeric value column found")
+        raise DataError("표가 비어 있습니다 (값이 있는 행이 없습니다).")
+    note: Optional[str] = None
+    if date_col is not None:
+        date_col = str(date_col).strip()
+        if date_col not in df.columns:
+            raise DataError(f"날짜 열 {date_col!r}을(를) 찾지 못했습니다. 열 목록: {list(df.columns)}")
+        parsed, label, note = parse_dates(df[date_col], name_hint=True, allow_epoch=True)
+        if parsed is None:
+            ex = ", ".join(repr(str(x)) for x in df[date_col].dropna().head(3))
+            raise DataError(
+                f"{date_col!r} 열을 날짜로 읽을 수 없습니다 (예: {ex}). 지원 형식: 2024-01-05, 2024-01, "
+                "2024.01, 202401, 20240105, 2024년 1월, 2024 Q1, 2024년 1분기, 2024-W01, 05.01.2024, "
+                "연도(2024), Unix 시간.")
+    else:
+        found = _find_date_column(df)
+        if found is None:
+            wide = _wide_to_series(df, prefer_decimal_comma)
+            if wide is not None:
+                return wide
+            raise DataError(
+                "날짜 열을 찾지 못했습니다. --date-col 로 날짜 열을 지정하세요 (파이썬: date_col=...). "
+                f"열 목록: {list(df.columns)}")
+        date_col, parsed, label, note = found
+    period_col: Optional[str] = None
+    combo = _combine_year_and_period(df, str(date_col), parsed, label)
+    if combo is not None:
+        parsed, label, period_col = combo
+    if note:
+        _warn(note, DataNotice)
+    dates = pd.DatetimeIndex(parsed.to_numpy())
+    if value_cols is not None:
+        value_cols = [str(c).strip() for c in value_cols]
+        for c in value_cols:
+            if c not in df.columns:
+                raise DataError(f"값 열 {c!r}을(를) 찾지 못했습니다. 열 목록: {list(df.columns)}")
+        explicit = True
+    else:
+        explicit = False
+    candidates = value_cols if explicit else [c for c in df.columns if c not in (date_col, period_col)]
+    parsed_vals: dict[str, tuple[pd.Series, int, list[str]]] = {}
+    for c in candidates:
+        vals, n_bad, ex = parse_numbers(df[c], decimal=decimal, prefer_decimal_comma=prefer_decimal_comma)
+        n_ok = int(vals.notna().sum())
+        if explicit:
+            if n_ok < 1:
+                ex_raw = ", ".join(repr(str(x)) for x in df[c].dropna().head(3))
+                raise DataError(f"값 열 {c!r}을(를) 숫자로 읽을 수 없습니다 (예: {ex_raw}).")
+            parsed_vals[c] = (vals, n_bad, ex)
+        elif n_ok >= 1 and n_ok / max(n_ok + n_bad, 1) >= 0.8:
+            parsed_vals[c] = (vals, n_bad, ex)
+    if not explicit:
+        def index_like(c: str) -> bool:
+            unnamed = str(c) == "" or str(c).lower().startswith("unnamed")
+            if unnamed:  # a blank header over real values is kept; over 0..N-1 it is a row number
+                return _is_step1_sequence(parsed_vals[c][0])
+            return bool(_INDEX_NAME_RE.match(str(c)))
+
+        by_name = [c for c in parsed_vals if index_like(c)]
+        rest = [c for c in parsed_vals if c not in by_name]
+        by_seq = [c for c in rest if _is_step1_sequence(parsed_vals[c][0])]
+        keep = [c for c in rest if c not in by_seq] or by_seq
+        skipped = [c for c in parsed_vals if c not in keep]
+        if not keep:
+            if skipped:
+                raise DataError(f"분석할 숫자 값 열이 없습니다 (행 번호 열 {skipped}만 있음). "
+                                "--value-col 로 값 열을 지정하세요.")
+            raise DataError("숫자 값 열을 찾지 못했습니다. --value-col 로 값 열을 지정하세요 "
+                            f"(파이썬: value_cols=[...]). 열 목록: {list(df.columns)}")
+        if skipped:
+            _warn(f"행 번호/일련번호로 보이는 열 {skipped}은(는) 분석에서 제외했습니다 "
+                  "(포함하려면 --value-col 로 지정).", DataNotice)
+        parsed_vals = {c: parsed_vals[c] for c in keep}
+    valid_date = ~dates.isna()
     out: dict[str, pd.Series] = {}
-    for c in value_cols:
-        if c not in df.columns:
-            raise DataError(f"value column {c!r} not found; columns: {list(df.columns)}")
-        s = pd.Series(pd.to_numeric(df[c], errors="coerce").to_numpy(), index=dates, name=str(c))
-        s = s[~s.index.isna()]
+    for c, (vals, n_bad, ex) in parsed_vals.items():
+        s = pd.Series(vals.to_numpy(dtype=float), index=dates, name=str(c))
+        if n_bad:
+            pos = np.flatnonzero(vals.isna().to_numpy() & valid_date)
+            edge = ""
+            ok_pos = np.flatnonzero(vals.notna().to_numpy())
+            if len(ok_pos) and len(pos) and (pos.max() > ok_pos.max() or pos.min() < ok_pos.min()):
+                edge = " 시계열의 처음/끝 부분이 잘렸을 수 있습니다."
+            _warn(f"'{c}' 열: 숫자로 읽을 수 없는 값 {n_bad}개(예: {', '.join(map(repr, ex))})를 결측으로 "
+                  f"처리했습니다.{edge}")
+        s = s[valid_date]
+        shown = f"{date_col} + {period_col}" if period_col else str(date_col)
+        s.attrs["trendai"] = {"date_col": shown, "date_format": label, "n_rows": int(len(df))}
         out[str(c)] = s
     return out
 
 
+# --------------------------------------------------------------------------- files
+
+
+def _decode(raw: bytes, what: str) -> tuple[str, str]:
+    """Decode file bytes: BOM, then strict UTF-8, CP949, UTF-16 (no BOM), CP1252, Latin-1."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", errors="replace"), "utf-8-sig"
+    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return raw.decode("utf-32", errors="replace"), "utf-32"
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace"), "utf-16"
+    try:
+        return raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    sample = raw[:4000]
+    if sample.count(b"\x00") > len(sample) // 4:  # UTF-16 without BOM
+        enc = "utf-16-le" if sample[1:2] == b"\x00" else "utf-16-be"
+        try:
+            return raw.decode(enc), enc
+        except UnicodeDecodeError:
+            pass
+    bad_utf8 = raw.decode("utf-8", errors="replace").count("\ufffd")
+    multibyte = len(re.findall(rb"[\xc2-\xf4][\x80-\xbf]+", raw))
+    if multibyte >= 20 * max(bad_utf8, 1):
+        _warn(f"{what}: UTF-8 파일에 깨진 바이트 {bad_utf8}개가 있어 '\ufffd'로 바꿔 읽었습니다.")
+        return raw.decode("utf-8", errors="replace"), "utf-8"
+    for enc in ("cp949", "cp1252"):
+        try:
+            return raw.decode(enc), enc
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1"), "latin-1"
+
+
+def _sniff_sep(lines: list[str]) -> Optional[str]:
+    best: Optional[tuple[tuple[float, int, int], str]] = None
+    for order, sep in enumerate([",", "\t", ";", "|"]):
+        try:
+            counts = [len(r) for r in csv.reader(lines, delimiter=sep)]
+        except csv.Error:
+            continue
+        counts = [c for c in counts if c > 0]
+        if not counts:
+            continue
+        mode, freq = Counter(counts).most_common(1)[0]
+        if mode < 2:
+            continue
+        key = (freq / len(counts), mode, -order)
+        if best is None or key > best[0]:
+            best = (key, sep)
+    if best is not None:
+        return best[1]
+    ws = [len(line.split()) for line in lines]
+    if ws and min(ws) >= 2 and len(set(ws)) == 1:
+        return r"\s+"
+    return None
+
+
+def _header_is_data(columns: list[str]) -> bool:
+    """True when the 'header' row is really the first data row (headerless file)."""
+    if len(columns) < 2:
+        return False
+    first, _, _ = parse_dates(pd.Series([columns[0]], dtype=object), name_hint=True, allow_epoch=False)
+    if first is None or first.isna().all():
+        return False
+    vals, _, _ = parse_numbers(pd.Series(columns[1:], dtype=object))
+    return bool(vals.notna().all())
+
+
+def _read_text_table(text: str, what: str) -> tuple[pd.DataFrame, bool]:
+    """Parse delimited text into an all-string DataFrame. Returns (df, decimal_comma_hint)."""
+    text = text.lstrip("\ufeff")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        raise DataError(f"{what}: 파일이 비어 있습니다.")
+    sep = _sniff_sep(lines[:50]) or ","
+    kw: dict[str, Any] = dict(sep=sep, dtype=str, keep_default_na=False, na_filter=False,
+                              skipinitialspace=True, skip_blank_lines=True)
+    if sep == r"\s+":
+        kw["engine"] = "python"
+    try:
+        df = pd.read_csv(io.StringIO(text), **kw)
+        if _header_is_data([str(c) for c in df.columns]):
+            ncol = df.shape[1]
+            names = ["date"] + (["value"] if ncol == 2 else [f"value{i}" for i in range(1, ncol)])
+            df = pd.read_csv(io.StringIO(text), header=None, names=names, **kw)
+            _warn(f"{what}: 머리글(열 이름) 행이 없는 파일로 보고 첫 행부터 데이터로 읽었습니다.", DataNotice)
+    except pd.errors.EmptyDataError:
+        raise DataError(f"{what}: 파일이 비어 있습니다.") from None
+    except (pd.errors.ParserError, csv.Error) as exc:
+        hint = ""
+        if sep == ",":
+            hint = (" 천 단위 쉼표(1,234)가 따옴표 없이 들어 있으면 열 개수가 달라집니다. "
+                    "값을 따옴표로 감싸거나 탭/세미콜론 구분자로 저장하세요.")
+        raise DataError(f"{what}: CSV 형식 오류 — 행마다 열 개수가 다릅니다 ({exc}).{hint}") from None
+    return df, sep == ";"
+
+
+def _json_to_frame(obj: Any, what: str) -> pd.DataFrame:
+    """Accept the common JSON shapes: records, columns/index/split/table orients, {date: value}."""
+    if isinstance(obj, dict) and isinstance(obj.get("data"), list) and ("schema" in obj or "columns" in obj):
+        if "columns" in obj:
+            df = pd.DataFrame(obj["data"], columns=obj["columns"])
+            if "index" in obj and len(obj["index"]) == len(df):
+                df.insert(0, "date", obj["index"])
+            return df
+        return pd.DataFrame(obj["data"])
+    if isinstance(obj, dict) and len(obj) == 1:
+        (only,) = obj.values()
+        if isinstance(only, list) and only and all(isinstance(r, dict) for r in only):
+            return pd.DataFrame(only)  # e.g. {"items": [...]} (Wikimedia API)
+    if isinstance(obj, list):
+        if not obj:
+            raise DataError(f"{what}: JSON 배열이 비어 있습니다.")
+        if all(isinstance(r, dict) for r in obj):
+            return pd.DataFrame(obj)
+        if all(isinstance(r, (list, tuple)) for r in obj):
+            head = obj[0]
+            if all(isinstance(h, str) for h in head) and len(obj) > 1:
+                return pd.DataFrame(obj[1:], columns=head)
+            return pd.DataFrame(obj, columns=["date"] + [f"value{i}" if len(head) > 2 else "value"
+                                                         for i in range(1, len(head))])
+        raise DataError(f"{what}: JSON 배열 형식을 이해할 수 없습니다 (객체 또는 [날짜, 값] 목록이 필요).")
+    if isinstance(obj, dict):
+        if not obj:
+            raise DataError(f"{what}: JSON 객체가 비어 있습니다.")
+        vals = list(obj.values())
+        if all(not isinstance(v, (dict, list)) for v in vals):  # {date: value} (Series.to_json)
+            return pd.DataFrame({"date": list(obj.keys()), "value": vals})
+        if all(isinstance(v, list) for v in vals):
+            return pd.DataFrame(obj)
+        if all(isinstance(v, dict) for v in vals):
+            keys = pd.Series([str(k) for k in obj.keys()], dtype=object)
+            outer_dates, _, _ = parse_dates(keys, name_hint=True)
+            if outer_dates is not None:  # orient='index': {date: {col: value}}
+                df = pd.DataFrame.from_dict(obj, orient="index")
+            else:  # orient='columns': {col: {date: value}}
+                df = pd.DataFrame(obj)
+            df.index.name = None
+            return df.rename_axis("date").reset_index()
+    raise DataError(f"{what}: JSON 구조를 이해할 수 없습니다 (레코드 목록, {{날짜: 값}} 또는 열 객체가 필요).")
+
+
+_EXCEL_SIGNATURES = (b"PK\x03\x04", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+
+
+def _read_excel(p: Path, raw: bytes, what: str) -> pd.DataFrame:
+    if not raw.startswith(_EXCEL_SIGNATURES):
+        head = raw[:2000].lstrip().lower()
+        if head.startswith((b"<!doctype html", b"<html", b"<table", b"<?xml")):
+            raise DataError(f"{what}: 확장자는 엑셀이지만 실제로는 HTML/XML 표입니다. 엑셀에서 열어 "
+                            "CSV(UTF-8) 또는 .xlsx로 다시 저장하세요.")
+        _warn(f"{what}: 확장자는 엑셀이지만 내용이 텍스트여서 CSV로 읽었습니다.", DataNotice)
+        return pd.DataFrame()  # caller falls back to text parsing
+    engine_pkg = "xlrd" if raw.startswith(_EXCEL_SIGNATURES[1]) else "openpyxl"
+    try:
+        df = pd.read_excel(p, sheet_name=0)
+    except ImportError:
+        raise DataError(f"{what}: 이 엑셀 파일을 읽으려면 {engine_pkg} 패키지가 필요합니다 "
+                        f"(pip install {engine_pkg}). 또는 CSV로 저장해 사용하세요.") from None
+    except (ValueError, zipfile.BadZipFile, KeyError, OSError, TypeError) as exc:
+        raise DataError(f"{what}: 엑셀 파일을 읽을 수 없습니다 (손상되었거나 형식이 다름: {exc}).") from None
+    except Exception as exc:  # noqa: BLE001 - engine-specific parse errors (xlrd.XLRDError, ...)
+        raise DataError(f"{what}: 엑셀 파일을 읽을 수 없습니다 ({type(exc).__name__}: {exc}).") from None
+    if _header_is_data([str(c) for c in df.columns]):
+        try:
+            df = pd.read_excel(p, sheet_name=0, header=None)
+        except Exception:  # noqa: BLE001 - already read once; keep the first result
+            return df
+        ncol = df.shape[1]
+        df.columns = ["date"] + (["value"] if ncol == 2 else [f"value{i}" for i in range(1, ncol)])
+    return df
+
+
 def load_table(path: Union[str, Path], date_col: Optional[str] = None,
                value_cols: Optional[Iterable[str]] = None) -> dict[str, pd.Series]:
-    """Load a CSV/TSV/Excel/JSON file into ``{name: raw series}``.
+    """Load a CSV/TSV/TXT/Excel/JSON file into ``{name: raw series}``.
 
-    The date column and the numeric value columns are detected automatically
-    unless given explicitly.  Returned series are *raw*; pass them through
-    :func:`prepare` before analysis.
+    The encoding, separator, date column and numeric value columns are
+    detected automatically unless given explicitly (see the module docstring
+    for the supported formats).  Returned series are *raw*; pass them through
+    :func:`prepare` (or :func:`trendai.pipeline.run`) before analysis.
+
+    Raises :class:`DataError` with a Korean message for every unreadable input
+    (missing / empty / directory path, damaged Excel, unknown JSON shape,
+    no date or value column ...).
     """
     p = Path(path)
+    what = p.name or str(p)
     if not p.exists():
-        raise DataError(f"file not found: {p}")
+        raise DataError(f"파일을 찾을 수 없습니다: {p}")
+    if p.is_dir():
+        raise DataError(f"폴더가 아니라 파일 경로를 지정하세요: {p}")
+    try:
+        raw = p.read_bytes()
+    except OSError as exc:
+        raise DataError(f"{what}: 파일을 읽을 수 없습니다 ({exc.strerror or exc}).") from None
+    if not raw.strip():
+        raise DataError(f"{what}: 파일이 비어 있습니다.")
     suffix = p.suffix.lower()
-    if suffix in (".xlsx", ".xls"):
-        df = pd.read_excel(p)
+    decimal_comma = False
+    df: Optional[pd.DataFrame] = None
+    if suffix in (".xlsx", ".xlsm", ".xls", ".ods"):
+        df = _read_excel(p, raw, what)
+        if df.empty and not raw.startswith(_EXCEL_SIGNATURES):
+            df = None  # text content behind an Excel extension: parse as CSV below
     elif suffix == ".json":
-        df = pd.read_json(p)
-    else:
-        df = pd.read_csv(p, sep=None, engine="python", encoding_errors="replace")
-    return frame_to_series(df, date_col=date_col, value_cols=value_cols)
+        text, _ = _decode(raw, what)
+        try:
+            obj = json.loads(text.lstrip("\ufeff"))
+        except json.JSONDecodeError as exc:
+            try:  # JSON Lines
+                obj = [json.loads(ln) for ln in text.lstrip("\ufeff").splitlines() if ln.strip()]
+            except json.JSONDecodeError:
+                raise DataError(f"{what}: 올바른 JSON이 아닙니다 ({exc.msg}, {exc.lineno}행).") from None
+        try:
+            df = _json_to_frame(obj, what)
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            if isinstance(exc, DataError):
+                raise
+            raise DataError(f"{what}: JSON 구조를 표로 바꿀 수 없습니다 ({exc}).") from None
+    if df is None:
+        if raw.startswith(_EXCEL_SIGNATURES):
+            raise DataError(f"{what}: 엑셀 파일로 보입니다. 확장자를 .xlsx/.xls로 바꾸거나 CSV로 저장하세요.")
+        text, _ = _decode(raw, what)
+        df, decimal_comma = _read_text_table(text, what)
+    return frame_to_series(df, date_col=date_col, value_cols=value_cols,
+                           prefer_decimal_comma=decimal_comma)
 
 
 def from_values(values: Iterable[float], start: str = "2020-01-01", freq: str = "M",

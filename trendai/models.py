@@ -28,8 +28,8 @@ Registered models
 ``ar``                 AR(p) on first differences, p by AIC, forced stationary
 ``lag_ridge``          ridge regression on lagged differences (ML), recursive
 ``analog_knn``         k nearest historical windows ("past analogues")
-``logistic_growth``    S-curve fit with capped saturation (``requires_positive``)
-``*@log``              ``holt_damped`` / ``holt_winters`` / ``linear_trend`` in log space
+``logistic_growth``    S-curve fit, observed transitions only, capped saturation (``requires_positive``)
+``*@log``              ``holt_damped`` / ``holt_winters`` / ``linear_trend`` in log space (growth-guarded)
 =====================  ==========================================================
 
 ``*``: like the M4-competition benchmarks, these non-seasonal methods are
@@ -158,11 +158,20 @@ def _standardize(y: np.ndarray) -> tuple[np.ndarray, float, float]:
     ``scale`` is the standard deviation, or (for constant input) the largest
     absolute value (1 for an all-zero series), so it is always ``> 0`` and the
     transform is exactly invertible.  Working on ``z`` keeps the numerics of
-    every model independent of the series' magnitude (1e-6 .. 1e9).
+    every model independent of the series' magnitude (1e-6 .. 1e9).  For
+    extreme magnitudes (``max|y|`` above 1e150 or below 1e-150, where squares
+    overflow or underflow) the moments are computed on ``y / max|y|`` so the
+    standard deviation stays exact instead of overflowing to ``inf`` or
+    underflowing to 0.
     """
-    loc = float(np.mean(y))
-    scale = float(np.std(y))
     ref = float(np.max(np.abs(y))) if y.size else 0.0
+    if 0.0 < ref and not (1e-150 < ref < 1e150):
+        yr = y / ref
+        loc = ref * float(np.mean(yr))
+        scale = ref * float(np.std(yr))
+    else:
+        loc = float(np.mean(y))
+        scale = float(np.std(y))
     if not np.isfinite(scale) or scale <= 1e-12 * ref or scale == 0.0:
         scale = ref if ref > 0 else 1.0
     return (y - loc) / scale, loc, scale
@@ -306,8 +315,11 @@ def _classical_seasonal(y: np.ndarray, m: int, multiplicative: bool) -> np.ndarr
     return _seasonal_indices(trend, seg, ph, m, multiplicative)
 
 
-def _paulson_z(F: float, df1: int, df2: int) -> float:
-    """Normal approximation (Paulson 1942) of the upper tail of an F(df1, df2) statistic."""
+def _paulson_z(F: float, df1: float, df2: float) -> float:
+    """Normal approximation (Paulson 1942) of the upper tail of an F(df1, df2) statistic.
+
+    Non-integer (effective) degrees of freedom are allowed.
+    """
     a = 2.0 / (9.0 * df1)
     b = 2.0 / (9.0 * df2)
     f3 = F ** (1.0 / 3.0)
@@ -323,15 +335,34 @@ def _is_seasonal(y: np.ndarray, m: int) -> bool:
     that (b) repeat from one season to the next (positive lag-``m``
     autocorrelation of the remainder, > 0.1).  This handles slow non-linear
     trends and long seasons (weekly data, m = 52) much better than the classic
-    test.  With 2 to 2.5 seasons (too short for the above) the classic M4
+    test.
+
+    The F-test's degrees of freedom are deflated for serial correlation of
+    the noise (Satterthwaite / Bartlett effective sample size): with
+    ``r1`` the lag-1 autocorrelation of the *within-phase* residual (the
+    remainder minus its phase means, so a genuine seasonal pattern does not
+    count as correlation), both df are divided by
+    ``kappa = (1 + r1^2) / (1 - r1^2)``, the variance inflation of a sum of
+    squares of AR(1) noise.  Without it the test assumed white noise, but the
+    moving-average remainder of a random walk (or any persistent level) is
+    smooth and its phase means are strongly correlated, so their spread is
+    far more variable than ``F(m-1, N-m)`` allows: 13-20 % of pure random
+    walks with m = 52 and 3-6 seasons were called seasonal (about 3 % now);
+    for white-noise remainders (``r1 ~ 0``) nothing changes.
+
+    With 2 to 2.5 seasons (too short for the above) the classic M4
     test is used: ``|r_m| > 1.645 * sqrt((1 + 2 sum_{k<m} r_k^2) / n)`` on the
-    linearly detrended series.
+    linearly detrended series.  The data are divided by ``max|y|`` first, so
+    the decision does not depend on the magnitude (no overflow or underflow
+    of squares for ``|y| ~ 1e300`` or ``1e-300``).
     """
     n = len(y)
     if m <= 1 or n < 2 * m:
         return False
-    if float(np.ptp(y)) <= 1e-12 * float(np.max(np.abs(y))):
+    ref = float(np.max(np.abs(y)))
+    if float(np.ptp(y)) <= 1e-12 * ref:
         return False  # constant (up to rounding)
+    y = y / ref
     if 2 * n >= 5 * m:
         trend, seg, ph = _centred_ma(y, m)
         x = seg - trend
@@ -342,13 +373,16 @@ def _is_seasonal(y: np.ndarray, m: int) -> bool:
         if df1 >= 1 and df2 >= 2:
             means = np.bincount(ph, weights=x, minlength=m) / np.maximum(cnt, 1.0)
             ssb = float((cnt * (means - x.mean()) ** 2).sum())
-            ssw = float(((x - means[ph]) ** 2).sum())
+            e = x - means[ph]
+            ssw = float((e * e).sum())
             if ssb <= 0:
                 return False
             if ssw <= 1e-12 * ssb:
                 z = np.inf
             else:
-                z = _paulson_z((ssb / df1) / (ssw / df2), df1, df2)
+                r1 = min(max(float((e[1:] * e[:-1]).sum()) / ssw, 0.0), 0.98)
+                kappa = (1.0 + r1 * r1) / (1.0 - r1 * r1)
+                z = _paulson_z((ssb / df1) / (ssw / df2), max(df1 / kappa, 1.0), max(df2 / kappa, 2.0))
             return bool(z > 2.326 and _acf(x, m)[m] > 0.1)
     a, b = _ols_line(y)
     x = y - (a + b * np.arange(n))
@@ -391,8 +425,9 @@ class _SeasonalAdjustment:
         idx_m = _seasonal_indices(trend, seg, ph, m, True)
         if multiplicative is None:
             idx_a = _seasonal_indices(trend, seg, ph, m, False)
-            sse_m = float(((seg - trend * idx_m[ph]) ** 2).sum())
-            sse_a = float(((seg - trend - idx_a[ph]) ** 2).sum())
+            ref = float(np.max(seg))  # compare in units of max(y): squares cannot overflow
+            sse_m = float((((seg - trend * idx_m[ph]) / ref) ** 2).sum())
+            sse_a = float((((seg - trend - idx_a[ph]) / ref) ** 2).sum())
             if sse_a < sse_m:
                 return cls("add", idx_a, m)
         return cls("mult", idx_m, m)
@@ -981,6 +1016,15 @@ class AnalogKNN(Forecaster):
     (``sqrt(2 w)``); below half of it the analogues are fully trusted, above
     it not at all (the forecast then is the last value), with a linear blend
     in between.  Falls back to drift when the history is too short.
+
+    Numerics: the series is first multiplied by an exact power of two (so
+    ``max|y|`` lies in [0.5, 1); this changes no rounding at all) and the
+    final change is scaled back, so the model is exactly scale-equivariant
+    and its window variances cannot overflow even for ``|y| ~ 1e300``.
+    Distances are compared after rounding to 1e-9 (they are O(1) for
+    z-normalised windows), so analogues that are equally close up to rounding
+    noise -- e.g. every window of a perfect line -- resolve deterministically
+    to the earliest ones, which have the most future points.
     """
 
     name = "analog_knn"
@@ -991,14 +1035,18 @@ class AnalogKNN(Forecaster):
         n = len(y)
         self._mode = "drift"
         self.params_ = {"fallback": "drift"}  # replaced below when analogues are found
+        ref = float(np.max(np.abs(y)))
+        self._exp = math.frexp(ref)[1] if ref > 0 else 0
+        z = np.ldexp(y, -self._exp)  # exact: y = z * 2**exp
+        self._z = z
         w = min(max(m, 6), n // 3)
         if w < 3:
             return
-        win = np.lib.stride_tricks.sliding_window_view(y, w)  # window i = y[i:i+w]
+        win = np.lib.stride_tricks.sliding_window_view(z, w)  # window i = z[i:i+w]
         mu = win.mean(axis=1)
         sd = win.std(axis=1)
-        ref = float(np.max(np.abs(y)))
-        floor = max(0.1 * float(np.median(sd)), 1e-9 * ref, 1e-300)
+        # windows whose spread is below 1e-9 of the series' magnitude count as flat
+        floor = max(0.1 * float(np.median(sd)), 1e-9 * float(np.max(np.abs(z))), 1e-300)
         sde = np.maximum(sd, floor)
         Z = (win - mu[:, None]) / sde[:, None]
         excl = max(1, w // 2)
@@ -1008,7 +1056,7 @@ class AnalogKNN(Forecaster):
         cand = np.arange(0, i_max + 1)
         dist = np.sqrt(((Z[cand] - Z[-1]) ** 2).sum(axis=1))
         k = min(self.k, cand.size)
-        order = np.argsort(dist, kind="stable")[:k]
+        order = np.argsort(np.round(dist, 9), kind="stable")[:k]
         self._ends = cand[order] + w - 1
         self._dist = dist[order]
         self._ratio = np.clip(sde[-1] / sde[cand[order]], 1.0 / 3.0, 3.0)
@@ -1022,22 +1070,22 @@ class AnalogKNN(Forecaster):
                         "analogue_ends": self._ends.tolist()}
 
     def _predict(self, h: int) -> np.ndarray:
-        y = self._y
-        n = len(y)
+        y, z = self._y, self._z
+        n = len(z)
         if self._mode != "knn":
-            return _drift_forecast(y, h)
+            return y[-1] + np.ldexp(_drift_forecast(z, h) - z[-1], self._exp)
         paths = np.empty((len(self._ends), h))
         damp = np.cumsum(0.9 ** np.arange(1, h + 1))
         for r, e in enumerate(self._ends):
             avail = n - 1 - e
             L = min(h, avail)
-            fut = y[e + 1: e + 1 + L] - y[e]
+            fut = z[e + 1: e + 1 + L] - z[e]
             paths[r, :L] = fut
             if L < h:
-                step = (y[e + avail] - y[e]) / avail
+                step = (z[e + avail] - z[e]) / avail
                 paths[r, L:] = fut[-1] + step * damp[: h - L]
         paths *= self._ratio[:, None]
-        return y[-1] + self._trust * (self._wts @ paths)
+        return y[-1] + np.ldexp(self._trust * (self._wts @ paths), self._exp)
 
 
 # --------------------------------------------------------------------------- logistic growth
@@ -1094,6 +1142,15 @@ class LogisticGrowth(Forecaster):
     therefore stay bounded for any input; on non-sigmoidal data the fit is
     just poor (and the backtest will rank it down).  Falls back to drift for
     very short or constant input.
+
+    Identification (see :meth:`_admissible`): only curves whose transition is
+    actually *observed* are considered -- at least ``min_active`` observations
+    must lie in its 10-90 % part and at least ``min_observed`` of the whole
+    transition must happen inside the data.  Otherwise a sharp step placed
+    just after the last observation could fit that single (recency-weighted)
+    point while the asymptote reached by the forecast is constrained by no
+    data at all; on white noise this used to send roughly 20-30 % of the
+    forecasts more than 10 standard deviations away from the data.
     """
 
     name = "logistic_growth"
@@ -1101,6 +1158,10 @@ class LogisticGrowth(Forecaster):
     requires_positive = True
     #: recency weighting: weight of observation at relative time u is exp(recency * (u - 1))
     recency = 3.0
+    #: identification: min. number of observations inside the 10-90 % part of the transition
+    min_active = 4
+    #: identification: min. fraction of the transition that happens inside the observed range
+    min_observed = 0.3
 
     def _fit(self, y: np.ndarray, m: int) -> None:
         n = len(y)
@@ -1124,7 +1185,7 @@ class LogisticGrowth(Forecaster):
         fit = None
         for it in range(2 if use_season else 1):
             target = yn - s[ph] if use_season else yn
-            fit = self._grid_fit(u, target, wt, floor, cap)
+            fit = self._grid_fit(u, target, wt, floor, cap, self.min_active, self.min_observed)
             if fit is None:
                 return
             if use_season:
@@ -1140,9 +1201,32 @@ class LogisticGrowth(Forecaster):
         self.params_ = {"t0": t0, "k": k, "b": b * ref, "L": L * ref}
 
     @staticmethod
-    def _grid_fit(u: np.ndarray, y: np.ndarray, wt: np.ndarray, floor: float,
-                  cap: float) -> tuple[float, float, float, float] | None:
-        """Coarse ``(t0, k)`` grid (on <= ~250 evenly spaced points), then 3 local refinements."""
+    def _admissible(t0: np.ndarray, k: np.ndarray, n: int, min_active: int,
+                    min_observed: float) -> np.ndarray:
+        """Which ``(t0, k)`` curves have a transition that the ``n`` observations resolve.
+
+        With ``c(u) = 1 / (1 + exp(-|k| (u - t0)))`` the completed fraction of
+        the transition at relative time ``u`` (same formula for growth and
+        decline), a curve is admissible iff ``c(1) - c(0) >= min_observed``
+        and at least ``min_active`` of the observation times ``i / (n - 1)``
+        fall in ``|u - t0| <= ln(9) / |k|`` (10 % <= c <= 90 %).
+        """
+        ak = np.abs(k)
+        c1 = 1.0 / (1.0 + np.exp(np.clip(-ak * (1.0 - t0), -50.0, 50.0)))
+        c0 = 1.0 / (1.0 + np.exp(np.clip(ak * t0, -50.0, 50.0)))
+        hw = math.log(9.0) / ak
+        first = np.ceil(np.maximum(0.0, t0 - hw) * (n - 1) - 1e-9)
+        last = np.floor(np.minimum(1.0, t0 + hw) * (n - 1) + 1e-9)
+        return ((c1 - c0) >= min_observed) & ((last - first + 1.0) >= min_active)
+
+    @staticmethod
+    def _grid_fit(u: np.ndarray, y: np.ndarray, wt: np.ndarray, floor: float, cap: float,
+                  min_active: int = 4, min_observed: float = 0.3,
+                  ) -> tuple[float, float, float, float] | None:
+        """Coarse ``(t0, k)`` grid (on <= ~250 evenly spaced points), then 3 local refinements.
+
+        Only :meth:`_admissible` curves compete; ``None`` if none is feasible.
+        """
         n = len(y)
         step = max(1, math.ceil(n / 250))
         sub = np.unique(np.r_[np.arange(0, n, step), n - 1])
@@ -1153,6 +1237,7 @@ class LogisticGrowth(Forecaster):
         T0, KK = np.meshgrid(t0g, kg, indexing="ij")
         t0s, ks = T0.ravel(), KK.ravel()
         sse, _, _ = _logistic_eval(u[sub], y[sub], ws, t0s, ks, floor, cap)
+        sse = np.where(LogisticGrowth._admissible(t0s, ks, n, min_active, min_observed), sse, np.inf)
         i = int(np.argmin(sse))
         if not np.isfinite(sse[i]):
             return None
@@ -1165,6 +1250,7 @@ class LogisticGrowth(Forecaster):
             T0, KK = np.meshgrid(t0r, kr, indexing="ij")
             t0s, ks = T0.ravel(), KK.ravel()
             sse, b, L = _logistic_eval(u, y, wt, t0s, ks, floor, cap)
+            sse = np.where(LogisticGrowth._admissible(t0s, ks, n, min_active, min_observed), sse, np.inf)
             j = int(np.argmin(sse))
             if float(sse[j]) < bsse:
                 bt0, bk, bsse = float(t0s[j]), float(ks[j]), float(sse[j])
@@ -1190,15 +1276,70 @@ class LogisticGrowth(Forecaster):
 # --------------------------------------------------------------------------- log-space wrapper
 
 
+def _max_log_moves(x: np.ndarray, J: int) -> tuple[np.ndarray, np.ndarray]:
+    """Largest rise and largest drop of ``x`` over any span of ``<= j`` steps, for ``j = 1..J``.
+
+    Returns ``(up, down)`` (both ``>= 0``, non-decreasing in ``j``); ``J`` must
+    be ``<= len(x) - 1``.
+    """
+    up = np.empty(J)
+    down = np.empty(J)
+    for i in range(1, J + 1):
+        d = x[i:] - x[:-i]
+        up[i - 1] = d.max()
+        down[i - 1] = -d.min()
+    return (np.maximum.accumulate(np.maximum(up, 0.0)),
+            np.maximum.accumulate(np.maximum(down, 0.0)))
+
+
+def _log_move_bounds(ly: np.ndarray, m: int, h: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-step bounds ``(up, down)`` (length ``h``) on how far a log forecast may move.
+
+    ``up[j-1]`` bounds the rise ``j`` steps ahead: the largest ``j``-step rise
+    within the recent window (the last ``max(m, n // 4, 8)`` points), carried
+    on at that window's average pace beyond its length, and never more than
+    the largest rise over the same span anywhere in the history (which
+    stays flat beyond ``n - 1`` steps, so a horizon longer than the history
+    cannot add more growth than the whole history showed).  ``down`` is the
+    same for drops.  Requires ``len(ly) >= 2``.
+    """
+    n = len(ly)
+    steps = np.arange(1, h + 1)
+    Ja = min(h, n - 1)
+    up_all, dn_all = _max_log_moves(ly, Ja)
+    W = min(n, max(m, n // 4, 8))
+    Jr = min(h, W - 1)
+    up_rec, dn_rec = _max_log_moves(ly[-W:], Jr)
+    ja = np.minimum(steps, Ja) - 1
+    jr = np.minimum(steps, Jr) - 1
+    ext = np.maximum(steps / Jr, 1.0)
+    return (np.minimum(up_rec[jr] * ext, up_all[ja]),
+            np.minimum(dn_rec[jr] * ext, dn_all[ja]))
+
+
 class LogTransformed(Forecaster):
     """Fit ``inner`` on ``log(y)`` and forecast ``exp(.)``.
 
     ``requires_positive``; ``needs_season`` and ``min_obs`` follow the inner
     model.  If non-positive values are passed anyway it degrades gracefully by
-    shifting the series before the log.  Log-space forecasts are clipped to a
-    wide band around the observed log range so ``exp`` cannot overflow.  A
-    constant series is forecast exactly as that constant (no ``exp(log(c))``
-    rounding residue, e.g. exactly 0 for an all-zero series).
+    shifting the series before the log.  A constant series is forecast exactly
+    as that constant (no ``exp(log(c))`` rounding residue, e.g. exactly 0 for
+    an all-zero series).
+
+    Growth guard: a straight line in log space is exponential growth, and a
+    log-slope estimated on a short explosive history (e.g. x8 over the last 6
+    points) compounds into absurd forecasts (x300 after 30 steps).  So the
+    log forecast may not rise (fall) ``j`` steps ahead by more than the
+    largest ``j``-step log rise (fall) seen in the recent past, extended at
+    that pace beyond the recent window, and never by more than the largest
+    rise (fall) over the same span anywhere in the history -- which caps the
+    total growth over a horizon longer than the series at the growth the
+    whole series showed (see :func:`_log_move_bounds`).  The moves are
+    measured from the last observation, or from the first forecast step if
+    that already lies further out (the model's level estimate is never
+    clipped, only the trajectory after it).  A steady exponential trend is
+    left untouched.  Finally the log forecasts are clipped to a wide band
+    around the observed log range, so ``exp`` can never overflow.
     """
 
     requires_positive = True
@@ -1221,6 +1362,7 @@ class LogTransformed(Forecaster):
             rng = float(y.max()) - ymin
             self._shift = -ymin + max(0.01 * rng, 1e-9 * max(1.0, abs(ymin)))
         ly = np.log(y + self._shift)
+        self._ly = ly
         lo, hi = float(ly.min()), float(ly.max())
         span = hi - lo
         self._clip = (lo - 3.0 - span, hi + 3.0 + span)
@@ -1230,7 +1372,15 @@ class LogTransformed(Forecaster):
     def _predict(self, h: int) -> np.ndarray:
         if self._const is not None:
             return np.full(h, self._const)
-        lf = np.clip(self.inner.predict(h), *self._clip)
+        lf = self.inner.predict(h)
+        ly = self._ly
+        if len(ly) >= 2:
+            up, down = _log_move_bounds(ly, self.season_length, h)
+            last = float(ly[-1])
+            a_up = max(last, float(lf[0]) - float(up[0]))
+            a_dn = min(last, float(lf[0]) + float(down[0]))
+            lf = np.clip(lf, a_dn - down, a_up + up)
+        lf = np.clip(lf, *self._clip)
         return np.exp(lf) - self._shift
 
 
