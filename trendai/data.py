@@ -705,9 +705,11 @@ def _infer_freq_with_gaps(observed: pd.DatetimeIndex, dates: pd.DatetimeIndex) -
     The spacing of the observed values alone turns a monthly table with many
     empty cells into a coarser one (36 monthly rows with 9 values read as
     quarterly averages).  So the frequency of the full date column is used,
-    unless the observed values form a complete series at their own, coarser
-    frequency (e.g. month-start values in a daily calendar: every month has
-    a value), which is then kept.
+    unless the observed values cover at least 80 % of the periods of their
+    own, coarser frequency (e.g. month-start values in a daily calendar, or
+    Monday values with a couple of holiday weeks missing), which is then kept:
+    a few empty periods of a weekly or monthly series are gaps of that series,
+    not a reason to interpolate it into a mostly made-up daily one.
     """
     f_obs = infer_freq(observed)
     if len(dates) <= len(observed) or len(pd.DatetimeIndex(dates).unique()) < 2:
@@ -719,9 +721,14 @@ def _infer_freq_with_gaps(observed: pd.DatetimeIndex, dates: pd.DatetimeIndex) -
     if f_all == f_obs:
         return f_obs
     counts = pd.Series(1.0, index=observed).resample(_alias_for(f_obs, observed)).count()
-    if bool((counts > 0).all()):
+    if len(counts) and float((counts > 0).mean()) >= _OWN_GRID_COVERAGE:
         return f_obs
     return f_all
+
+
+#: share of the periods of the observed values' own (coarser) frequency that must hold a value
+#: for that frequency to be kept over the date column's finer one (_infer_freq_with_gaps)
+_OWN_GRID_COVERAGE = 0.8
 
 
 def _label(series: pd.Series) -> str:

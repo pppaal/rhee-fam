@@ -18,9 +18,9 @@ import pandas as pd
 from pandas.errors import OutOfBoundsDatetime
 
 from .analysis import analyze
-from .data import DataError, DataWarning, future_index, prepare
-from .forecast import auto_forecast, compute_outlook, is_random_walk
-from .narrative import generate_narrative
+from .data import DataError, DataWarning, default_horizon, future_index, prepare
+from .forecast import auto_forecast, compute_outlook, is_random_walk, outlook_levels
+from .narrative import direction_label, generate_narrative
 from .types import PHASE_KO, TrendReport
 
 DEFAULT_LLM_MODEL = "claude-opus-5-5"
@@ -51,16 +51,17 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
     are not offered there.
 
     Raises :class:`trendai.data.DataError` (Korean message) when the input
-    cannot be used (no date index, fewer than 2 observations, ``horizon < 1``,
-    ``horizon > MAX_HORIZON`` or forecast dates beyond pandas' datetime range).
+    cannot be used (no date index, fewer than 2 observations, a horizon that
+    is not a whole number >= 1 (``inf`` and ``nan`` included), ``horizon >
+    MAX_HORIZON`` or forecast dates beyond pandas' datetime range).
     Data issues that were worked around (interpolated gaps, weekday-only data,
-    unreadable values) and a horizon of more than 5x the history are reported
-    as :class:`trendai.data.DataWarning`.
+    unreadable values) and a horizon of more than 5x the history -- the
+    default horizon included -- are reported as :class:`trendai.data.DataWarning`.
     """
     if horizon is not None:
         try:
             h_int = int(horizon)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise DataError(f"예측 기간(horizon)은 정수여야 합니다: {horizon!r}") from None
         if h_int != horizon or h_int < 1:
             raise DataError(f"예측 기간(horizon)은 1 이상의 정수여야 합니다: {horizon!r}")
@@ -69,8 +70,11 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
                             f"(최대 {MAX_HORIZON:,}기간까지 지원합니다).")
         horizon = h_int
     s, f = prepare(series, freq=freq, name=name)
-    if horizon is not None:
-        _check_horizon(s, f, horizon)
+    if horizon is None:
+        # resolve the default here, so that it gets the same checks and warnings as an explicit
+        # horizon (a 3-point daily series silently got a 30-day forecast, 10x its history)
+        horizon = default_horizon(f)
+    _check_horizon(s, f, horizon)
     display_name = str(name if name is not None else (s.name if s.name is not None else "series"))
     analysis = analyze(s, freq=f, name=display_name)
     forecast = auto_forecast(analysis.series, horizon=horizon, freq=f, levels=tuple(levels),
@@ -136,15 +140,23 @@ def run_many(series_map: Mapping[str, pd.Series], errors: Optional[dict[str, Exc
 # --------------------------------------------------------------------------- JSON export
 
 
-#: significant digits of the floats in the JSON export
-_JSON_DIGITS = 12
+#: significant digits of the floats in the JSON export: every decimal input of up to 15
+#: significant digits (a 13-digit amount in won) round-trips exactly, while float noise such
+#: as 0.30000000000000004 still becomes 0.3
+_JSON_DIGITS = 15
+
+
+def _date_str(d: Any) -> str:
+    """``YYYY-MM-DD`` of a timestamp / date without ``strftime`` (which refuses years after 9999,
+    dates that run() accepts for long yearly horizons)."""
+    return f"{d.year:04d}-{d.month:02d}-{d.day:02d}"
 
 
 def _clean(obj: Any) -> Any:
     """Recursively convert numpy/pandas objects into JSON-serialisable values.
 
-    Floats keep 12 significant digits (relative precision, so values of any
-    magnitude survive); NaN / inf become ``None``.
+    Floats keep 15 significant digits (relative precision, so values of any
+    magnitude survive); NaN / inf become ``None``; dates become ``YYYY-MM-DD``.
     """
     if isinstance(obj, dict):
         return {str(k): _clean(v) for k, v in obj.items()}
@@ -153,13 +165,13 @@ def _clean(obj: Any) -> Any:
     if obj is None or obj is pd.NaT:
         return None
     if isinstance(obj, (pd.Timestamp, _dt.date)):
-        return obj.strftime("%Y-%m-%d")
+        return _date_str(obj)
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating, float)):
         f = float(obj)
         # significant digits, not decimals: round(f, 6) zeroed a 1e-7 series and merged the
-        # bands of a 1e-5 price; 12 digits keep every value while dropping float noise
+        # bands of a 1e-5 price; 15 digits keep every value while dropping float noise
         return float(f"{f:.{_JSON_DIGITS}g}") if math.isfinite(f) else None
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
@@ -167,17 +179,52 @@ def _clean(obj: Any) -> Any:
 
 
 def _series_records(s: pd.Series) -> list[dict[str, Any]]:
-    return [{"date": d.strftime("%Y-%m-%d"), "value": float(v)} for d, v in s.items()]
+    return [{"date": _date_str(d), "value": float(v)} for d, v in s.items()]
+
+
+def _outlook_extras(report: TrendReport) -> dict[str, Any]:
+    """What the human surfaces say about the outlook beyond the raw ``Outlook`` fields.
+
+    * ``direction_label``: ``{'ko', 'en'}`` word of :func:`narrative.direction_label`
+      (``'flat'`` is ``보합`` or ``방향 불확실`` depending on the change);
+    * ``expected_change_undefined``: why ``expected_change_pct`` is ``None``
+      (``forecast.outlook_levels(...).undefined``), ``None`` when it is a number;
+    * ``compared_levels``: ``{'current', 'future'}``, the two levels the expected
+      change and ``prob_increase`` compare.
+
+    The same fields and rules as ``narrative.build_llm_payload``'s outlook.
+    """
+    o = report.outlook
+    try:
+        lv = outlook_levels(report.analysis, report.forecast)
+    except (AttributeError, TypeError, ValueError):   # hand-made or partial report
+        lv = None
+    undefined = lv.undefined if lv is not None else None
+    return {
+        "direction_label": {lg: direction_label(o.direction, o.expected_change_pct, lg, undefined)
+                            for lg in ("ko", "en")},
+        "expected_change_undefined": undefined,
+        "compared_levels": {"current": lv.current if lv is not None else None,
+                            "future": lv.future if lv is not None else None},
+    }
 
 
 def report_to_dict(report: TrendReport) -> dict[str, Any]:
-    """Full machine-readable export of a report (history, trend, forecast, findings)."""
+    """Full machine-readable export of a report (history, trend, forecast, findings).
+
+    ``outlook`` holds the :class:`~trendai.types.Outlook` fields plus
+    ``direction_label`` (``{'ko', 'en'}``: the word every human surface shows,
+    e.g. ``방향 불확실`` for a ``'flat'`` outlook with a large but uncertain
+    change), ``expected_change_undefined`` (why ``expected_change_pct`` is
+    ``None``) and ``compared_levels`` (``{'current', 'future'}``, see
+    :func:`trendai.forecast.outlook_levels`).
+    """
     a, fc, o = report.analysis, report.forecast, report.outlook
     m = a.metrics
     fc_frame = fc.to_frame()
     forecast_rows = []
     for d, row in fc_frame.iterrows():
-        rec = {"date": d.strftime("%Y-%m-%d")}
+        rec = {"date": _date_str(d)}
         rec.update({k: float(v) for k, v in row.items()})
         forecast_rows.append(rec)
     payload = {
@@ -201,7 +248,7 @@ def report_to_dict(report: TrendReport) -> dict[str, Any]:
             "table": forecast_rows,
             "models": [ms.__dict__ for ms in fc.model_scores],
         },
-        "outlook": {k: getattr(o, k) for k in o.__dataclass_fields__},
+        "outlook": {**{k: getattr(o, k) for k in o.__dataclass_fields__}, **_outlook_extras(report)},
         "narrative": report.narrative,
         "narrative_source": report.narrative_source,
     }

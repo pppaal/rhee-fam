@@ -4,7 +4,7 @@ Public API (see ``docs/ARCHITECTURE.md``)::
 
     sparkline(values, width=None) -> str          # ▁▂▃▄▅▆▇█
     svg_chart(report, width=960, height=380) -> str
-    render_text(report, width=78) -> str
+    render_text(report, width=78, lang='ko') -> str   # 'en': English terminal summary
     render_html(report, path=None) -> str
     render_compare_html(reports, ranking, path=None, links=None) -> str
 
@@ -40,9 +40,23 @@ from urllib.parse import quote, urlsplit
 import numpy as np
 import pandas as pd
 
+from .analysis import changepoint_label as _changepoint_label
+from .analysis import pct_change_undefined as _pct_change_undefined
 from .data import FREQ_KO
+from .data import periods_per_year as _periods_per_year
 from .data import season_length as _season_length
+from .narrative import MODEL_KO as _NARRATIVE_MODEL_KO
+from .narrative import _SCI_LARGE, _SCI_SMALL, _SUPERSCRIPT
+from .narrative import PHASE_EN as _PHASE_EN
+from .narrative import describe_method as _describe_method
+from .narrative import direction_label as _direction_label
+from .narrative import format_number as _format_number
 from .narrative import format_prob as _format_prob
+from .narrative import is_intermittent as _narrative_is_intermittent
+from .narrative import model_label as _model_label
+from .narrative import period_unit as _period_unit
+from .narrative import phase_is_tentative as _phase_is_tentative
+from .narrative import scenario_value as _scenario_value
 from .narrative import translate_reason as _translate_reason
 from .types import PHASE_KO, TrendReport
 
@@ -59,6 +73,8 @@ CHANGEPOINT_KO: dict[str, str] = {
     "reversal_down": "하락 반전",
     "level_shift": "수준 변화",
 }
+# plain words of Outlook.direction; the pages and the terminal print narrative.direction_label instead
+# (see _direction_word: a 'flat' call on a visible change reads "방향 불확실", not "보합")
 DIRECTION_KO: dict[str, str] = {"up": "상승", "down": "하락", "flat": "보합"}
 DIRECTION_ARROW: dict[str, str] = {"up": "▲", "down": "▼", "flat": "▶"}
 CONFIDENCE_KO: dict[str, str] = {"high": "높음", "medium": "보통", "low": "낮음"}
@@ -72,22 +88,9 @@ SCENARIOS_KO: tuple[tuple[str, str], ...] = (
 )
 NARRATIVE_SOURCE_KO: dict[str, str] = {"llm": "AI(Claude) 해석", "rule": "규칙 기반 해석"}
 
-MODEL_KO: dict[str, str] = {
-    "naive": "단순 예측(직전값)",
-    "seasonal_naive": "계절 단순 예측",
-    "drift": "드리프트(평균 기울기)",
-    "ses": "단순 지수평활",
-    "holt": "Holt 선형 추세",
-    "holt_damped": "감쇠 추세 Holt",
-    "holt_winters": "Holt-Winters 계절 모형",
-    "theta": "Theta 방법",
-    "linear_trend": "선형 추세 + 계절 항",
-    "ar": "자기회귀(AR)",
-    "lag_ridge": "릿지 회귀(머신러닝)",
-    "analog_knn": "과거 유사 패턴(kNN)",
-    "logistic_growth": "로지스틱 S-커브",
-    "sba": "간헐 수요 Croston(SBA 보정)",
-}
+#: model id -> Korean name: the narrative's table (``narrative.MODEL_KO``), so the page, the terminal
+#: summary and the narrative name a model alike; kept here as an alias for compatibility
+MODEL_KO: dict[str, str] = _NARRATIVE_MODEL_KO
 
 # phase -> accent colour of the badge dot (the label text always carries the meaning)
 PHASE_COLOR: dict[str, str] = {
@@ -106,19 +109,18 @@ KIND_COLOR: dict[str, str] = {
     "reversal_down": "#d03b3b",
     "level_shift": "#6250d6",
 }
-# acceleration / deceleration only say "steeper" / "flatter": the direction comes from the
-# slopes.  Same wording as narrative._changepoint_line, coloured by meaning for the series.
-_CP_DIRECTED: dict[tuple[str, bool], tuple[str, str]] = {
-    ("acceleration", True): ("성장 가속", "#0ca30c"),
-    ("acceleration", False): ("하락 가속", "#d03b3b"),
-    ("deceleration", True): ("성장 둔화", "#eda100"),
-    ("deceleration", False): ("하락세 둔화", "#1baf7a"),
-    # reversal_* only says "the slope changed sign or started": from a flat stretch it is a
-    # turn, not a reversal (narrative._changepoint_line: "횡보에서 상승으로 전환")
-    ("reversal_up", True): ("하락→상승 반전", "#2a78d6"),
-    ("reversal_up", False): ("횡보→상승 전환", "#2a78d6"),
-    ("reversal_down", True): ("상승→하락 반전", "#d03b3b"),
-    ("reversal_down", False): ("횡보→하락 전환", "#d03b3b"),
+# colour of a changepoint by its directed label (analysis.changepoint_label, the one classifier
+# behind the chart, the table, the terminal, the narrative and the phase reasons): coloured by
+# what it means for the series (a decline accelerating is red, a decline easing green)
+_CP_COLOR: dict[str, str] = {
+    "성장 가속": "#0ca30c",
+    "하락 가속": "#d03b3b",
+    "성장 둔화": "#eda100",
+    "하락세 둔화": "#1baf7a",
+    "하락→상승 반전": "#2a78d6",
+    "횡보→상승 전환": "#2a78d6",
+    "상승→하락 반전": "#d03b3b",
+    "횡보→하락 전환": "#d03b3b",
 }
 
 #: the benchmarks behind ForecastResult.skill
@@ -129,6 +131,9 @@ _SKILL_TIP = ("같은 백테스트 구간에서 가장 나은 단순 기준 예�
 _MASE_TIP = ("MASE: 예측 오차를 학습 구간에서 한 기 앞을 계절 단순 예측한 오차로 나눈 값(낮을수록 좋음). "
              "여러 기 앞을 내다보는 예측은 단순 예측보다 정확해도 1을 넘기 쉬우므로, 단순 예측과의 비교는 "
              "‘단순 대비’ 열을 보세요.")
+#: momentum (TrendMetrics.momentum): recent trend slope minus the long-run slope, in % of the
+#: current (recent) trend level per period -- not of the mean level
+_MOMENTUM_TIP = "최근 추세 기울기 − 장기 기울기 (현재 추세 수준 대비 %p, 기간당)"
 # anomalies are left out of the y range when they stretch it by more than 1 / _SPIKE_RATIO
 _SPIKE_RATIO = 0.5
 
@@ -203,42 +208,37 @@ def _fmt_date(ts: Any, freq: str) -> str:
     return f"{t.year:04d}-{t.month:02d}-{t.day:02d}"
 
 
-def _auto_decimals(a: float) -> int:
-    if a >= 100:
-        return 0 if a >= 1000 else 1
-    if a >= 10:
-        return 1
-    if a >= 1:
-        return 2
-    if a == 0:
-        return 0
-    return int(min(8, max(2, 1 - math.floor(math.log10(a)))))
-
-
 def _sci(a: float, digits: int = 3) -> str:
-    """Compact scientific notation of a non-negative number: ``1.23e−9``, ``4e16``."""
-    s = f"{a:.{digits}g}"
-    if "e" in s:
-        mant, ex = s.split("e")
-        s = f"{mant}e{int(ex)}".replace("-", _MINUS)
-    return s
+    """``×10ⁿ`` notation of a non-negative number, as :func:`narrative.format_number` writes it:
+    ``digits`` significant digits, trailing zeros dropped (``1.23×10⁻⁹``, ``4×10¹⁶``)."""
+    mant, ex = f"{a:.{max(1, int(digits)) - 1}e}".split("e")
+    if "." in mant:
+        mant = mant.rstrip("0").rstrip(".")
+    e = int(ex)
+    if e == 0:
+        return mant
+    return f"{mant}×10" + ("⁻" if e < 0 else "") + str(abs(e)).translate(_SUPERSCRIPT)
 
 
 def _fmt_num(x: Any, decimals: Optional[int] = None, signed: bool = False) -> str:
     """Thousands separators, magnitude-dependent decimals, typographic minus; ``—`` for None.
 
-    Magnitudes ``>= 1e15`` and (with automatic decimals) tiny magnitudes
-    ``< 1e-6`` use scientific notation, so tiny values never print as ``0.00000000``.
+    With automatic decimals this is exactly :func:`narrative.format_number` (``1,234`` /
+    ``45.2`` / ``1.20`` / ``0.02``, and ``1.05×10⁻⁹`` / ``6.99×10¹⁶`` below 1e-4 and from
+    1e12), so the page, the terminal summary and the narrative print a value alike.
+    With fixed ``decimals`` magnitudes from 1e12 still use ``×10ⁿ`` (never 13+-digit
+    integers); smaller values keep the given decimals.
     """
     v = _finite(x)
     if v is None:
         return _DASH
+    if decimals is None:
+        return _format_number(v, signed=signed)
     a = abs(v)
-    if a >= 1e15 or (decimals is None and 0 < a < 1e-6):
+    if a >= _SCI_LARGE:
         body = _sci(a)
     else:
-        d = _auto_decimals(a) if decimals is None else max(0, int(decimals))
-        body = f"{a:,.{d}f}"
+        body = f"{a:,.{max(0, int(decimals))}f}"
     if body.strip("0.,") == "":  # rounds to zero -> no sign
         return body
     if v < 0:
@@ -268,21 +268,26 @@ def _fmt_prob(p: Any) -> str:
 
 
 def _fmt_short(x: Any) -> str:
-    """Like :func:`_fmt_num` but abbreviates magnitudes ``>= 1e6`` (``1.23M``, ``45.6B``, ``1.50T``).
+    """Like :func:`_fmt_num` but abbreviates magnitudes ``>= 1e6`` (``1.23M``, ``45.6B``).
 
     Used for big-number tiles whose width is limited (KPI tiles, scenario boxes);
-    the full value is still shown in tables and ``title`` tooltips.
+    the full value is still shown in tables and ``title`` tooltips.  From about
+    1e12 -- where :func:`narrative.format_number` switches -- it is the same
+    ``×10ⁿ`` notation as the narrative (``6.99×10¹⁶``, never ``69,922T``).
     """
     v = _finite(x)
     if v is None:
         return _DASH
     a = abs(v)
-    for unit, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+    sign = _MINUS if v < 0 else ""
+    if a >= _SCI_LARGE * 0.9995:   # (999.7B would round to "1,000B")
+        return sign + _sci(a)
+    for unit, suffix in ((1e9, "B"), (1e6, "M")):
         # 0.9995 so that e.g. 999.7M becomes "1.00B" instead of "1,000M"
-        if a >= unit * 0.9995 and (a < 1e15 or suffix == "T"):
+        if a >= unit * 0.9995:
             q = a / unit
             body = f"{q:,.{2 if q < 9.995 else 1 if q < 99.95 else 0}f}{suffix}"
-            return (_MINUS if v < 0 else "") + body
+            return sign + body
     return _fmt_num(v)
 
 
@@ -303,39 +308,100 @@ def _phase_ko(label: Any) -> str:
     return PHASE_KO.get(str(label), str(label))
 
 
+def _phase_name(label: Any, lang: str = "ko") -> str:
+    """Phase name in ``lang``: ``성장기`` / ``Growing`` (the narrative's names)."""
+    return _PHASE_EN.get(str(label), str(label)) if lang == "en" else _phase_ko(label)
+
+
+#: phases that describe a move (narrative._phase_undecided): a 'flat' outlook that keeps one of
+#: them cannot tell whether the move goes on
+_MOVING_PHASES: tuple[str, ...] = ("emerging", "growing", "peaking", "declining", "reviving")
+
+
+def _tentative(report: TrendReport) -> bool:
+    """:func:`narrative.phase_is_tentative`: too few observations for a lifecycle verdict."""
+    try:
+        return bool(_phase_is_tentative(report.analysis))
+    except Exception:  # noqa: BLE001 - hand-made / partial analyses
+        return False
+
+
+def _future_phase_hedge(report: TrendReport) -> Optional[str]:
+    """How far ``Outlook.future_phase`` can be stated, by the rule of the narrative's projected-phase
+    line (``narrative._phase_projection`` / the payload's ``future_phase_basis``):
+
+    * ``'undecided'``: a 'flat' outlook only *kept* a moving phase -- whether the
+      move goes on is hard to judge ("이어질지 바뀔지는 아직 판단하기 어렵습니다");
+    * ``'tentative'``: too few observations for a phase call at all
+      (:func:`narrative.phase_is_tentative`);
+    * ``'low_confidence'``: a phase change implied by a low-confidence forecast
+      ("국면이 바뀐다고 보기는 어렵습니다");
+    * ``None``: the projected phase as it stands.
+
+    The terminal and the page then never state a phase the narrative declines to project.
+    """
+    a, o = report.analysis, report.outlook
+    cur, fut = str(getattr(a.phase, "label", "")), str(getattr(o, "future_phase", ""))
+    if str(getattr(o, "direction", "")) == "flat" and fut == cur and cur in _MOVING_PHASES:
+        return "undecided"
+    if _tentative(report):
+        return "tentative"
+    if fut != cur and str(getattr(o, "confidence", "")) == "low":
+        return "low_confidence"
+    return None
+
+
+def _future_phase_parts(report: TrendReport, lang: str = "ko") -> tuple[str, str]:
+    """``(value, note)`` of the projected phase: ``('성장기', '')``, ``('판단 보류', '예측에 뚜렷한 방향 없음')``,
+    ``('쇠퇴기', '신뢰도 낮아 참고용')``, ``('안정기', '관측치가 적어 잠정')`` (see :func:`_future_phase_hedge`)."""
+    fut = _phase_name(getattr(report.outlook, "future_phase", ""), lang)
+    hedge = _future_phase_hedge(report)
+    if lang == "en":
+        return {"undecided": ("undecided", "no clear forecast direction"),
+                "tentative": (fut, "tentative: few observations"),
+                "low_confidence": (fut, "low confidence, indicative only")}.get(hedge, (fut, ""))
+    return {"undecided": ("판단 보류", "예측에 뚜렷한 방향 없음"),
+            "tentative": (fut, "관측치가 적어 잠정"),
+            "low_confidence": (fut, "신뢰도 낮아 참고용")}.get(hedge, (fut, ""))
+
+
+def _future_phase_tip(report: TrendReport) -> str:
+    """The narrative's sentence behind a hedged projected phase (tooltip); ``''`` when not hedged."""
+    hedge = _future_phase_hedge(report)
+    cur = _phase_ko(getattr(report.analysis.phase, "label", ""))
+    fut = _phase_ko(getattr(report.outlook, "future_phase", ""))
+    if hedge == "undecided":
+        return f"예측에 뚜렷한 방향이 없어, 현재 {cur} 국면이 이어질지 바뀔지는 아직 판단하기 어렵습니다."
+    if hedge == "tentative":
+        return ("관측치가 적어 국면은 잠정 판단입니다." if fut == cur else
+                f"예측대로라면 {fut} 국면에 해당하지만, 현재 국면({cur})이 관측치가 적어 잠정 판단이므로 "
+                "국면 변화로 단정하기는 어렵습니다.")
+    if hedge == "low_confidence":
+        return f"예측대로라면 {cur}에서 {fut} 국면으로 넘어가지만, 예측 신뢰도가 낮아 국면이 바뀐다고 보기는 어렵습니다."
+    return ""
+
+
 def _model_desc(name: str) -> str:
-    base, _, variant = str(name).partition("@")
-    desc = MODEL_KO.get(base, "")
-    if desc and variant == "log":
-        desc += " (로그 공간)"
-    return desc
+    """Korean name of a model id (``narrative.model_label``), ``''`` for an id it does not know."""
+    raw = str(name).strip()
+    label = _model_label(raw, "ko")
+    return "" if label == raw else label
 
 
 def _cp_kind(cp: Any) -> tuple[str, str]:
     """Korean label and colour of a changepoint, directed by its slopes.
 
-    ``acceleration`` with a falling slope is a *decline* accelerating (red), not
-    growth; ``deceleration`` of a decline is the decline easing.  A
-    ``reversal_up`` is a real reversal (``하락→상승 반전``) only when the slope
-    before was clearly negative, otherwise a flat stretch turned upwards
-    (``횡보→상승 전환``); ``reversal_down`` likewise.  Same rule and tolerance
-    (10 % of the larger slope) as the rule-based narrative
-    (``narrative._changepoint_line``), so the chart, the table, the terminal
-    and the narrative name a changepoint alike.  Other kinds, and slopes that
-    are missing, use :data:`CHANGEPOINT_KO`.
+    The label is :func:`analysis.changepoint_label` -- the one classifier behind
+    the phase reasons (``구조 변화(하락→상승 반전)``), the narrative, the chart,
+    the table and the terminal: ``acceleration`` with a falling slope is a
+    *decline* accelerating (red), ``deceleration`` of a decline is the decline
+    easing, and a ``reversal_up`` from a flat stretch is a turn
+    (``횡보→상승 전환``), not a reversal.  Slopes that are missing give the
+    undirected labels of :data:`CHANGEPOINT_KO`.
     """
     kind = str(getattr(cp, "kind", ""))
-    before = _finite(getattr(cp, "slope_before", None))
-    after = _finite(getattr(cp, "slope_after", None))
-    if kind == "acceleration" and after is not None:
-        return _CP_DIRECTED[(kind, after >= 0)]
-    if kind == "deceleration" and before is not None:
-        return _CP_DIRECTED[(kind, before > 0)]
-    if kind in ("reversal_up", "reversal_down") and before is not None and after is not None:
-        tol = 0.1 * max(abs(before), abs(after), 1e-12)
-        real = before < -tol if kind == "reversal_up" else before > tol
-        return _CP_DIRECTED[(kind, real)]
-    return CHANGEPOINT_KO.get(kind, kind), KIND_COLOR.get(kind, "#898781")
+    label = _changepoint_label(cp, "ko")
+    return label, _CP_COLOR.get(label, KIND_COLOR.get(kind, "#898781"))
 
 
 def _skill_value(fc: Any) -> Optional[float]:
@@ -352,14 +418,31 @@ def _rel_error_text(ratio: Optional[float]) -> str:
 
 
 def _rel_error_class(ratio: Optional[float]) -> str:
-    """``pos`` when clearly better than naive (lower error), ``neg`` when worse, else ``''``."""
+    """``pos`` when clearly better than naive (lower error), ``neg`` when the shown change of
+    the error (:func:`_rel_error_text`) is an increase, else ``''`` (a ``0%`` is never red)."""
     if ratio is None:
         return ""
-    return "pos" if ratio <= 0.95 else ("neg" if ratio > 1.0 else "")
+    if ratio <= 0.95:
+        return "pos"
+    return "neg" if _rel_error_text(ratio).startswith("+") else ""
+
+
+def _skill_verdict(skill: Optional[float]) -> str:
+    """Short verdict of ``forecast.skill`` for the terminal, with the narrative's thresholds
+    (``narrative._accuracy_line``): within 5 % better is a tie, and an error less than 1 %
+    higher is "not better", not "less accurate" (its size rounds to ``0%``)."""
+    if skill is None:
+        return ""
+    if skill <= 0.95:
+        return "단순 예측보다 정확"
+    if skill <= 1.0:
+        return "단순 예측과 비슷"
+    return "단순 예측보다 부정확" if (skill - 1.0) * 100.0 >= 1.0 else "단순 예측보다 낫지 않음"
 
 
 def _skill_sentence(skill: Optional[float]) -> str:
-    """Plain-Korean verdict of the final method versus the naive benchmarks (same thresholds as the narrative)."""
+    """Plain-Korean verdict of the final method versus the naive benchmarks (same thresholds as
+    ``narrative._accuracy_line``: no size for an error less than 1 % higher)."""
     if skill is None:
         return "같은 백테스트 구간에서 단순 기준 예측과 비교한 결과가 없어, 단순 예측보다 나은지는 판단하지 않았습니다."
     if skill <= 0.95:
@@ -369,18 +452,24 @@ def _skill_sentence(skill: Optional[float]) -> str:
     if skill <= 1.0:
         return "최종 방법의 백테스트 오차가 가장 나은 단순 기준 예측과 비슷합니다(차이 5% 이내)."
     worse = (skill - 1.0) * 100.0
-    size = f"약 {skill:.1f}배" if skill >= 2.0 else f"약 {worse:.0f}% 더 큼"
-    return f"최종 방법은 백테스트에서 단순 기준 예측보다 낫지 않았습니다(오차 {size})."
+    if skill >= 2.0:
+        size = f"(오차 약 {skill:.1f}배)"
+    elif worse >= 1.0:
+        size = f"(오차 약 {worse:.0f}% 더 큼)"
+    else:   # "약 0% 더 큼" would contradict itself: the narrative gives no size either
+        size = ""
+    return f"최종 방법은 백테스트에서 단순 기준 예측보다 낫지 않았습니다{size}."
 
 
-def _best_naive_mae(scores: Sequence[Any]) -> tuple[Optional[str], Optional[float]]:
-    """Name and MAE of the most accurate naive benchmark among the leaderboard rows."""
+def _best_naive(scores: Sequence[Any], metric: str = "mae") -> tuple[Optional[str], Optional[float]]:
+    """Name and error (``metric``: ``'mae'`` or ``'rmse'``) of the most accurate naive benchmark
+    among the leaderboard rows; ``(None, None)`` when no benchmark row is listed."""
     best: tuple[Optional[str], Optional[float]] = (None, None)
     for s in scores:
         name = str(getattr(s, "name", ""))
-        mae = _finite(getattr(s, "mae", None))
-        if name in _NAIVE_NAMES and mae is not None and mae >= 0 and (best[1] is None or mae < best[1]):
-            best = (name, mae)
+        err = _finite(getattr(s, metric, None))
+        if name in _NAIVE_NAMES and err is not None and err >= 0 and (best[1] is None or err < best[1]):
+            best = (name, err)
     return best
 
 
@@ -398,10 +487,68 @@ def _intermittent_selection(scores: Sequence[Any]) -> bool:
     return any(str(getattr(s, "name", "")).partition("@")[0] in _INTERMITTENT_ONLY for s in scores)
 
 
+def _intermittent(report: TrendReport) -> bool:
+    """Intermittent (mostly-zero) demand: :func:`narrative.is_intermittent` (the rule of the
+    analysis and the forecast), or candidates that were ranked as such (an ``sba`` row).
+
+    For such series the forecast measures ``ForecastResult.skill`` in RMSE (the metric
+    that ranked the candidates) and ``Anomaly.expected`` is the typical demand size.
+    """
+    if _intermittent_selection(getattr(report.forecast, "model_scores", None) or []):
+        return True
+    try:
+        return bool(_narrative_is_intermittent(report.analysis))
+    except Exception:  # noqa: BLE001 - hand-made / partial analyses
+        return False
+
+
+def _skill_tip(intermittent: bool) -> str:
+    """Tooltip of the skill figure: MAE, or RMSE for intermittent demand (``forecast.auto_forecast``)."""
+    if not intermittent:
+        return _SKILL_TIP
+    return _SKILL_TIP.replace("평균 절대 오차", "제곱 오차(RMSE, 간헐 수요라 모델 선택과 같은 기준)")
+
+
+def _method_kind(fc: Any) -> str:
+    """The final method in a few words for the page subtitle: ``단일 모델 예측``,
+    ``3개 모델 앙상블 예측`` or, for the fallback of very short series, ``백테스트 없이 만든 기본 예측``
+    (members = models with a positive ensemble weight, as :func:`narrative.describe_method`)."""
+    method = str(getattr(fc, "method", "") or "").strip()
+    if method.lower().startswith("fallback"):
+        return "백테스트 없이 만든 기본 예측"
+    n = sum(1 for s in (getattr(fc, "model_scores", None) or []) if (_finite(getattr(s, "weight", None)) or 0.0) > 0)
+    if n == 0 and method.lower().startswith("ensemble("):
+        n = method.count(",") + 1
+    if n == 0 and not method:
+        return "통계 모델 예측"
+    return f"{n}개 모델 앙상블 예측" if n >= 2 else "단일 모델 예측"
+
+
 def _model_html(name: Any) -> str:
     """Escaped model name with line-break opportunities after ``_`` and before ``@`` only."""
     e = _esc(name)
     return e.replace("_", "_<wbr>").replace("@", "<wbr>@")
+
+
+def _outlook_levels(report: TrendReport, d: "_ChartData") -> Any:
+    """:func:`forecast.outlook_levels` of ``report`` (computed once per render, cached on ``d``).
+
+    The single source of the two levels behind ``Outlook.expected_change_pct`` and
+    ``prob_increase`` -- their windows, partial-season adjustments and the reason a
+    percentage is undefined (``'zero'``, ``'mostly_zero'``, ``'sign_change'``,
+    ``'near_zero'``) -- shared with ``compute_outlook`` itself and the narrative.
+    ``None`` for reports it cannot handle (empty or hand-made partial ones).
+    """
+    if not d.levels_done:
+        try:
+            from .forecast import outlook_levels
+
+            with np.errstate(all="ignore"):   # sums of |y| ~ 1e306 overflow: no levels, no warning
+                d.levels = outlook_levels(report.analysis, report.forecast)
+        except Exception:  # noqa: BLE001 - hand-made / partial analyses: windows only, no levels
+            d.levels = None
+        d.levels_done = True
+    return d.levels
 
 
 def _outlook_windows(report: TrendReport, d: "_ChartData") -> tuple[int, int, int, Optional[int], bool, bool]:
@@ -411,26 +558,34 @@ def _outlook_windows(report: TrendReport, d: "_ChartData") -> tuple[int, int, in
     points, current level = mean of the last ``k_cur = min(season, n)``
     observations.  A window that is not a whole number of seasonal periods has
     its average seasonal effect removed (``adj_*``; e.g. the default 26 of 52
-    weeks) -- whenever the decomposition has a usable seasonal component, the
-    same test as ``compute_outlook`` and ``narrative._outlook_windows`` (the
-    component check is ``forecast._seasonal_component`` itself, so they cannot drift apart).
+    weeks) when the decomposition has a usable seasonal component.  Taken from
+    :func:`forecast.outlook_levels` (see :func:`_outlook_levels`), so the page,
+    ``compute_outlook`` and the narrative cannot drift apart; a report it cannot
+    handle gets the plain windows without adjustment.
     """
-    m = max(1, int(_finite(getattr(report.analysis, "season_length", 1)) or 1))
-    n = max(1, int(np.isfinite(d.hist_y).sum()))
     mean = getattr(report.forecast, "mean", None)
     h = len(mean) if isinstance(mean, pd.Series) and len(mean) else max(1, int(_finite(report.forecast.horizon) or 1))
-    k_fut, k_cur = min(m, h), min(m, n)
-    period: Optional[int] = None
-    try:
-        from .forecast import _seasonal_component
+    lv = _outlook_levels(report, d)
+    if lv is not None:
+        p = _finite(lv.period)
+        period = int(p) if p is not None and p > 1 else None
+        return int(lv.k_fut), int(lv.k_cur), h, period, bool(lv.adj_fut), bool(lv.adj_cur)
+    m = max(1, int(_finite(getattr(report.analysis, "season_length", 1)) or 1))
+    n = max(1, int(np.isfinite(d.hist_y).sum()))
+    return min(m, h), min(m, n), h, None, False, False
 
-        seas, p = _seasonal_component(report.analysis)
-        period = int(p) if seas is not None and int(p) > 1 else None
-    except Exception:  # noqa: BLE001 - hand-made / partial analyses: no adjustment to report
-        period = None
-    adj_fut = period is not None and k_fut % period != 0
-    adj_cur = period is not None and k_cur % period != 0
-    return k_fut, k_cur, h, period, adj_fut, adj_cur
+
+def _direction_word(report: TrendReport, d: "_ChartData", lang: str = "ko") -> str:
+    """The outlook's direction word, exactly as the narrative names it (:func:`narrative.direction_label`):
+    ``상승`` / ``하락`` / ``보합`` / ``방향 불확실`` (a 'flat' call on a visible change, or on a level
+    expected to cross zero); ``upward`` / ``downward`` / ``flat`` / ``direction uncertain`` for ``'en'``."""
+    lv = _outlook_levels(report, d)
+    o = report.outlook
+    return _direction_label(str(getattr(o, "direction", "flat")), getattr(o, "expected_change_pct", None), lang,
+                            getattr(lv, "undefined", None))
+
+
+_UNCERTAIN_KO = _direction_label("flat", 100.0, "ko")   # '방향 불확실'
 
 
 #: prefix of a level whose partial-season window was seasonally adjusted (narrative: "계절 효과를 보정한")
@@ -459,6 +614,22 @@ def _change_basis(report: TrendReport, d: "_ChartData") -> tuple[str, str]:
     return (_ADJ_KO + fut if adj_fut else fut), (_ADJ_KO + cur if adj_cur else cur)
 
 
+def _change_basis_en(report: TrendReport, d: "_ChartData") -> tuple[str, str]:
+    """:func:`_change_basis` in English: ``('next 12-month avg', 'last 12-month avg')``,
+    ``('seasonally adj. next 26-week avg', 'last 52-week avg')``, ``('2026 forecast', 'latest value')``."""
+    k_fut, k_cur, h, _, adj_fut, adj_cur = _outlook_windows(report, d)
+    if k_fut <= 1:
+        end = _fmt_date(d.fc_dates[-1], d.freq) if len(d.fc_dates) else ""
+        fut = f"{end} forecast".strip()
+    elif k_fut >= h:
+        fut = f"next {_span_adj_en(h, d.freq)} avg"
+    else:
+        fut = f"forecast's last {_span_adj_en(k_fut, d.freq)} avg"
+    cur = "latest value" if k_cur <= 1 else f"last {_span_adj_en(k_cur, d.freq)} avg"
+    adj = "seasonally adj. "
+    return (adj + fut if adj_fut else fut), (adj + cur if adj_cur else cur)
+
+
 def _adjustment_note(report: TrendReport, d: "_ChartData") -> str:
     """``'26주 구간은 계절 주기(52주)를 다 채우지 못해 … 빼고 비교했습니다.'``; ``''`` when nothing was adjusted."""
     k_fut, k_cur, _, period, adj_fut, adj_cur = _outlook_windows(report, d)
@@ -477,6 +648,68 @@ def _prob_basis(report: TrendReport, d: "_ChartData") -> str:
     """
     fut, cur = _change_basis(report, d)
     return f"{fut}이 {cur}보다 높을 확률"
+
+
+class _NoChange:
+    """Why ``Outlook.expected_change_pct`` is ``None`` (see :func:`_change_undefined`)."""
+
+    def __init__(self, code: Optional[str], short: str, sentence: str, levels: str) -> None:
+        self.code = code          # forecast.outlook_levels(...).undefined
+        self.short = short        # tile / terminal phrase: '0을 지나 음수로 바뀔 전망'
+        self.sentence = sentence  # full sentence: '수준이 0을 지나 … 의미가 없습니다.'
+        self.levels = levels      # '최근 12개월 평균 +4.72 → 향후 12개월 평균 −3.90' ('' if unknown)
+
+
+def _change_undefined(report: TrendReport, d: "_ChartData", lang: str = "ko") -> Optional[_NoChange]:
+    """Why the outlook states no percentage, worded like the narrative's outlook line.
+
+    ``None`` when ``expected_change_pct`` is a number.  Otherwise the reason of
+    :func:`forecast.outlook_levels` -- ``'sign_change'`` (the level is expected to
+    cross zero), ``'near_zero'`` (a level close to 0 for data with negative values),
+    ``'mostly_zero'`` (intermittent demand) or ``'zero'`` -- with the two compared
+    levels, so a ``—`` is never left unexplained.  ``lang='en'``: the same in English
+    (the terminal summary only uses ``short`` and ``levels``).
+    """
+    if _finite(getattr(report.outlook, "expected_change_pct", None)) is not None:
+        return None
+    lv = _outlook_levels(report, d)
+    code = getattr(lv, "undefined", None)
+    fut_b, cur_b = _change_basis_en(report, d) if lang == "en" else _change_basis(report, d)
+    cur, fut = (_finite(lv.current), _finite(lv.future)) if lv is not None else (None, None)
+    signed = code in ("sign_change", "near_zero")
+    scale = max(abs(cur or 0.0), abs(fut or 0.0))
+    levels = (f"{cur_b} {_format_number(cur, signed=signed, scale=scale)} → "
+              f"{fut_b} {_format_number(fut, signed=signed, scale=scale)}"
+              if cur is not None and fut is not None else "")
+    if lang == "en":
+        if code == "sign_change" and fut is not None:
+            to = "negative" if fut < 0 else "positive"
+            return _NoChange(code, f"expected to cross zero to {to}",
+                             "The level is expected to cross zero, so a % change is not meaningful.", levels)
+        if code in ("near_zero", "zero"):
+            return _NoChange(code, "current level near zero",
+                             "The current level is close to zero, so a % change is not meaningful.", levels)
+        if code == "mostly_zero":
+            k_cur = _outlook_windows(report, d)[1]
+            what = (f"at least half of the last {_span_en(k_cur, d.freq)} are zero" if k_cur > 1
+                    else "the latest value is zero")
+            return _NoChange(code, what, f"No % change: {what}.", levels)
+        return _NoChange(code, "no % change", "No % change was computed.", levels)
+    if code == "sign_change" and fut is not None:
+        to = "음수로" if fut < 0 else "양수로"
+        return _NoChange(code, f"0을 지나 {to} 바뀔 전망",
+                         f"수준이 0을 지나 {to} 바뀔 것으로 예상되어 변화율(%)은 의미가 없습니다.", levels)
+    if code == "near_zero":
+        return _NoChange(code, "현재 수준이 0에 가까움",
+                         f"{cur_b}이 값의 평소 변동 폭에 비해 0에 가까워 변화율(%)은 의미가 없습니다.", levels)
+    if code == "mostly_zero":
+        k_cur = _outlook_windows(report, d)[1]
+        what = f"최근 {_span_text(k_cur, d.freq)} 중 절반 이상이 0" if k_cur > 1 else "최근 값이 0"
+        return _NoChange(code, what, f"{what}이라 변화율은 계산하지 않았습니다.", levels)
+    if code == "zero":
+        return _NoChange(code, "현재 수준이 0에 가까움", "현재 수준이 0에 가까워 변화율은 계산하지 않았습니다.",
+                         levels)
+    return _NoChange(code, "변화율 없음", "변화율은 계산하지 않았습니다.", levels)
 
 
 def _horizon_steps(report: TrendReport) -> int:
@@ -501,6 +734,22 @@ def _recent_lag(report: TrendReport, n: int) -> int:
 def _span_text(periods: int, freq: str) -> str:
     """``12개월``, ``30일``, ``8분기``, ``5년``; ``''`` for a non-positive span."""
     return f"{periods:,}{PERIOD_KO.get(freq, '기간')}" if periods > 0 else ""
+
+
+_PERIOD_EN: dict[str, tuple[str, str]] = {"D": ("day", "days"), "W": ("week", "weeks"), "M": ("month", "months"),
+                                          "Q": ("quarter", "quarters"), "Y": ("year", "years")}
+_FREQ_EN: dict[str, str] = {"D": "daily", "W": "weekly", "M": "monthly", "Q": "quarterly", "Y": "yearly"}
+
+
+def _span_en(periods: int, freq: str) -> str:
+    """``12 months``, ``1 week``; ``''`` for a non-positive span."""
+    one, many = _PERIOD_EN.get(freq, ("period", "periods"))
+    return f"{periods:,} {one if periods == 1 else many}" if periods > 0 else ""
+
+
+def _span_adj_en(periods: int, freq: str) -> str:
+    """Compound adjective ``12-month``, ``26-week`` (as the English narrative)."""
+    return f"{periods:,}-{_PERIOD_EN.get(freq, ('period', 'periods'))[0]}"
 
 
 def _excluded_spike(report: TrendReport, d: "_ChartData") -> Optional[tuple[float, pd.Timestamp]]:
@@ -538,15 +787,35 @@ _SEASONAL_REF_STRENGTH = 0.3
 
 def _trend_drawdown(report: TrendReport, d: "_ChartData") -> Optional[float]:
     """Latest trend value versus the trend maximum, in % (<= 0); ``None`` if undefined
-    (fewer than two values, or a maximum that is not positive) -- as ``narrative._trend_drawdown``."""
+    (fewer than two values, a maximum that is not positive, or a trend that crossed zero
+    -- :func:`analysis.pct_change_undefined` from the maximum to the latest value) -- as
+    ``narrative._trend_drawdown``."""
     tr = d.trend_y[np.isfinite(d.trend_y)]
     if tr.size < 2:
         return None
     pk, last = float(tr.max()), float(tr[-1])
     if not pk > 0:
         return None
+    if _pct_change_undefined(pk, last, d.hist_y) is not None:
+        return None   # the trend crossed zero (or peaked near 0 among negative values)
     dd = (last - pk) / pk * 100.0
     return min(0.0, dd) if math.isfinite(dd) else None
+
+
+def _drawdown_undefined(report: TrendReport, d: "_ChartData") -> Optional[str]:
+    """Why ``metrics.drawdown_pct`` is no meaningful percentage (``None``: it is one).
+
+    ``drawdown_pct`` is always a number, but for a series that crossed zero (a P&L
+    from 10 to −8 reads "−179 %"), whose peak is not positive, or whose peak is
+    near 0 relative to the spread of data with negative values it means nothing:
+    :func:`analysis.pct_change_undefined` from the peak to the latest value, the
+    rule of ``narrative._drawdown_undefined``.
+    """
+    m = report.analysis.metrics
+    pk, last = _finite(getattr(m, "peak_value", None)), _finite(getattr(m, "last_value", None))
+    if pk is None or last is None:
+        return None
+    return _pct_change_undefined(pk, last, d.hist_y)
 
 
 def _seasonal_trend_drawdown(report: TrendReport, d: "_ChartData") -> Optional[float]:
@@ -558,12 +827,13 @@ def _seasonal_trend_drawdown(report: TrendReport, d: "_ChartData") -> Optional[f
     (``narrative._seasonal_drawdown``): the trend drawdown is used when the series
     is seasonal *and* it differs from the raw drawdown by at least 5 points;
     otherwise ``None`` (the raw drawdown is used, as in the narrative's "최근
-    값은 고점보다 X% 낮아" sentence).
+    값은 고점보다 X% 낮아" sentence).  Never for a drawdown that is no percentage
+    (:func:`_drawdown_undefined`).
     """
     m = report.analysis.metrics
     period = int(_finite(getattr(report.analysis.decomposition, "period", 1)) or 1)
     ss = _finite(getattr(m, "seasonal_strength", None))
-    if period <= 1 or ss is None or ss < _SEASONAL_DD_STRENGTH:
+    if period <= 1 or ss is None or ss < _SEASONAL_DD_STRENGTH or _drawdown_undefined(report, d) is not None:
         return None
     tdd = _trend_drawdown(report, d)
     dd = _finite(m.drawdown_pct)
@@ -579,15 +849,134 @@ def _drawdown_sub(report: TrendReport, d: "_ChartData") -> str:
     observed drawdown, next to the observed current value, unless a seasonal
     low or high distorts it -- then the trend's drawdown, labelled ``추세 고점``.
     On the observation basis a flagged one-off spike that the peak leaves out is
-    mentioned (``일회성 급등 제외``).
+    mentioned (``일회성 급등 제외``).  As in the narrative, no percentage where it
+    means nothing: intermittent demand names its largest demand instead
+    (``최대 12.0 (2023-02-19)``), and a series that crossed zero (or whose peak
+    is not positive) gives the gap in its own units (``최고점보다 18.2 낮음``).
     """
+    m = report.analysis.metrics
+    spike = " (일회성 급등 제외)" if _excluded_spike(report, d) else ""
+    if _intermittent(report) and _finite(m.peak_value) is not None:
+        return (f"최대 {_fmt_short(m.peak_value)} ({_fmt_date(m.peak_date, d.freq)}"
+                + (", 일회성 급등 제외)" if spike else ")"))
+    dd = _finite(m.drawdown_pct)
+    if _drawdown_undefined(report, d) is not None and dd is not None and dd < -0.05:
+        gap = abs(float(m.peak_value) - float(m.last_value))
+        return f"최고점보다 {_fmt_short(gap)} 낮음{spike}"
     tdd = _seasonal_trend_drawdown(report, d)
     if tdd is not None:
         return f"추세 고점 대비 {_fmt_pct(tdd)}" if tdd < -0.05 else "추세 최고 수준"
-    dd = _finite(report.analysis.metrics.drawdown_pct)
     if dd is None or dd >= -0.05:
         return "현재 최고 수준"
-    return f"최고점 대비 {_fmt_pct(dd)}" + (" (일회성 급등 제외)" if _excluded_spike(report, d) else "")
+    return f"최고점 대비 {_fmt_pct(dd)}{spike}"
+
+
+#: why a growth metric is None, as a short tile / terminal phrase (analysis.pct_change_undefined codes,
+#: plus 'intermittent' and 'short_span'); {base} is 시작 수준 for the whole-period change and the CAGR,
+#: 기준 수준 for the recent change -- the narrative's subjects
+_PCT_WHY: dict[str, dict[str, str]] = {
+    "ko": {
+        "sign_change": "0을 지나 음수로 바뀌어 변화율 없음",
+        "negative": "{base}이 음수라 변화율 없음",
+        "near_zero": "{base}이 0에 가까워 변화율 없음",
+        "zero": "{base}이 0에 가까워 변화율 없음",
+        "intermittent": "간헐 수요라 계산하지 않음",
+        "short_span": "기간이 1년 미만이라 연 환산하지 않음",
+    },
+    "en": {
+        "sign_change": "crossed zero, so no % change",
+        "negative": "the {base} is negative, so no % change",
+        "near_zero": "the {base} is near zero, so no % change",
+        "zero": "the {base} is near zero, so no % change",
+        "intermittent": "intermittent demand, not computed",
+        "short_span": "less than a year of data, not annualised",
+    },
+}
+_PCT_BASE: dict[str, tuple[str, str]] = {"ko": ("시작 수준", "기준 수준"), "en": ("starting level", "base level")}
+
+#: analysis.compute_metrics computes a CAGR only over at least this many years
+_CAGR_MIN_YEARS = 0.95
+
+
+def _pct_why(code: Optional[str], key: str, lang: str = "ko") -> str:
+    """The :data:`_PCT_WHY` phrase of ``code`` for the growth metric ``key`` (``''`` for no reason)."""
+    table = _PCT_WHY["en" if lang == "en" else "ko"]
+    if code not in table:
+        return ""
+    start, base = _PCT_BASE["en" if lang == "en" else "ko"]
+    return table[code].format(base=base if key == "recent_change_pct" else start)
+
+
+def _metric_undefined(report: TrendReport, d: "_ChartData", key: str) -> Optional[str]:
+    """Why the growth metric ``key`` (``total_change_pct``, ``cagr_pct``, ``recent_change_pct``) is ``None``.
+
+    ``'intermittent'`` for mostly-zero demand (the analysis computes no growth
+    rates for it); ``'short_span'`` for a CAGR over less than a year (the analysis
+    annualises only spans of at least 0.95 years: ``(n - 1) / periods_per_year``);
+    else :func:`analysis.pct_change_undefined` of the trend from the metric's base
+    to the latest trend value (``'sign_change'``, ``'negative'``, ``'near_zero'``,
+    ``'zero'``) -- the rule of the metrics themselves and of the narrative.
+    ``None`` when the metric is a number or no reason applies, so a ``—`` is
+    explained wherever the analysis' own rule can say why.
+    """
+    if _finite(getattr(report.analysis.metrics, key, None)) is not None:
+        return None
+    if _intermittent(report):
+        return "intermittent"
+    if key == "cagr_pct":
+        try:
+            years = (len(d.hist_y) - 1) / _periods_per_year(d.freq)
+        except (ValueError, KeyError, ZeroDivisionError):
+            years = None
+        if years is not None and years < _CAGR_MIN_YEARS:
+            return "short_span"
+    tr = d.trend_y[np.isfinite(d.trend_y)]
+    if tr.size < 2:
+        return None
+    if key == "recent_change_pct":
+        lag = _recent_lag(report, len(d.hist_y))
+        if tr.size <= lag:
+            return None
+        base = float(tr[-1 - lag])
+    else:
+        base = float(tr[0])
+    return _pct_change_undefined(base, float(tr[-1]), d.hist_y)
+
+
+def _nonnegative(report: TrendReport) -> bool:
+    return bool(getattr(report.forecast, "nonnegative", False))
+
+
+def _scen_text(report: TrendReport, value: Any, short: bool = False, lang: str = "ko",
+               scale: Optional[float] = None) -> str:
+    """A horizon-end scenario value: ``0(하한)`` / ``0 (floor)`` at the 0 floor of a nonnegative
+    forecast (:func:`narrative.scenario_value`: the band was cut at 0, the value is a floor, not a
+    forecast of zero), else the number (abbreviated with ``short``); ``—`` if missing.  ``scale``: the
+    largest magnitude printed next to it (:func:`narrative.format_number`), so one line keeps one notation."""
+    v = _finite(value)
+    if v is None:
+        return _DASH
+    text, _ = _scenario_value(v, None, _nonnegative(report), lang)
+    if _nonnegative(report) and v <= 0.0:
+        return text
+    return _fmt_short(v) if short else _format_number(v, scale=scale)
+
+
+def _floor_note(report: TrendReport) -> str:
+    """The narrative's note when a scenario sits at the 0 floor of a nonnegative forecast; ``''`` otherwise."""
+    if not _nonnegative(report):
+        return ""
+    scen = getattr(report.outlook, "scenarios", None) or {}
+
+    def floored(k: str) -> bool:
+        v = _finite(scen.get(k))
+        return v is not None and v <= 0.0
+
+    if floored("base"):
+        return "기준 예측이 하한인 0까지 내려갑니다(값은 0 아래로 내려갈 수 없음)."
+    if floored("pessimistic"):
+        return "예측구간이 넓어 비관 시나리오는 하한인 0에 닿습니다(값은 0 아래로 내려갈 수 없음)."
+    return ""
 
 
 def _scenario_ref(report: TrendReport, d: "_ChartData") -> Optional[tuple[float, pd.Timestamp, bool]]:
@@ -769,7 +1158,9 @@ def _nice_ticks(lo: float, hi: float, min_n: int = 4, max_n: int = 6,
     the step that wastes the least vertical space wins.  Any finite range works:
     from ``1e300`` up the ticks are computed in units of ``10**k`` (so neither the
     span nor ``10**exp`` overflows) and never go beyond ``±limit`` (the largest
-    float), falling back to evenly spaced ticks if no nice step fits there.
+    float), falling back to evenly spaced ticks if no nice step fits there; a
+    subnormal range whose step underflows to 0 (``[0, 5e-324]``) gets its two ends
+    (or, when flat, the value and the floats next to it) -- at least two distinct ticks.
     """
     if not (math.isfinite(lo) and math.isfinite(hi)):
         lo, hi = 0.0, 1.0
@@ -794,7 +1185,14 @@ def _nice_ticks(lo: float, hi: float, min_n: int = 4, max_n: int = 6,
         else:
             lo, hi = lo - pad, hi + pad
     span = hi - lo
-    e = math.floor(math.log10(span / max(1, max_n - 1)))
+    unit = span / max(1, max_n - 1)
+    if not (span > 0 and unit > 0 and math.isfinite(unit)):
+        # subnormal ranges (|values| ~ 5e-324): the span or the step underflows to 0, so no
+        # 10**k step exists: the range itself, widened to the neighbouring floats when flat
+        if hi > lo:
+            return [lo + 0.0, hi + 0.0]
+        return [math.nextafter(lo, -math.inf) + 0.0, lo + 0.0, math.nextafter(hi, math.inf) + 0.0]
+    e = math.floor(math.log10(unit))
     best: Optional[tuple[tuple[float, float], float, float, int]] = None
     for exp in range(e - 1, e + 3):
         for mant, penalty in ((1.0, 0.0), (2.0, 0.0), (2.5, 0.03), (3.0, 0.1), (4.0, 0.1), (5.0, 0.0)):
@@ -815,40 +1213,41 @@ def _nice_ticks(lo: float, hi: float, min_n: int = 4, max_n: int = 6,
 
 
 def _axis_labels(ticks: Sequence[float]) -> list[str]:
-    """Tick labels: thousands separators below 10,000, k/M/B/T abbreviations above.
+    """Tick labels: thousands separators below 10,000, k/M/B abbreviations above.
 
-    Labels are always distinct: when the ticks would need more than 6 decimals
-    (tiny magnitudes) or reach ``1e15`` (where :func:`_fmt_num` switches too) they
-    use compact scientific notation (``5e−8``, ``1.25e300``) with as many digits
-    as the ticks need.
+    Labels are always distinct.  Ticks that reach 1e12 or stay below 1e-4 -- where
+    :func:`narrative.format_number` switches -- use its ``×10ⁿ`` notation
+    (``5×10⁻⁸``, ``1.25×10¹⁷``), with as many digits as the ticks need; so do
+    ticks that would need more than 6 decimals.
     """
     if not ticks:
         return []
     m = max(abs(t) for t in ticks)
-    unit, suffix = 1.0, ""
-    for u, sfx in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e4, "k")):
-        if m >= u:
-            unit, suffix = (1e3 if sfx == "k" else u), sfx
-            break
-    vals = [t / unit for t in ticks]
-    diffs = [abs(b - a) for a, b in zip(vals, vals[1:]) if b != a]
-    tol = 1e-6 * (min(diffs) if diffs else max(1.0, abs(vals[0])))
     out: Optional[list[str]] = None
-    for dec in range(7 if m < 1e15 else 0):
-        if all(abs(round(v, dec) - v) <= tol for v in vals):
-            out = []
-            for v in vals:
-                body = f"{abs(v):,.{dec}f}"
-                if body.strip("0.,") == "":
-                    out.append(body + (suffix if body != "0" else ""))
-                else:
-                    out.append((_MINUS if v < 0 else "") + body + suffix)
-            break
+    if _SCI_SMALL <= m < _SCI_LARGE:
+        unit, suffix = 1.0, ""
+        for u, sfx in ((1e9, "B"), (1e6, "M"), (1e4, "k")):
+            if m >= u:
+                unit, suffix = (1e3 if sfx == "k" else u), sfx
+                break
+        vals = [t / unit for t in ticks]
+        diffs = [abs(b - a) for a, b in zip(vals, vals[1:]) if b != a]
+        tol = 1e-6 * (min(diffs) if diffs else max(1.0, abs(vals[0])))
+        for dec in range(7):
+            if all(abs(round(v, dec) - v) <= tol for v in vals):
+                out = []
+                for v in vals:
+                    body = f"{abs(v):,.{dec}f}"
+                    if body.strip("0.,") == "":
+                        out.append(body + (suffix if body != "0" else ""))
+                    else:
+                        out.append((_MINUS if v < 0 else "") + body + suffix)
+                break
     if out is None or len(set(out)) < len(out):
         steps = [abs(b - a) for a, b in zip(ticks, ticks[1:]) if b != a]
         sci_tol = 1e-6 * (min(steps) if steps else max(abs(t) for t in ticks))
         for digits in range(2, 18):
-            exact = all(t == 0 or abs(float(f"{abs(t):.{digits}g}") - abs(t)) <= sci_tol for t in ticks)
+            exact = all(t == 0 or abs(float(f"{abs(t):.{digits - 1}e}") - abs(t)) <= sci_tol for t in ticks)
             out = ["0" if t == 0 else (_MINUS if t < 0 else "") + _sci(abs(t), digits) for t in ticks]
             if exact and len(set(out)) == len(out):
                 break
@@ -856,12 +1255,12 @@ def _axis_labels(ticks: Sequence[float]) -> list[str]:
 
 
 def _fmt_axis_value(v: float, ref: float) -> str:
-    """A single value formatted like the axis (abbreviated when the axis is; scientific from 1e15)."""
+    """A single value formatted like the axis whose largest magnitude is ``ref``: abbreviated
+    (k/M/B) when the axis is, and from 1e12 in the narrative's ``×10ⁿ`` notation, as
+    :func:`narrative.format_number` writes a number next to such a value (``scale``)."""
     a = abs(ref)
-    if a >= 1e15:
-        return _fmt_num(v)
-    if a >= 1e12:
-        return _fmt_num(v / 1e12, decimals=2) + "T"
+    if a >= _SCI_LARGE:
+        return _format_number(v, scale=a)
     if a >= 1e9:
         return _fmt_num(v / 1e9, decimals=2) + "B"
     if a >= 1e6:
@@ -973,6 +1372,9 @@ class _ChartData:
         a = report.analysis
         fc = report.forecast
         self.freq = str(getattr(a, "freq", "M"))
+        # forecast.outlook_levels of the report, computed on first use (see _outlook_levels)
+        self.levels: Any = None
+        self.levels_done = False
         hist = a.series
         hist_idx = self._index(hist)
         self.t0 = hist_idx[0] if len(hist_idx) else pd.Timestamp("2000-01-01")
@@ -1019,6 +1421,8 @@ class _ChartData:
             if len(lo) != len(ok) or len(hi) != len(ok):
                 continue
             lo, hi = lo[ok], hi[ok]
+            if not lo.size:   # no finite forecast point (e.g. a subnormal series): no band to draw
+                continue
             lo = np.where(np.isfinite(lo), lo, self.fc_y)
             hi = np.where(np.isfinite(hi), hi, self.fc_y)
             self.bands.append((int(lv), np.minimum(lo, hi), np.maximum(lo, hi)))
@@ -1796,13 +2200,76 @@ def _wrap_segments(segments: list[str], width: int, sep: str = " · ", indent: s
     return [_fit(ln, width) for ln in lines]
 
 
-def render_text(report: TrendReport, width: int = 78) -> str:
+#: labels of the terminal summary per language (render_text); the narrative supplies the phase names,
+#: direction words, changepoint labels, method description and scenario floor text in the same language
+_TEXT: dict[str, dict[str, str]] = {
+    "ko": {
+        "conf": "신뢰도 {p}%", "tentative": "잠정", "obs": "{unit} 단위 {n:,}개", "range": "{a} ~ {b}",
+        "current": "현재 값", "total": "전체 변화", "cagr": "CAGR", "recent": "최근 변화",
+        "momentum": "모멘텀", "mom_unit": "%p", "volatility": "변동성", "why_sep": "·",
+        "outlook": "전망", "change": "예측 변화", "change_basis": "{fut}, {cur} 대비",
+        "prob": "상승 확률 {p} (같은 기준)", "confidence": "신뢰도 {c}",
+        "scen": "시나리오", "scen_at": "시나리오({end} 시점)", "scen_ref_season": "(비교: {date} 실제 {v})",
+        "scen_ref_now": "(비교: 현재 {v})", "future_phase": "미래 단계", "peak": "예측 정점",
+        "cps": "변곡점: ", "cps_more": "외 {n}개", "method": "방법: ", "accuracy": "정확도: ",
+        "skill": _SKILL_LABEL, "top": "상위 모델({metric}):",
+    },
+    "en": {
+        "conf": "confidence {p}%", "tentative": "tentative", "obs": "{n:,} {unit} obs", "range": "{a} to {b}",
+        "current": "Current", "total": "Total change", "cagr": "CAGR", "recent": "Recent change",
+        "momentum": "Momentum", "mom_unit": " pp", "volatility": "Volatility", "why_sep": ", ",
+        "outlook": "Outlook", "change": "Exp. change", "change_basis": "{fut} vs {cur}",
+        "prob": "P(up) {p} (same basis)", "confidence": "Confidence {c}",
+        "scen": "Scenarios", "scen_at": "Scenarios (at {end})", "scen_ref_season": "(vs. {date} actual {v})",
+        "scen_ref_now": "(vs. now {v})", "future_phase": "Future phase", "peak": "Forecast peak",
+        "cps": "Changepoints: ", "cps_more": "+{n} more", "method": "Method: ", "accuracy": "Accuracy: ",
+        "skill": "error vs naive", "top": "Top models ({metric}):",
+    },
+}
+_CONFIDENCE_EN: dict[str, str] = {"high": "high", "medium": "medium", "low": "low"}
+_SKILL_VERDICT_EN: dict[str, str] = {
+    "단순 예측보다 정확": "better than naive", "단순 예측과 비슷": "about the same as naive",
+    "단순 예측보다 부정확": "less accurate than naive", "단순 예측보다 낫지 않음": "not better than naive",
+}
+
+
+def _wrap_method(text: str, width: int) -> list[str]:
+    """The method line, wrapped at its `` · `` separators (a trailing ``·`` marks the break; continuation
+    lines indented by two), or -- when a part is still too wide, e.g. the English fallback
+    description -- at spaces, so the description is never cut off."""
+    segs = text.split(" · ")
+    if all(_dw(seg) + 2 <= width - 2 for seg in segs):
+        mlines = _wrap_segments(segs, width - 2)
+        return ([ln + " ·" if len(mlines) > 1 else ln for ln in mlines[:1]]
+                + [_fit("  " + ln + (" ·" if i < len(mlines) - 2 else ""), width)
+                   for i, ln in enumerate(mlines[1:])])
+    out: list[str] = []
+    cur = ""
+    for word in text.split(" "):
+        cand = word if not cur else cur + " " + word
+        if cur and _dw(("  " if out else "") + cand) > width:
+            out.append(("  " if out else "") + cur)
+            cur = word
+        else:
+            cur = cand
+    if cur:
+        out.append(("  " if out else "") + cur)
+    return [_fit(ln, width) for ln in out]
+
+
+def render_text(report: TrendReport, width: int = 78, lang: str = "ko") -> str:
     """Compact terminal summary of ``report`` (every line fits in ``width`` columns).
 
     Shows the name, lifecycle phase, key metrics, a sparkline of the history
     and the forecast separated by ``│``, the outlook and the top models.
-    Widths below 10 are treated as 10.
+    Widths below 10 are treated as 10.  ``lang='en'`` gives the same summary in
+    English (no Hangul apart from what the data itself contains, e.g. the series
+    name), with the narrative's English phase names, direction words,
+    changepoint labels and method description; any other value gives Korean.
     """
+    lang = "en" if str(lang).lower().startswith("en") else "ko"
+    tx = _TEXT[lang]
+    en = lang == "en"
     width = max(10, int(width))
     a, fc, o = report.analysis, report.forecast, report.outlook
     m = a.metrics
@@ -1815,22 +2282,38 @@ def render_text(report: TrendReport, width: int = 78) -> str:
     lines.append(_fit(_term(report.name), width))
     phase = a.phase
     conf = _finite(getattr(phase, "confidence", None))
-    head = [f"[{_term(_phase_ko(phase.label))}]" + (f" 신뢰도 {conf * 100:.0f}%" if conf is not None else ""),
-            f"{UNIT_KO.get(freq, FREQ_KO.get(freq, freq))} 단위 {len(d.hist_y)}개",
-            f"{_fmt_date(m.start, freq)} ~ {_fmt_date(m.end, freq)}"]
+    # a phase called on too few observations is a tentative call, as the narrative says
+    ph = _term(_phase_name(phase.label, lang)) + ((", " if en else "·") + tx["tentative"] if _tentative(report)
+                                                  else "")
+    unit = _FREQ_EN.get(freq, freq) if en else UNIT_KO.get(freq, FREQ_KO.get(freq, freq))
+    head = [f"[{ph}]" + (" " + tx["conf"].format(p=f"{conf * 100:.0f}") if conf is not None else ""),
+            tx["obs"].format(unit=unit, n=len(d.hist_y)),
+            tx["range"].format(a=_fmt_date(m.start, freq), b=_fmt_date(m.end, freq))]
     lines += _wrap_segments(head, width)
     lines.append(light)
 
+    vol = _finite(m.volatility)
     metrics = [
-        f"현재 값 {_fmt_num(m.last_value)}",
-        f"전체 변화 {_fmt_pct(m.total_change_pct)}",
-        f"CAGR {_fmt_pct(m.cagr_pct)}",
-        f"최근 변화 {_fmt_pct(m.recent_change_pct)}",
-        f"모멘텀 {_fmt_num(m.momentum, 2, signed=True)}"
-        + (f"%p{_PER_UNIT.get(freq, '')}" if _finite(m.momentum) is not None else ""),
-        f"변동성 {_fmt_pct((_finite(m.volatility) or 0.0) * 100 if _finite(m.volatility) is not None else None, signed=False)}",
+        f"{tx['current']} {_fmt_num(m.last_value)}",
+        f"{tx['total']} {_fmt_pct(m.total_change_pct)}",
+        f"{tx['cagr']} {_fmt_pct(m.cagr_pct)}",
+        f"{tx['recent']} {_fmt_pct(m.recent_change_pct)}",
+        f"{tx['momentum']} {_fmt_num(m.momentum, 2, signed=True)}"
+        + (f"{tx['mom_unit']}{_period_unit(freq, lang) or _PER_UNIT.get(freq, '')}"
+           if _finite(m.momentum) is not None else ""),
+        f"{tx['volatility']} {_fmt_pct(vol * 100 if vol is not None else None, signed=False)}",
     ]
     lines += _wrap_segments(metrics, width)
+    # a "—" is never left unexplained: why the growth rates are missing (crossed zero, intermittent,
+    # a CAGR over less than a year ...)
+    why: dict[str, list[str]] = {}
+    for key, label in (("total_change_pct", tx["total"]), ("cagr_pct", tx["cagr"]),
+                       ("recent_change_pct", tx["recent"])):
+        text = _pct_why(_metric_undefined(report, d, key), key, lang)
+        if text:
+            why.setdefault(text, []).append(label)
+    for text, labels in why.items():
+        lines += _wrap_segments([f"※ {tx['why_sep'].join(labels)}: {text}"], width)
     lines.append(light)
 
     # sparkline: history │ forecast on a shared scale
@@ -1873,54 +2356,78 @@ def render_text(report: TrendReport, width: int = 78) -> str:
 
     # outlook
     direction = str(getattr(o, "direction", "flat"))
-    fut_basis, cur_basis = _change_basis(report, d)
-    out_seg = [f"전망 {DIRECTION_ARROW.get(direction, '')} {DIRECTION_KO.get(direction, _term(direction))}".replace("  ", " "),
-               f"예측 변화 {_fmt_pct(o.expected_change_pct)} ({fut_basis}, {cur_basis} 대비)",
-               f"상승 확률 {_fmt_prob(o.prob_increase)} (같은 기준)",
-               f"신뢰도 {CONFIDENCE_KO.get(str(o.confidence), _term(o.confidence))}"]
+    fut_basis, cur_basis = _change_basis_en(report, d) if en else _change_basis(report, d)
+    # the narrative's direction word (방향 불확실 for a 'flat' call on a visible change)
+    word = _term(_direction_word(report, d, lang))
+    nochange = _change_undefined(report, d, lang)
+    if nochange is None:
+        chg_seg = [f"{tx['change']} {_fmt_pct(o.expected_change_pct)} "
+                   f"({tx['change_basis'].format(fut=fut_basis, cur=cur_basis)})"]
+    else:  # no percentage: say why and give the two levels instead
+        chg_seg = [f"{tx['change']} {_DASH} ({nochange.short})"] + ([nochange.levels] if nochange.levels else [])
+    conf_word = (_CONFIDENCE_EN if en else CONFIDENCE_KO).get(str(o.confidence), _term(o.confidence))
+    out_seg = [f"{tx['outlook']} {DIRECTION_ARROW.get(direction, '')} {word}".replace("  ", " "),
+               *chg_seg,
+               tx["prob"].format(p=_fmt_prob(o.prob_increase)),
+               tx["confidence"].format(c=conf_word)]
     lines += _wrap_segments(out_seg, width)
     scen = o.scenarios or {}
     if scen:
         # single horizon-end values: compared with the observation at the same point of the season
         end_s = _fmt_date(d.fc_dates[-1], freq) if len(d.fc_dates) else ""
-        sc = [f"{ko} {_fmt_num(scen.get(k))}" for k, ko in SCENARIOS_KO if k in scen]
+        names = (("pessimistic", "pessimistic"), ("base", "base"), ("optimistic", "optimistic")) if en \
+            else SCENARIOS_KO
         ref = _scenario_ref(report, d)
+        # one notation for the whole line (as the narrative: 4.61×10¹¹ next to 1.51×10¹⁵, not 461,…)
+        big = max([abs(v) for v in (_finite(x) for x in list(scen.values()) + [ref[0] if ref else None])
+                   if v is not None] + [0.0])
+        sc = [f"{nm} {_scen_text(report, scen.get(k), lang=lang, scale=big)}" for k, nm in names if k in scen]
         if ref is not None:
-            sc.append(f"(비교: {_fmt_date(ref[1], freq)} 실제 {_fmt_num(ref[0])})" if ref[2]
-                      else f"(비교: 현재 {_fmt_num(ref[0])})")
-        lines += _wrap_segments([f"시나리오({end_s} 시점)" if end_s else "시나리오"] + sc, width, sep="  ")
-    extra = [f"미래 단계 {_term(_phase_ko(o.future_phase))}"]
+            rv = _format_number(ref[0], scale=big)
+            sc.append(tx["scen_ref_season"].format(date=_fmt_date(ref[1], freq), v=rv) if ref[2]
+                      else tx["scen_ref_now"].format(v=rv))
+        lines += _wrap_segments([tx["scen_at"].format(end=end_s) if end_s else tx["scen"]] + sc, width, sep="  ")
+    # the projected phase only as far as the narrative projects it (판단 보류 / 참고용 / 잠정)
+    ph_val, ph_note = _future_phase_parts(report, lang)
+    ph_txt = _term(ph_val) + ((" (" if en else "(") + ph_note + ")" if ph_note else "")
+    extra = [f"{tx['future_phase']} {ph_txt}"]
     if _ts(o.forecast_peak_date) is not None:
-        extra.append(f"예측 정점 {_fmt_date(o.forecast_peak_date, freq)}")
+        extra.append(f"{tx['peak']} {_fmt_date(o.forecast_peak_date, freq)}")
     lines += _wrap_segments(extra, width)
     cps = list(a.changepoints or [])
     if cps:
-        segs = [f"{_fmt_date(cp.date, freq)} {_term(_cp_kind(cp)[0])}" for cp in cps[:4]]
+        segs = [f"{_fmt_date(cp.date, freq)} "
+                f"{_term(_changepoint_label(cp, 'en') if en else _cp_kind(cp)[0])}" for cp in cps[:4]]
         if len(cps) > 4:
-            segs.append(f"외 {len(cps) - 4}개")
-        segs[0] = "변곡점: " + segs[0]
+            segs.append(tx["cps_more"].format(n=len(cps) - 4))
+        segs[0] = tx["cps"] + segs[0]
         lines += _wrap_segments(segs, width)
     lines.append(light)
-    method = _term(fc.method)
+    # the method in words (narrative.describe_method), wrapped at its " · " separators
+    method = _term(_describe_method(fc, lang))
     bm = _finite(fc.backtest_mase)
-    lines.append(_fit(f"방법: {method}", width))
+    lines += _wrap_method(f"{tx['method']}{method}", width)
     skill = _skill_value(fc)
-    acc = [f"정확도: {_SKILL_LABEL} {_rel_error_text(skill)}"]
+    acc = [f"{tx['accuracy']}{tx['skill']} {_rel_error_text(skill)}"]
     if skill is not None:
-        acc.append("단순 예측보다 정확" if skill <= 0.95 else ("단순 예측과 비슷" if skill <= 1.0
-                                                             else "단순 예측보다 부정확"))
+        verdict = _skill_verdict(skill)
+        acc.append(_SKILL_VERDICT_EN.get(verdict, verdict) if en else verdict)
+    elif bm is None:   # the "—" is explained, as in the narrative's accuracy line
+        acc.append("too short to backtest" if en else "데이터가 짧아 백테스트하지 못함")
+    else:
+        acc.append("no naive benchmark to compare" if en else "단순 기준 예측과 비교한 결과 없음")
     if bm is not None:
         acc.append(f"MASE {bm:.2f}")
     lines += _wrap_segments(acc, width)
     all_scores = list(fc.model_scores or [])
-    if _intermittent_selection(all_scores):
-        # intermittent demand: the candidates were ranked by RMSE (see _intermittent_selection)
+    if _intermittent(report):
+        # intermittent demand: the candidates were ranked by RMSE (see _intermittent)
         ranked = sorted(all_scores, key=lambda s: (_finite(s.rmse) is None, _finite(s.rmse) or 0.0))[:3]
         segs = [f"{_term(s.name)} {_fmt_num(s.rmse, 2)}" for s in ranked]
-        lines += _wrap_segments(["상위 모델(RMSE):"] + segs, width, sep="  ")
+        lines += _wrap_segments([tx["top"].format(metric="RMSE")] + segs, width, sep="  ")
     elif all_scores:
         segs = [f"{_term(s.name)} {_fmt_num(s.mase, 2)}" for s in all_scores[:3]]
-        lines += _wrap_segments(["상위 모델(MASE):"] + segs, width, sep="  ")
+        lines += _wrap_segments([tx["top"].format(metric="MASE")] + segs, width, sep="  ")
     lines.append(heavy)
     return "\n".join(_fit(ln, width) for ln in lines)
 
@@ -2044,8 +2551,8 @@ padding:2px 6px;border-radius:6px;overflow-wrap:anywhere}
 .facts{display:grid;grid-template-columns:auto 1fr;gap:8px 16px;margin:0;font-size:14px}
 .facts dt{color:var(--ink-3)}.facts dd{margin:0;text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
 .facts .dnote{display:block;font-size:12px;font-weight:400;color:var(--ink-3)}
-.dir{display:flex;align-items:baseline;gap:10px;margin:2px 0 14px}
-.dir .big{font-size:26px;font-weight:700;letter-spacing:-.02em}
+.dir{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px;margin:2px 0 14px}
+.dir .big{font-size:26px;font-weight:700;letter-spacing:-.02em;white-space:nowrap}
 .dir .lab{font-size:14px;color:var(--ink-2)}
 .scen{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 0 12px}
 .scen>div{background:var(--surface-2);border-radius:10px;padding:10px 12px;min-width:0}
@@ -2119,9 +2626,12 @@ def _write(text: str, path: Optional[PathLike]) -> None:
     p.write_text(text, encoding="utf-8")
 
 
-def _badge(label: str, conf: Optional[float] = None) -> str:
+def _badge(label: str, conf: Optional[float] = None, tentative: bool = False) -> str:
+    """Phase badge; ``tentative`` (:func:`narrative.phase_is_tentative`) marks a call on too few
+    observations as ``잠정``, as the narrative words it."""
     color = PHASE_COLOR.get(label, "#898781")
-    conf_html = f" <small>신뢰도 {conf * 100:.0f}%</small>" if conf is not None else ""
+    small = (["잠정"] if tentative else []) + ([f"신뢰도 {conf * 100:.0f}%"] if conf is not None else [])
+    conf_html = f" <small>{' · '.join(small)}</small>" if small else ""
     return (f'<span class="badge" style="background:{_hex_rgba(color, 0.13)};'
             f'border:1px solid {_hex_rgba(color, 0.35)}"><span class="dot" style="background:{color}"></span>'
             f'{_esc(_phase_ko(label))}{conf_html}</span>')
@@ -2261,7 +2771,7 @@ def _header_html(report: TrendReport, d: _ChartData) -> str:
     from . import __version__
 
     chips = [
-        _badge(str(a.phase.label), conf),
+        _badge(str(a.phase.label), conf, _tentative(report)),
         f'<span class="chip">기간 {_esc(_fmt_date(m.start, freq))} ~ {_esc(_fmt_date(m.end, freq))}</span>',
         f'<span class="chip">{_esc(UNIT_KO.get(freq, FREQ_KO.get(freq, freq)))} 단위 · 관측 {len(d.hist_y):,}개</span>',
         f'<span class="chip">예측 {int(report.forecast.horizon):,}{_esc(PERIOD_KO.get(freq, "기간"))}</span>',
@@ -2271,7 +2781,8 @@ def _header_html(report: TrendReport, d: _ChartData) -> str:
         '<div class="eyebrow"><span class="logo" aria-hidden="true"></span>TrendAI 트렌드 리포트 · 과거 → 현재 → 미래</div>'
         f"<h1>{_esc(report.name)}</h1>"
         f'<div class="meta">{"".join(chips)}</div>'
-        f'<p class="gen">TrendAI {_esc(__version__)} 버전으로 생성 · 통계 모델 앙상블 예측 · {_esc(src)}</p>'
+        f'<p class="gen">TrendAI {_esc(__version__)} 버전으로 생성 · {_esc(_method_kind(report.forecast))} · '
+        f'{_esc(src)}</p>'
         "</header>"
     )
 
@@ -2288,16 +2799,47 @@ def _kpis_html(report: TrendReport, d: _ChartData) -> str:
     prob_basis = _prob_basis(report, d)
     meter = (f'<div class="meter" role="img" aria-label="{_esc(prob_basis)} {_esc(_fmt_prob(p))}">'
              f'<span style="width:{(min(1.0, max(0.0, p)) * 100) if p is not None else 0:.0f}%"></span></div>')
+
+    # a growth rate that is None gets its reason (crossed zero, intermittent demand ...) next to the "—"
+    why = {key: _metric_undefined(report, d, key) for key in ("total_change_pct", "cagr_pct", "recent_change_pct")}
+
+    def why_text(key: str) -> str:
+        return _esc(_pct_why(why[key], key))
+
+    total_sub = f'<span class="nw">{_esc(_fmt_date(m.start, freq))} 이후</span> (추세 기준)'
+    tr = d.trend_y[np.isfinite(d.trend_y)]
+    if why_text("total_change_pct"):
+        if why["total_change_pct"] != "intermittent" and tr.size >= 2:
+            # no percentage: the change of the trend in its own units, as the narrative states it
+            total_sub = (f'<span class="nw">{_esc(_fmt_date(m.start, freq))} 이후</span> 추세 '
+                         f'<span class="nw">{_esc(_fmt_num(tr[0]))} → {_esc(_fmt_num(tr[-1]))}</span>')
+        total_sub += f" · {why_text('total_change_pct')}"
+    # the expected change: no arrow / colour when the narrative calls the outlook 보합 or 방향 불확실
+    # (a green ▲ next to "방향 불확실" would claim the rise the narrative does not), and a reason
+    # instead of a bare "—" when there is no percentage
+    word = _direction_word(report, d)
+    nochange = _change_undefined(report, d)
+    chg_sub = f'{_esc(fut_basis)} · <span class="nw">{_esc(cur_basis)} 대비</span>'
+    if nochange is not None:
+        chg_val = f"<span>{_DASH}</span>"
+        chg_sub = _esc(nochange.short) + (f" · {_esc(nochange.levels)}" if nochange.levels else "")
+    elif str(o.direction) == "flat":
+        chg_val = f"<span>{_esc(_fmt_pct(o.expected_change_pct))}</span>"
+        if word == _UNCERTAIN_KO:
+            chg_sub += f' · <span class="nw">{_esc(word)}</span>'
+    else:
+        chg_val = _signed_html(o.expected_change_pct, _fmt_pct(o.expected_change_pct))
     tiles = [
         _kpi("현재 값", f"<span>{_esc(_fmt_short(m.last_value))}</span>",
              f'<span class="nw">{_esc(_fmt_date(m.end, freq))} 기준</span> · {_esc(peak_sub)}',
              title=_fmt_num(m.last_value)),
-        _kpi("전체 변화", _signed_html(m.total_change_pct, _fmt_pct(m.total_change_pct)),
-             f'<span class="nw">{_esc(_fmt_date(m.start, freq))} 이후</span> (추세 기준)'),
-        _kpi("연평균 성장률 CAGR", _signed_html(m.cagr_pct, _fmt_pct(m.cagr_pct)), "연 환산 복리 성장률"),
-        _kpi("최근 변화", _signed_html(m.recent_change_pct, _fmt_pct(m.recent_change_pct)), _esc(recent_span)),
-        _kpi("예측 변화", _signed_html(o.expected_change_pct, _fmt_pct(o.expected_change_pct)),
-             f'{_esc(fut_basis)} · <span class="nw">{_esc(cur_basis)} 대비</span>'),
+        _kpi("전체 변화", _signed_html(m.total_change_pct, _fmt_pct(m.total_change_pct)), total_sub),
+        _kpi("연평균 성장률 CAGR", _signed_html(m.cagr_pct, _fmt_pct(m.cagr_pct)),
+             why_text("cagr_pct") or "연 환산 복리 성장률"),
+        _kpi("최근 변화", _signed_html(m.recent_change_pct, _fmt_pct(m.recent_change_pct)),
+             _esc(recent_span) + (f" · {why_text('recent_change_pct')}" if why_text("recent_change_pct") else "")),
+        _kpi("예측 변화", chg_val, chg_sub,
+             title=(nochange.sentence + (f" ({nochange.levels})" if nochange.levels else "")) if nochange else None),
         _kpi("상승 확률", f"<span>{_esc(_fmt_prob(p))}</span>",
              f"{_esc(prob_basis)} · 예측 신뢰도 {_esc(CONFIDENCE_KO.get(str(o.confidence), str(o.confidence)))}",
              extra=meter, title=f"{prob_basis}: {_fmt_prob(p)}"),
@@ -2342,13 +2884,15 @@ def _outlook_card(report: TrendReport, d: _ChartData) -> str:
     freq = d.freq
     unit = PERIOD_KO.get(freq, "기간")
     direction = str(o.direction)
-    dir_ko = DIRECTION_KO.get(direction, direction)
+    dir_ko = _direction_word(report, d)   # the narrative's word: 보합 / 방향 불확실 for a 'flat' call
     cls = {"up": "pos", "down": "neg"}.get(direction, "")
     end_fc = _fmt_date(d.fc_dates[-1], freq) if len(d.fc_dates) else _DASH
     scen = o.scenarios or {}
+    # a bound at the 0 floor of a nonnegative forecast reads "0(하한)" (narrative.scenario_value)
     sc_html = "".join(
         f'<div class="{"base" if k == "base" else ""}"><div class="k">{ko}</div>'
-        f'<div class="v" title="{_esc(_fmt_num(scen.get(k)))}">{_esc(_fmt_short(scen.get(k)))}</div></div>'
+        f'<div class="v" title="{_esc(_scen_text(report, scen.get(k)))}">'
+        f'{_esc(_scen_text(report, scen.get(k), short=True))}</div></div>'
         for k, ko in SCENARIOS_KO)
     # range visual: pessimistic..optimistic band, base marker, tick at the comparable observation
     ref = _scenario_ref(report, d)
@@ -2389,32 +2933,45 @@ def _outlook_card(report: TrendReport, d: _ChartData) -> str:
             segs.append(f'<div class="rl" style="left:{lab_pos:.1f}%">{_esc(ref_lab)}</div>')
         cap = (f"막대는 {end_fc} 시점의 비관~낙관 범위" if has_band else f"표시는 {end_fc} 시점의 기준 시나리오")
         cap += f"이고, {ref_cap}." if ref_cap else "입니다."
+        floor = _floor_note(report)
+        if floor:
+            cap += " " + floor
         range_html = (f'<div class="range" role="img" aria-label="{_esc(cap)}">{"".join(segs)}</div>'
                       f'<p class="desc" style="margin:0 0 14px">{_esc(cap)}</p>')
     peak = _ts(o.forecast_peak_date)
     skill = _skill_value(fc)
     fut_basis, cur_basis = _change_basis(report, d)
     adj_note = _adjustment_note(report, d)
+    nochange = _change_undefined(report, d)
+    # the projected phase as far as the narrative projects it (판단 보류 / 참고용 / 잠정, see _future_phase_hedge)
+    ph_val, ph_note = _future_phase_parts(report)
     facts: list[tuple[str, str, str, str]] = [  # (label, value, tooltip, value class)
-        ("미래 단계", _phase_ko(o.future_phase), "", ""),
+        ("미래 단계", ph_val, _future_phase_tip(report), "ph-hedged" if ph_note else ""),
         ("예측 신뢰도", CONFIDENCE_KO.get(str(o.confidence), str(o.confidence)), "", ""),
-        (_SKILL_LABEL, _rel_error_text(skill), _SKILL_TIP, _rel_error_class(skill)),
+        (_SKILL_LABEL, _rel_error_text(skill), _skill_tip(_intermittent(report)), _rel_error_class(skill)),
         ("예측 정점", _fmt_date(peak, freq) if peak is not None else "예측 기간 내 없음", "", ""),
     ]
     facts_html = "".join(
         (f'<dt><abbr title="{_esc(tip)}">{_esc(k)}</abbr></dt>' if tip else f"<dt>{_esc(k)}</dt>")
-        + (f'<dd class="{vc}">{_esc(v)}</dd>' if vc else f"<dd>{_esc(v)}</dd>")
+        + (f'<dd>{_esc(v)}<span class="dnote">{_esc(ph_note)}</span></dd>' if vc == "ph-hedged"
+           else f'<dd class="{vc}">{_esc(v)}</dd>' if vc else f"<dd>{_esc(v)}</dd>")
         for k, v, tip, vc in facts)
     arrow = DIRECTION_ARROW.get(direction, "")
     prob_txt = _fmt_prob(o.prob_increase)
+    if nochange is None:
+        chg_html = f'<span class="nw">{_esc(_fmt_pct(o.expected_change_pct))} 예상</span>'
+        basis = f"변화율과 상승 확률은 모두 {fut_basis}을 {cur_basis}과 비교한 값입니다."
+    else:  # no percentage: the reason and the two compared levels, worded like the narrative
+        chg_html = '<span class="nw">변화율 없음</span>'   # the reason follows in the sentence below
+        basis = (f"{nochange.sentence} 상승 확률은 {fut_basis}을 {cur_basis}과 비교한 값입니다"
+                 + (f"({nochange.levels})." if nochange.levels else "."))
     return (
         '<section class="card"><h2>미래 전망</h2>'
         f'<p class="desc">{_esc(end_fc)}까지 · 향후 {int(fc.horizon):,}{_esc(unit)}</p>'
         f'<div class="dir"><span class="big {cls}">{_esc(arrow)} {_esc(dir_ko)}</span>'
-        f'<span class="lab"><span class="nw">{_esc(_fmt_pct(o.expected_change_pct))} 예상</span> · '
+        f'<span class="lab">{chg_html} · '
         f'<span class="nw" title="{_esc(_prob_basis(report, d))}">상승 확률 {_esc(prob_txt)}</span></span></div>'
-        f'<p class="desc" style="margin:-8px 0 14px">변화율과 상승 확률은 모두 {_esc(fut_basis)}을 '
-        f'{_esc(cur_basis)}과 비교한 값입니다.{(" " + _esc(adj_note)) if adj_note else ""}</p>'
+        f'<p class="desc" style="margin:-8px 0 14px">{_esc(basis)}{(" " + _esc(adj_note)) if adj_note else ""}</p>'
         f'<h3 class="sub">시나리오 ({_esc(end_fc)} 시점 값)</h3><div class="scen">{sc_html}</div>{range_html}'
         f'<dl class="facts">{facts_html}</dl></section>'
     )
@@ -2451,17 +3008,20 @@ def _diagnosis_card(report: TrendReport, d: _ChartData) -> str:
         peak_html += (f'<span class="dnote">일회성 급등 {_esc(_fmt_short(spike[0]))}'
                       f'({_esc(_fmt_date(spike[1], freq))}) 제외</span>')
     facts = [
-        # momentum = recent slope - long-run slope, both in % of the mean level per period
+        # momentum = recent trend slope - long-run (Theil-Sen) slope, in % of the *current* trend
+        # level per period (analysis.compute_metrics; the narrative's "현재 추세 수준 대비")
         ("모멘텀", _esc(mom + (f"%p{_PER_UNIT.get(freq, '')}" if mom != _DASH else ""))),
         ("추세 강도", _esc(_fmt_num(m.trend_strength, 2))),
         ("계절성 강도", _esc(_fmt_num(m.seasonal_strength, 2))),
         ("변동성", _esc(_fmt_pct(vol * 100 if vol is not None else None, signed=False))),
         ("최고점", peak_html),
     ]
-    facts_html = "".join(f"<dt>{_esc(k)}</dt><dd>{v}</dd>" for k, v in facts)
+    tips = {"모멘텀": _MOMENTUM_TIP}
+    facts_html = "".join((f'<dt><abbr title="{_esc(tips[k])}">{_esc(k)}</abbr></dt>' if k in tips
+                          else f"<dt>{_esc(k)}</dt>") + f"<dd>{v}</dd>" for k, v in facts)
     return (
         '<section class="card"><h2>현재 진단</h2>'
-        f'<p class="desc">{_esc(desc)}</p>{_badge(str(a.phase.label), conf)}{reasons_html}'
+        f'<p class="desc">{_esc(desc)}</p>{_badge(str(a.phase.label), conf, _tentative(report))}{reasons_html}'
         f'<dl class="facts" style="margin-top:16px">{facts_html}</dl></section>'
     )
 
@@ -2498,8 +3058,12 @@ def _events_card(report: TrendReport, d: _ChartData) -> str:
                 f"<td class=\"num\">{_esc(_fmt_num(an.value))}</td>"
                 f"<td class=\"num\">{_esc(_fmt_num(an.expected))}</td>"
                 f"<td class=\"num\">{_signed_html(z, _fmt_num(z, 1, signed=True))}</td></tr>")
+        # intermittent demand: an anomaly is an unusually large demand and Anomaly.expected the
+        # typical (median non-zero) demand size, not a trend expectation (narrative.is_intermittent)
+        exp_head = ('<abbr title="0이 잦은 간헐 수요라, 0이 아닌 수요의 평소(중앙값) 크기와 비교했습니다">평소 규모</abbr>'
+                    if _intermittent(report) else "예상")
         an_html = ('<div class="table-wrap"><table><thead><tr><th>날짜</th><th class="num">실제</th>'
-                   '<th class="num">예상</th><th class="num">z-점수</th></tr></thead>'
+                   f'<th class="num">{exp_head}</th><th class="num">z-점수</th></tr></thead>'
                    f'<tbody>{"".join(rows)}</tbody></table></div>')
     else:
         an_html = '<p class="empty">이상치가 감지되지 않았습니다.</p>'
@@ -2515,23 +3079,32 @@ def _models_card(report: TrendReport) -> str:
     fc = report.forecast
     scores = list(fc.model_scores or [])
     skill = _skill_value(fc)
+    # ForecastResult.skill compares MAEs -- RMSEs for intermittent demand, the metric that ranked the
+    # candidates (forecast.auto_forecast) -- so the per-model column uses the same metric
+    intermittent = _intermittent(report)
+    metric, metric_ko = ("rmse", "제곱 오차(RMSE)") if intermittent else ("mae", "평균 절대 오차")
+    naive_name: Optional[str] = None
     if scores:
         max_w = max([_finite(s.weight) or 0.0 for s in scores] + [0.0])
         # per-model error versus the best naive benchmark on the same backtest windows
         # (the same ratio as ForecastResult.skill, row by row)
-        naive_name, naive_mae = _best_naive_mae(scores)
+        naive_name, naive_err = _best_naive(scores, metric)
+        no_bench = ('<span class="muted" title="단순 기준 예측이 비교 후보에 없어 모델별로는 비교하지 않았습니다">'
+                    f"{_DASH}</span>")
         rows = []
         for i, s in enumerate(scores, 1):
             w = _finite(s.weight) or 0.0
             desc = _model_desc(s.name)
             fill = (w / max_w * 100) if max_w > 0 else 0.0
-            mae = _finite(s.mae)
-            if naive_mae is None or mae is None or mae < 0:
+            err = _finite(getattr(s, metric, None))
+            if naive_err is None:
+                rel_html = no_bench
+            elif err is None or err < 0:
                 rel_html = _DASH
             elif str(s.name) == naive_name:
                 rel_html = '<span class="muted">기준</span>'
-            elif naive_mae > 0:
-                ratio = mae / naive_mae
+            elif naive_err > 0:
+                ratio = err / naive_err
                 rel_cls = _rel_error_class(ratio)
                 rel_txt = _esc(_rel_error_text(ratio))
                 rel_html = f'<span class="{rel_cls}">{rel_txt}</span>' if rel_cls else rel_txt
@@ -2546,15 +3119,22 @@ def _models_card(report: TrendReport) -> str:
                 f'<td class="num hide-sm">{_esc(_fmt_pct(s.smape, signed=False))}</td>'
                 f'<td class="wcell"><div class="wbar"><div class="track"><div class="fill" style="width:{fill:.1f}%"></div></div>'
                 f'<span class="pct">{w * 100:.0f}%</span></div></td></tr>')
-        naive_ko = MODEL_KO.get(naive_name or "", "")
         rel_tip = ("같은 백테스트 구간에서 가장 나은 단순 기준 예측"
-                   + (f"({naive_name}: {naive_ko})" if naive_name else "")
-                   + "보다 평균 절대 오차가 몇 % 작은지(−) 큰지(+)")
+                   + (f"({_model_label(naive_name, 'ko')})" if naive_name else "")
+                   + f"보다 {metric_ko}가 몇 % 작은지(−) 큰지(+)")
         table = ('<div class="table-wrap"><table><thead><tr><th>#</th><th>모델</th>'
                  f'<th class="num"><abbr title="{_esc(_MASE_TIP)}">MASE</abbr></th>'
                  f'<th class="num"><abbr title="{_esc(rel_tip)}">단순 대비</abbr></th>'
                  '<th class="num hide-sm">sMAPE</th><th><span class="hide-sm">앙상블 </span>가중치</th></tr></thead>'
                  f'<tbody>{"".join(rows)}</tbody></table></div>')
+        if naive_name is None:
+            # no benchmark rows (intermittent demand offers level models only; explicit candidates):
+            # say why the column is empty instead of leaving a bare "—"
+            why = ("0이 잦은 간헐 수요라 수요 수준을 추정하는 모델만 후보로 써서" if intermittent
+                   else "후보 목록에 단순 기준 예측(직전값·계절 반복·평균 기울기)이 없어")
+            table += (f'<p class="desc" style="margin:8px 0 0">‘단순 대비’: {_esc(why)} 모델별로는 비교하지 '
+                      "않았습니다. 최종 방법은 같은 구간에서 단순 기준 예측과 따로 비교했습니다(아래 "
+                      "‘단순 예측 대비 오차’).</p>")
     else:
         table = '<p class="empty">백테스트 점수가 없습니다 (데이터가 짧아 단순 모델을 사용).</p>'
     bm = _finite(fc.backtest_mase)
@@ -2562,21 +3142,25 @@ def _models_card(report: TrendReport) -> str:
         acc_txt = "데이터가 짧아 백테스트로 정확도를 검증하지 못했습니다."
     else:
         acc_txt = _skill_sentence(skill)
-    skill_html = (f'<abbr title="{_esc(_SKILL_TIP)}">{_SKILL_LABEL}</abbr> '
+    skill_html = (f'<abbr title="{_esc(_skill_tip(intermittent))}">{_SKILL_LABEL}</abbr> '
                   f'<strong class="{_rel_error_class(skill)}">{_esc(_rel_error_text(skill))}</strong>')
     mase_note = ""
     if bm is not None:
+        judge = "위의 ‘단순 대비’" if naive_name else "‘단순 예측 대비 오차’"
         mase_note = (f"기술 참고: 최종 방법의 백테스트 MASE {bm:.2f}. MASE는 학습 구간에서 한 기 앞을 계절 단순 예측한 "
                      "오차를 1로 둔 상대 오차라, 여러 기 앞을 내다보는 예측은 단순 예측보다 정확해도 1을 넘기 쉬우므로 "
-                     "단순 예측과의 우열은 위의 ‘단순 대비’로 판단합니다.")
+                     f"단순 예측과의 우열은 {judge}로 판단합니다.")
     lead = "롤링 원점 백테스트 성적(MASE 낮을수록 좋음). 왼쪽 강조선은 최종 앙상블에 포함된 모델입니다."
-    if _intermittent_selection(scores):
-        lead += (" 0이 잦은 간헐 수요라 모델 순위·가중치·최종 선택은 제곱 오차(RMSE) 기준으로 정했으며, "
+    if intermittent and scores:
+        lead += (" 0이 잦은 간헐 수요라 모델 순위·가중치·최종 선택과 ‘단순 대비’는 제곱 오차(RMSE) 기준이며, "
                  "표는 MASE 순서입니다.")
+    # the method in words; no tooltip with the raw method string ("ensemble(linear_trend 0.35, …)":
+    # raw ids, Python floats, English) -- the ids and the weights are the table rows above
+    method_txt = _describe_method(fc, "ko")
     return (
         '<section class="card"><h2>모델 리더보드</h2>'
         f'<p class="desc">{_esc(lead)}</p>'
-        f'{table}<p class="desc" style="margin:14px 0 0">최종 방법 <code>{_esc(fc.method)}</code></p>'
+        f'{table}<p class="desc" style="margin:14px 0 0">최종 방법: {_esc(method_txt)}</p>'
         f'<p style="margin:8px 0 0;font-size:14px">{skill_html} · {_esc(acc_txt)}</p>'
         + (f'<p class="desc" style="margin:6px 0 0">{_esc(mase_note)}</p>' if mase_note else "")
         + "</section>"
@@ -2628,13 +3212,17 @@ def _notes_card(report: TrendReport, d: _ChartData) -> str:
     levels = ", ".join(f"{lv}%" for lv in sorted({lv for lv, _, _ in d.bands})) or "—"
     n_models = len(fc.model_scores or [])
     if n_models:
-        if _intermittent_selection(fc.model_scores or []):
-            ens = (f"0이 잦은 간헐 수요라 수요 수준을 추정하는 모델(SBA 등)과 단순 기준 예측까지 {n_models}개 모델을 "
+        with_naive = _best_naive(fc.model_scores or [])[0] is not None
+        if _intermittent(report):
+            # forecast offers intermittent demand level models only (ses, theta, holt_damped, sba, ...)
+            ens = (f"0이 잦은 간헐 수요라 수요 수준을 추정하는 모델(SBA 등) {n_models}개를 "
                    "롤링 원점 백테스트로 평가하고, 제곱 오차(RMSE)가 작은 상위 모델을 가중 평균한 앙상블(또는 확실히 "
-                   "우수한 단일 모델)을 최종 예측으로 씁니다.")
+                   "우수한 단일 모델)을 최종 예측으로 씁니다. 단순 기준 예측은 같은 구간에서 따로 계산해 정확도 비교에만 "
+                   "씁니다.")
         else:
-            ens = (f"단순 기준 예측을 포함한 {n_models}개 모델을 롤링 원점 백테스트로 평가해 MASE 순으로 정렬하고, "
-                   "상위 모델을 역-MASE 가중 평균한 앙상블(또는 확실히 우수한 단일 모델)을 최종 예측으로 씁니다.")
+            ens = (f"{'단순 기준 예측을 포함한 ' if with_naive else ''}{n_models}개 모델을 롤링 원점 백테스트로 평가해 "
+                   "MASE 순으로 정렬하고, 상위 모델을 역-MASE 가중 평균한 앙상블(또는 확실히 우수한 단일 모델)을 최종 "
+                   "예측으로 씁니다.")
         bands = (f"최종 방법의 백테스트 예측 오차를 시점별로 모아 {levels} 예측 구간을 추정합니다. 백테스트가 짧으면 "
                  "t-분포로 구간을 넓히고, 예측 시점이 멀수록 구간이 넓어집니다.")
     else:
@@ -2719,13 +3307,28 @@ _COMPARE_CSS = (
     "text-decoration-color:var(--border-strong);text-underline-offset:3px}"
     ".sname a:hover,.mcard h3 a:hover{color:var(--accent);text-decoration-color:currentColor}"
     "td .hz,th .hz{font-size:11.5px;color:var(--ink-3);font-weight:400;margin-left:4px}"
-    ".mcard .stats{align-items:end}"
+    ".dl{display:block;font-size:11.5px;line-height:1.3;color:var(--ink-3);font-weight:400;white-space:normal}"
+    # label / value / note rows shared by the three stats (subgrid), so a value with a note under it
+    # ("보합", "방향 불확실") or a label that wraps does not shift the other columns
+    ".mcard .stats{grid-template-rows:auto auto auto;row-gap:0;align-items:end}"
+    ".mcard .stats>div{display:grid;grid-row:span 3;grid-template-rows:subgrid}"
+    ".mcard .stats .v,.mcard .stats .dl{align-self:start}"
 )
-_EC_TIP = ("예측 마지막 한 주기의 평균이 최근 한 주기의 평균보다 몇 % 높은지(낮은지)입니다. "
+#: the two levels behind expected_change_pct / prob_increase (forecast.outlook_levels): the last season
+#: of the forecast -- the whole horizon, seasonally adjusted, when it is shorter (weekly data: 26 of 52
+#: weeks); the last value for yearly data -- against the last observed season
+_FUT_LEVEL_KO = ("예측 마지막 한 주기의 평균(예측 기간이 한 주기보다 짧으면 예측 기간 전체를 계절 보정한 평균, "
+                 "연 단위 데이터는 마지막 예측값)")
+_CUR_LEVEL_KO = "최근 한 주기의 평균(연 단위는 최근 값)"
+_EC_TIP = (f"{_FUT_LEVEL_KO}이 {_CUR_LEVEL_KO}보다 몇 % 높은지(낮은지)입니다. "
            "시리즈마다 예측 기간이 다르면 값 옆에 그 기간을 적었습니다.")
 _RC_TIP = "추세 성분이 최근 한 주기(연 단위 데이터는 1년) 동안 변한 비율입니다."
-_PI_TIP = ("예측 마지막 한 주기의 평균이 최근 한 주기의 평균보다 높을 확률입니다(예측 변화와 같은 기준). "
+_PI_TIP = (f"{_FUT_LEVEL_KO}이 {_CUR_LEVEL_KO}보다 높을 확률입니다(예측 변화와 같은 기준). "
            "예측 기간 끝 시점의 값이 지금보다 높을 확률이 아닙니다.")
+#: what the rising score (compare.rising_score) is: the outlook *and* the recent momentum, not the
+#: outlook alone -- "higher = stronger expected rise" overclaimed
+_SCORE_TIP = ("상승 점수: 전망(예측 변화·상승 확률)과 최근 기세(최근 변화·모멘텀)를 합친 0–100 점수, 50 = 중립. "
+              "안정기·변동성 장세에서는 전망만 반영합니다.")
 
 
 def render_compare_html(reports: list[TrendReport], ranking: pd.DataFrame,
@@ -2773,6 +3376,29 @@ def render_compare_html(reports: list[TrendReport], ranking: pd.DataFrame,
     def paren(text: str) -> str:
         return f"({text})" if text else ""
 
+    # chart data per report (also caches forecast.outlook_levels for the direction words and reasons)
+    dds: dict[int, _ChartData] = {}
+
+    def dd_of(r: TrendReport) -> _ChartData:
+        if id(r) not in dds:
+            dds[id(r)] = _ChartData(r)
+        return dds[id(r)]
+
+    def change_html(r: Optional[TrendReport], ec: Any) -> tuple[str, str]:
+        """``(value, note)`` of an expected change as the narrative calls it: no arrow / colour for a
+        'flat' outlook, whose word (보합 / 방향 불확실) is the note; without a percentage the note is
+        the reason instead of leaving a bare "—"."""
+        if r is None:
+            return _signed_html(ec, _fmt_pct(ec)), ""
+        rd = dd_of(r)
+        nochange = _change_undefined(r, rd)
+        if nochange is not None:
+            return (f'<span title="{_esc(nochange.sentence)}">{_DASH}</span>',
+                    f'<span class="dl">{_esc(nochange.short)}</span>')
+        if str(r.outlook.direction) != "flat":
+            return _signed_html(ec, _fmt_pct(ec)), ""
+        return f'<span>{_esc(_fmt_pct(ec))}</span>', f'<span class="dl">{_esc(_direction_word(r, rd))}</span>'
+
     rows_html = []
     scores: dict[str, Optional[float]] = {}
     for pos, ((_, row), nm) in enumerate(zip(rank_df.iterrows(), names), 1):
@@ -2790,24 +3416,24 @@ def render_compare_html(reports: list[TrendReport], ranking: pd.DataFrame,
         sw = min(100.0, max(0.0, score)) if score is not None else 0.0
         badge = _badge(phase_s) if phase_s else _DASH
         fc_sp, rc_sp = spans[nm]
+        ec_html, ec_note = change_html(by_name.get(nm), ec)
         rows_html.append(
             f'<tr><td class="num" style="text-align:left"><strong>{pos}</strong></td>'
             f'<td><span class="sname">{_link(_esc(nm), links.get(nm))}</span></td><td class="hide-sm">{badge}</td>'
             f'<td class="num hide-sm">{_signed_html(mom, mom_txt)}'
             f'{f"<span class=unit>{_esc(mom_unit)}</span>" if mom_unit else ""}</td>'
             f'<td class="num hide-sm">{_signed_html(rc, _fmt_pct(rc))}{"" if rc_shared else hz(rc_sp)}</td>'
-            f'<td class="num">{_signed_html(ec, _fmt_pct(ec))}{"" if fc_shared else hz(fc_sp)}</td>'
+            f'<td class="num">{ec_html}{"" if fc_shared else hz(fc_sp)}{ec_note}</td>'
             f'<td class="num hide-sm">{_esc(_fmt_prob(pi))}</td>'
-            f'<td class="score-cell"><div class="wbar" title="50 = 중립"><div class="track"><div class="fill" style="width:{sw:.1f}%"></div>'
+            f'<td class="score-cell"><div class="wbar" title="{_esc(_SCORE_TIP)}"><div class="track"><div class="fill" style="width:{sw:.1f}%"></div>'
             f'<span class="mid"></span></div><span class="pct score">{_esc(_fmt_num(score, 0))}</span></div></td></tr>')
     if rows_html:
         table = ('<div class="table-wrap"><table><thead><tr><th>순위</th><th>이름</th><th class="hide-sm">단계</th>'
-                 '<th class="num hide-sm"><abbr title="최근 추세 기울기 − 장기 기울기 (평균 수준 대비 %p, 기간당)">'
-                 '모멘텀 (%p/기간)</abbr></th>'
+                 f'<th class="num hide-sm"><abbr title="{_esc(_MOMENTUM_TIP)}">모멘텀 (%p/기간)</abbr></th>'
                  f'<th class="num hide-sm"><abbr title="{_esc(_RC_TIP)}">최근 변화</abbr>{hz(paren(rc_shared))}</th>'
                  f'<th class="num"><abbr title="{_esc(_EC_TIP)}">예측 변화</abbr>{hz(paren(fc_shared))}</th>'
                  f'<th class="num hide-sm"><abbr title="{_esc(_PI_TIP)}">상승 확률</abbr></th>'
-                 '<th class="th-score">상승 점수</th></tr></thead>'
+                 f'<th class="th-score"><abbr title="{_esc(_SCORE_TIP)}">상승 점수</abbr></th></tr></thead>'
                  f'<tbody>{"".join(rows_html)}</tbody></table></div>')
     else:
         table = '<p class="empty">순위 데이터가 없습니다.</p>'
@@ -2829,32 +3455,34 @@ def render_compare_html(reports: list[TrendReport], ranking: pd.DataFrame,
     for r in ordered:
         a, o, m = r.analysis, r.outlook, r.analysis.metrics
         freq = str(a.freq)
-        dd = _ChartData(r)
+        dd = dd_of(r)
         rank = rank_of.get(str(r.name))
         score = scores.get(str(r.name))
         end_fc = _fmt_date(dd.fc_dates[-1], freq) if len(dd.fc_dates) else _fmt_date(m.end, freq)
         fc_sp, rc_sp = _change_spans(r)
         rc_k = f'최근 변화 <span class="nw">({_esc(rc_sp)})</span>' if rc_sp else "최근 변화"
         fc_k = f'예측 변화 <span class="nw">({_esc(fc_sp)})</span>' if fc_sp else "예측 변화"
+        ec_html, ec_note = change_html(r, o.expected_change_pct)
         cards.append(
             '<article class="mcard"><div class="top">'
             f'<div><h3>{_link(_esc(r.name), links.get(str(r.name)))}</h3></div>'
             f'<span class="rank">{"#" + str(rank) if rank else ""}</span></div>'
-            f'<div>{_badge(str(a.phase.label), _finite(a.phase.confidence))}</div>'
+            f'<div>{_badge(str(a.phase.label), _finite(a.phase.confidence), _tentative(r))}</div>'
             f"{_mini_chart(r)}"
             '<div class="stats">'
             f'<div><div class="k">{rc_k}</div><div class="v">{_signed_html(m.recent_change_pct, _fmt_pct(m.recent_change_pct))}</div></div>'
-            f'<div><div class="k">{fc_k}</div><div class="v">{_signed_html(o.expected_change_pct, _fmt_pct(o.expected_change_pct))}</div></div>'
+            f'<div><div class="k">{fc_k}</div><div class="v">{ec_html}</div>{ec_note}</div>'
             f'<div title="{_esc(_PI_TIP)}"><div class="k">상승 확률</div><div class="v">{_esc(_fmt_prob(o.prob_increase))}</div></div>'
             "</div>"
             f'<div class="foot"><span>{_esc(_fmt_date(m.start, freq))} ~ {_esc(end_fc)}</span>'
-            f'<span>상승 점수 <strong>{_esc(_fmt_num(score, 0))}</strong></span></div>'
+            f'<span title="{_esc(_SCORE_TIP)}">상승 점수 <strong>{_esc(_fmt_num(score, 0))}</strong></span></div>'
             "</article>")
     cards_html = f'<div class="cards">{"".join(cards)}</div>' if cards else '<p class="empty">리포트가 없습니다.</p>'
 
     n = len(ordered) if ordered else len(names)
     freqs = {str(getattr(r.analysis, "freq", "")) for r in ordered}
-    rank_desc = "점수가 높을수록 앞으로 더 강하게 오를 것으로 예상되는 트렌드입니다."
+    rank_desc = ("상승 점수는 앞으로의 전망(예측 변화·상승 확률)과 최근 기세(최근 변화·모멘텀)를 합친 0–100 점수로, "
+                 "50이 중립입니다. 안정기·변동성 장세에서는 전망만 반영합니다.")
     if len(freqs) > 1:
         rank_desc += (" 주기가 다른 시계열이 섞여 있어, 점수는 변화율을 연 단위(모멘텀은 월 단위)로 환산해 계산했고 "
                       "표의 변화율은 값 옆에 적힌 각 시리즈의 기간 기준입니다.")
@@ -2866,7 +3494,7 @@ def render_compare_html(reports: list[TrendReport], ranking: pd.DataFrame,
         'TrendAI 비교 리포트 · 어떤 트렌드가 뜨고 있나</div>'
         f"<h1>트렌드 비교 · {n}개 시리즈</h1>"
         '<div class="meta"><span class="chip">상승 점수 0–100 (50 = 중립)</span>'
-        '<span class="chip">예측 변화 · 상승 확률 · 최근 변화 · 모멘텀 종합</span></div>'
+        '<span class="chip">전망(예측 변화 · 상승 확률) + 최근 기세(최근 변화 · 모멘텀)</span></div>'
         f'<p class="gen">TrendAI {_esc(__version__)} 버전으로 생성</p></header>',
         f'<section class="card"><h2>상승 순위</h2><p class="desc">{_esc(rank_desc)}</p>{table}</section>',
         '<section><h2 style="font-size:17px;margin:4px 0 12px">시리즈별 요약</h2>'

@@ -30,12 +30,14 @@ Registered models
 ``analog_knn``         k nearest historical windows ("past analogues")
 ``logistic_growth``    S-curve fit, observed transitions only, capped saturation (``requires_positive``)
 ``*@log``              ``holt_damped`` / ``holt_winters`` / ``linear_trend`` in log space (growth-guarded)
-``drift@log``          drift in log space: constant growth *rate* (only when requested by name)
+``drift@log``          drift in log space: constant growth *rate* (compounding series, see below)
 ``sba``                Croston's method with the Syntetos-Boylan bias correction (intermittent demand only)
 =====================  ==========================================================
 
 ``offered_for`` (class attribute) controls :func:`default_candidates`:
-``drift@log`` is ``"explicit"`` (never offered automatically) and ``sba`` is
+``drift@log`` is ``"explicit"`` (never one of the default candidates; but
+``forecast.auto_forecast`` adds it itself for a steadily compounding positive
+series, see ``forecast._multiplicative_growth``) and ``sba`` is
 ``"intermittent"`` (offered only for intermittent demand).
 
 ``*``: like the M4-competition benchmarks, these non-seasonal methods are
@@ -69,7 +71,8 @@ class Forecaster(ABC):
     requires_positive: bool = False  # True if the model needs all y > 0 (log / multiplicative)
     #: which series :func:`default_candidates` offers the model for: ``"regular"`` (every
     #: series, the default), ``"intermittent"`` (only intermittent demand, i.e. when called
-    #: with ``intermittent=True``) or ``"explicit"`` (never: only when requested by name)
+    #: with ``intermittent=True``) or ``"explicit"`` (never; such a model is used when
+    #: requested by name, or when ``forecast.auto_forecast`` adds it for a series it suits)
     offered_for: str = "regular"
 
     def __init__(self) -> None:
@@ -1495,14 +1498,18 @@ class _LogDrift(LogTransformed):
     slower than the average caps it.  For steadily compounding series (GDP, prices, populations) level-space drift
     projects *linear* growth and falls further behind with every step.
 
-    Not offered automatically (``offered_for = "explicit"``): request it by
-    name (``auto_forecast(..., candidates=[...])``).  As a default candidate
-    it cut the error on simulated annual GDP-like series (MAPE at h = 1..5
-    -11 %, median bias at h = 5 -2.2 % -> -1.5 %) but made the general
-    accuracy testbed slightly worse (MAE +0.5 % over 966 series, interval
-    coverage -0.1 pt): on S-curves cut mid-transition, which start from a
-    low base, the average log growth compounds into large overshoots
-    (``peaking`` W n=104: x2.6-4 the MAE).
+    Not one of :func:`default_candidates` (``offered_for = "explicit"``):
+    ``forecast.auto_forecast`` adds it to the default candidates only for a
+    steadily compounding, strictly positive series
+    (``forecast._multiplicative_growth``: steady percentage growth or decay;
+    never for intermittent demand or a driftless random walk), and it can be
+    requested by name (``auto_forecast(..., candidates=[...])``).  As an
+    unconditional default candidate it cut the error on simulated annual
+    GDP-like series (MAPE at h = 1..5 -11 %, median bias at h = 5 -2.2 % ->
+    -1.5 %) but made the general accuracy testbed slightly worse (MAE +0.5 %
+    over 966 series, interval coverage -0.1 pt): on S-curves cut
+    mid-transition, which start from a low base, the average log growth
+    compounds into large overshoots (``peaking`` W n=104: x2.6-4 the MAE).
     """
 
     offered_for = "explicit"
@@ -1549,7 +1556,8 @@ def default_candidates(n_obs: int, season_length: int, positive: bool,
     adds the models meant only for intermittent demand
     (``offered_for == "intermittent"``, e.g. ``sba``); they are never offered
     for ordinary series.  Models with ``offered_for == "explicit"`` are never
-    returned (request them by name).
+    returned (request them by name; ``forecast.auto_forecast`` adds
+    ``drift@log`` itself for steadily compounding series).
     """
     names = []
     for nm, factory in MODEL_REGISTRY.items():

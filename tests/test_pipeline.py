@@ -325,3 +325,117 @@ def test_run_passes_the_random_walk_finding_to_the_forecast():
     # a trending series keeps its trend models
     grow = pipeline.run(sample("growing"))
     assert {"linear_trend", "holt"} & {ms.name for ms in grow.forecast.model_scores}
+
+
+def test_default_horizon_gets_the_long_horizon_warning():
+    """F9: run(s) on a 3-point daily series made a 30-step forecast (10x the history) silently,
+    while run(s, horizon=30) made the same forecast with a DataWarning."""
+    from trendai.data import DataWarning, from_values
+
+    s = from_values([10.0, 11.0, 12.0], freq="D")
+    with pytest.warns(DataWarning, match="5배"):
+        rep = pipeline.run(s)
+    assert len(rep.forecast.mean) == 30
+    with pytest.warns(DataWarning, match="5배"):
+        explicit = pipeline.run(s, horizon=30)
+    assert np.allclose(rep.forecast.mean.to_numpy(), explicit.forecast.mean.to_numpy())
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pipeline.run(sample("growing"))                     # an ordinary default stays silent
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+def test_non_finite_horizon_is_a_data_error(bad):
+    """R4-REV-7: horizon=inf raised OverflowError instead of the documented DataError."""
+    from trendai.data import DataError
+
+    with pytest.raises(DataError, match="horizon"):
+        pipeline.run(sample("growing"), horizon=bad)
+
+
+def test_json_outlook_carries_the_direction_word_and_the_compared_levels():
+    """F15: the export said direction 'flat' next to −22.8 % where every human surface says
+    '방향 불확실'; it now carries the label, the None reason and the two compared levels."""
+    from trendai.forecast import outlook_levels
+    from trendai.narrative import build_llm_payload
+
+    rep = pipeline.run(sample("fad", n=8, freq="Y"))
+    o = json.loads(pipeline.report_to_json(rep))["outlook"]
+    assert o["direction"] == "flat" and o["expected_change_pct"] < -20
+    assert o["direction_label"] == {"ko": "방향 불확실", "en": "direction uncertain"}
+    assert o["expected_change_undefined"] is None
+    lv = outlook_levels(rep.analysis, rep.forecast)
+    assert o["compared_levels"]["current"] == pytest.approx(lv.current, rel=1e-12)
+    assert o["compared_levels"]["future"] == pytest.approx(lv.future, rel=1e-12)
+    # the same fields as the LLM payload
+    pay = build_llm_payload(rep.analysis, rep.forecast, rep.outlook)["outlook"]
+    assert o["direction_label"] == pay["direction_label"]
+    # a level expected to cross zero: no %, its reason and both levels
+    idx = pd.date_range("2016-01-01", periods=60, freq="MS")
+    pnl = pd.Series(np.linspace(30.0, -2.0, 60) + np.random.default_rng(3).normal(0, 0.3, 60), index=idx)
+    rep2 = pipeline.run(pnl, horizon=24)
+    o2 = pipeline.report_to_dict(rep2)["outlook"]
+    lv2 = outlook_levels(rep2.analysis, rep2.forecast)
+    assert o2["expected_change_undefined"] == lv2.undefined == "sign_change"
+    assert o2["expected_change_pct"] is None
+    assert o2["compared_levels"]["current"] > 0 > o2["compared_levels"]["future"]
+    assert "보합" not in o2["direction_label"]["ko"]
+
+
+def test_json_keeps_fifteen_significant_digits():
+    """R4-REV-5: 12-digit rounding exported 1,234,567,890,123 (won) as 1,234,567,890,120."""
+    vals = 1_234_567_890_123 + np.arange(24) * 1_000_003.0
+    rep = pipeline.run(pd.Series(vals, index=pd.date_range("2020-01-01", periods=24, freq="MS")), horizon=3)
+    d = json.loads(pipeline.report_to_json(rep))
+    assert [h["value"] for h in d["history"]] == vals.tolist()
+    assert pipeline._clean(123456789012345.0) == 123456789012345.0
+    assert pipeline._clean(0.1 + 0.2) == 0.3
+
+
+def test_json_export_of_forecast_dates_after_year_9999():
+    """R4-REV-6: run() accepts a yearly horizon that ends after 9999, but the JSON export
+    crashed in strftime (NotImplementedError)."""
+    s = pd.Series(np.arange(20.0) * 2 + 50, index=pd.date_range("2001-01-01", periods=20, freq="YS"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        rep = pipeline.run(s, horizon=8000)
+    assert rep.forecast.mean.index[-1].year == 10020
+    d = json.loads(pipeline.report_to_json(rep))
+    assert d["forecast"]["table"][-1]["date"] == "10020-01-01"
+    assert d["forecast"]["table"][0]["date"] == "2021-01-01"
+    assert d["history"][0]["date"] == "2001-01-01"
+
+
+def test_rising_score_follows_the_analysis_percentage_rules():
+    """R4-REV-2: the score's recent change ignored the analysis' rules: a P&L falling through
+    zero scored a '−100 %' recent change, a trend rising from a near-zero base of data with
+    negative values +944 to +1,467 %/yr (score ~99), intermittent demand +1,445 %/yr -- while
+    the table's recent_change_pct showed '—' for all three."""
+    from trendai.analysis import pct_change_undefined
+
+    idx = pd.date_range("2020-01-01", periods=48, freq="MS")
+    rng = np.random.default_rng(5)
+    pnl = np.r_[np.linspace(20, 12, 36), np.linspace(12, -6, 12)] + rng.normal(0, 0.5, 48)
+    near = np.r_[np.linspace(-6, 0.5, 36), np.linspace(0.5, 8, 12)] + np.random.default_rng(0).normal(0, 0.2, 48)
+    rng = np.random.default_rng(13)
+    interm = ((rng.random(60) < np.linspace(0.2, 0.6, 60)) * rng.integers(1, 20, 60)).astype(float)
+    cases = {"pnl": pd.Series(pnl, index=idx), "near": pd.Series(near, index=idx),
+             "interm": pd.Series(interm, index=pd.date_range("2020-01-01", periods=60, freq="MS"))}
+    reps = {nm: pipeline.run(s, name=nm, freq="M") for nm, s in cases.items()}
+    trend = np.asarray(reps["pnl"].analysis.decomposition.trend, dtype=float)
+    assert pct_change_undefined(trend[-13], trend[-1], reps["pnl"].analysis.series) == "sign_change"
+    trend = np.asarray(reps["near"].analysis.decomposition.trend, dtype=float)
+    assert pct_change_undefined(trend[-13], trend[-1], reps["near"].analysis.series) == "near_zero"
+    df = compare.rank_trends(reps).set_index("name")
+    for nm, r in reps.items():
+        assert r.analysis.metrics.recent_change_pct is None, nm
+        assert compare.recent_change_annualised(r) is None, nm
+        assert df.loc[nm, "recent_change_ann_pct"] is None or np.isnan(df.loc[nm, "recent_change_ann_pct"])
+        # the recent change no longer drives the score: what is left is outlook + momentum
+        o = r.outlook
+        z = (0.35 * np.tanh((compare.expected_change_annualised(r) or 0.0) / 50.0)
+             + 0.25 * (2 * o.prob_increase - 1))
+        if r.analysis.phase.label not in compare.NOISE_PHASES:
+            z += 0.20 * np.tanh(compare.momentum_per_month(r) / 2.0)
+        assert compare.rising_score(r) == pytest.approx(50 + 50 * z), nm
+    assert df.loc["near", "score"] < 95.0          # was 98.7-99.7 (tanh saturated by +1,000 %/yr)

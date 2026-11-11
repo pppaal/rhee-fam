@@ -4,7 +4,9 @@ Goal: an AI that understands a trend's **past** (history, structural breaks),
 its **present** (lifecycle phase, momentum) and predicts its **future**
 (forecast with uncertainty + interpretation), for *any* time series
 (search interest, page views, sales, prices, KPIs...). The user-facing text
-is Korean first (English for the narrative and the CLI chrome on request).
+is Korean first; on request (`lang='en'`, `--lang en`) the narrative, the
+terminal summary and the CLI's own messages are English. The HTML pages and
+the texts of `DataError` / `DataWarning` / `DataNotice` stay Korean.
 
 Runtime deps: `numpy`, `pandas` only. Optional: `anthropic` (Claude narrative /
 Q&A), `requests` / `pytrends` (online connectors), `openpyxl` / `xlrd` (Excel
@@ -46,11 +48,11 @@ in percent units (`12.5` = +12.5 %); slopes are per period in the series' units.
 
 | type | contents and semantics |
 |---|---|
-| `Decomposition` | `trend`, `seasonal`, `resid` (`series == trend + seasonal + resid` exactly, no NaNs, edges included) and `period` (1 = no seasonal component). The seasonal part is a periodic pattern summing to 0 per period only for an **additive** decomposition; a **multiplicative** (log-space) one has `seasonal = exp(t + s) − exp(t)`, which scales with the level (tell them apart with `analysis._is_multiplicative(dec)`). After a kept level shift the trend jumps there (piecewise decomposition). |
-| `Changepoint` | `date`, `index`, `slope_before`, `slope_after`, `kind` (one of `CHANGEPOINT_KINDS`: acceleration, deceleration, reversal_up, reversal_down, level_shift) and a unitless `magnitude >= 0`. |
-| `Anomaly` | `date`, `index`, `value`, `expected`, signed robust `zscore` (see `detect_anomalies`). |
-| `TrendMetrics` | descriptive past/present statistics; see the analysis section for the rules behind `total_change_pct`, `cagr_pct`, `recent_change_pct`, `momentum`, `volatility`, strengths, `mk_pvalue`, `peak_value` and `drawdown_pct`. |
-| `LifecyclePhase` | `label` (one of `PHASES`: emerging, growing, peaking, declining, stable, reviving, volatile), `confidence` in [0, 1], `reasons` (2–4 short Korean sentences), property `label_ko` (`PHASE_KO`). |
+| `Decomposition` | `trend`, `seasonal`, `resid` (`series == trend + seasonal + resid` exactly, no NaNs, edges included) and `period` (1 = no seasonal component). The seasonal part is a periodic pattern summing to 0 per period only for an **additive** decomposition. A **multiplicative** (log-space) one has `trend = k·exp(t)` (`k` = mean of `exp(s)` over one period, so the trend is the season-average level) and `seasonal = exp(t + s) − trend`, which scales with the level; `seasonal / trend` is periodic and averages 0 per period. Tell them apart with `analysis._is_multiplicative(dec)`. After a kept level shift the trend jumps there (piecewise decomposition). |
+| `Changepoint` | `date`, `index`, `slope_before`, `slope_after`, `kind` (one of `CHANGEPOINT_KINDS`: acceleration, deceleration, reversal_up, reversal_down, level_shift) and a unitless `magnitude >= 0`. Every surface names it with `analysis.changepoint_label(cp, lang)` (directed by the slopes, see the analysis section). |
+| `Anomaly` | `date`, `index`, `value`, `expected`, signed robust `zscore` (see `detect_anomalies`). For intermittent demand `expected` is the typical (median non-zero) demand size. |
+| `TrendMetrics` | descriptive past/present statistics; see the analysis section for the rules behind `total_change_pct`, `cagr_pct`, `recent_change_pct` (`None` when no meaningful percentage exists), `momentum`, `volatility`, strengths, `mk_pvalue`, `peak_value` and `drawdown_pct`. `drawdown_pct` is always a number: check `analysis.pct_change_undefined(m.peak_value, m.last_value, analysis.series)` before printing it as a percentage. |
+| `LifecyclePhase` | `label` (one of `PHASES`: emerging, growing, peaking, declining, stable, reviving, volatile), `confidence` in [0, 1], `reasons` (2–4 short Korean sentences), property `label_ko` (`PHASE_KO`). Below `analysis.MIN_PHASE_OBS` (8) observations the label is only a tentative placeholder (`narrative.phase_is_tentative`). |
 | `AnalysisResult` | `name`, the prepared `series`, `freq`, `season_length`, `decomposition`, `metrics`, `changepoints`, `anomalies`, `phase`. |
 | `ModelScore` | `name`, `mae`, `rmse`, `smape` (0..200 %), `mase` (scaled by the in-sample seasonal-naive MAE), `weight` (final ensemble weight, 0 if not used). |
 | `ForecastResult` | `mean`, `lower` / `upper` (`{level: series}`), `horizon`, `levels`, `model_scores`, `method`, `backtest_mase`, `nonnegative`, `skill`; `index` property and `to_frame()` (`mean, lo80, hi80, lo95, hi95`). |
@@ -83,18 +85,34 @@ in percent units (`12.5` = +12.5 %); slopes are per period in the series' units.
 * `expected_change_pct` compares the **future level** (mean of the forecast's
   last season, i.e. the last `min(m, horizon)` forecast means) with the
   **current level** (mean of the last observed season, the last `min(m, n)`
-  observations); partial-season windows are seasonally adjusted. It is not the
-  change of the horizon-end value. `None` when undefined (current level ~0,
-  sign change, at least half of the current window exactly 0, or a series with
-  negative values whose level is within 0.5 SD of 0).
+  observations). A partial-season window is seasonally adjusted only when the
+  seasonality matters (see `outlook_levels` below). It is not the change of
+  the horizon-end value. `None` when undefined, and
+  `forecast.outlook_levels(...).undefined` gives the reason:
+  * `'zero'`: the current level is about 0;
+  * `'mostly_zero'`: at least half of the current window is exactly 0;
+  * `'sign_change'`: the future level has the opposite sign;
+  * `'near_zero'`: a series with negative values whose current level is
+    within 0.5 SD of 0.
+
+  Intermittent demand whose current window is less than half zeros keeps a
+  percentage: the two levels are then average demand rates. A negative current
+  level far enough from 0 also keeps one, signed by the direction of the move
+  (`|current|` in the denominator: −25.9 → −34.2 is −32 %). The analysis'
+  own growth numbers refuse a negative base.
 * `prob_increase` — P(future level > current level) for **the same two
   levels** (sign-consistent with `expected_change_pct`); NOT P(horizon-end
   value > today's value).
 * `scenarios` — `{'pessimistic', 'base', 'optimistic'}` = lo80 / mean / hi80
-  **at the horizon end** (single values that carry that date's seasonal effect).
+  **at the horizon end** (single values that carry that date's seasonal
+  effect). For a `nonnegative` forecast a value at 0 is the floor of the band
+  and is printed as `0(하한)` / `0 (floor)` without a percentage
+  (`narrative.scenario_value`).
 * `direction` `'up' | 'down' | 'flat'`, `future_phase` (one of `PHASES`),
   `confidence` `'high' | 'medium' | 'low'` (from skill, sample size and the
-  relative 80 % band width), `forecast_peak_date` or `None`.
+  relative 80 % band width), `forecast_peak_date` or `None`. Every surface
+  that names the direction uses `narrative.direction_label(direction,
+  expected_change_pct, lang, undefined)`: `'flat'` reads `보합` or `방향 불확실`.
 
 ---
 
@@ -152,7 +170,12 @@ PANDAS_FREQ, FREQ_KO
   periods, >= 5 % merged duplicates) are emitted only when `prepare` infers
   the frequency itself, so clean regular input emits nothing.
 * Frequency inference uses the 25 % quantile of the spacing (gappy data keeps
-  its native frequency). There is no business-day code: weekday-only daily
+  its native frequency). `prepare` / `regularize` infer it from every dated
+  row, empty values included (`_infer_freq_with_gaps`), so a monthly table
+  with many empty cells stays monthly. The observed values keep their own,
+  coarser frequency when they fill at least 80 % of its periods
+  (`_OWN_GRID_COVERAGE`), e.g. Monday values in a daily calendar with a few
+  holiday weeks missing stay weekly. There is no business-day code: weekday-only daily
   data is interpolated over weekends (with a `DataWarning` suggesting
   `--freq W`), and sub-daily data is averaged to days.
 * Weekly series keep the weekday they were recorded on, and
@@ -184,7 +207,44 @@ def detect_anomalies(series, decomposition, threshold=3.5, breaks=None) -> list[
 def compute_metrics(series, freq, decomposition, anomalies=None) -> TrendMetrics
 def lifecycle_phase(series, freq, decomposition, metrics, changepoints) -> LifecyclePhase
 def analyze(series, freq=None, name=None) -> AnalysisResult
+def pct_change_undefined(base, new, values) -> str | None     # why a % change means nothing
+def changepoint_label(cp, lang="ko") -> str                    # '하락→상승 반전', 'growth slowing'
+CHANGEPOINT_LABEL_EN: dict[str, str]                           # every Korean label -> English
+MIN_PHASE_OBS = 8                                              # fewer: placeholder phase
 ```
+
+* `pct_change_undefined(base, new, values)` is the one percentage rule of the
+  analysis (`total_change_pct`, `recent_change_pct`, `cagr_pct`, the phase
+  reasons) and of every surface that prints such a number. It returns `None`
+  when `(new − base)/base·100` is meaningful, otherwise the reason:
+  * `'zero'`: `|base|` is at most 1 % of mean `|values|`, or a number is not
+    finite;
+  * `'negative'`: `base < 0`;
+  * `'sign_change'`: `new < 0 < base` (the level crossed zero: a P&L going from
+    10 to −10 is no "−200 %");
+  * `'near_zero'`: `values` contain negatives and `base` is below half their
+    standard deviation (an interval-scale series near its zero).
+
+  Non-negative series only ever get `'zero'` from their own numbers. Use it
+  before printing a drawdown:
+  `pct_change_undefined(m.peak_value, m.last_value, analysis.series)`. The
+  forecast has its own rule for the outlook (`forecast.outlook_levels`), which
+  keeps a percentage for a negative current level far from 0.
+* `changepoint_label(cp, lang)` names a break by its slopes; the phase
+  reasons, the narrative, the chart, the tables and the terminal all use it:
+  * acceleration: `성장 가속` (slope after >= 0) / `하락 가속` (growth
+    accelerating / decline accelerating);
+  * deceleration: `성장 둔화` (slope before > 0) / `하락세 둔화` (growth
+    slowing / decline easing);
+  * reversal_up: `하락→상승 반전` when the slope before is below −10 % of the
+    larger absolute slope, else `횡보→상승 전환` (reversal from decline to
+    growth / turn from flat to growth); reversal_down likewise (`상승→하락 반전`
+    / `횡보→하락 전환`);
+  * level_shift: `수준 변화` (level shift);
+  * missing slopes: `가속`, `감속`, `상승 반전`, `하락 반전`; an unknown kind:
+    `추세 변화` (trend change).
+
+  `CHANGEPOINT_LABEL_EN` maps every Korean label above to its English one.
 
 * `analyze` calls `data.prepare` first (raw input is fine), decomposes,
   finds changepoints on the deseasonalised series (`trend + resid`), and, if
@@ -205,11 +265,16 @@ def analyze(series, freq=None, name=None) -> AnalysisResult
   there are no NaNs. No seasonal component if `period <= 1` or fewer than two
   full periods (`Decomposition.period == 1`).
   * **Multiplicative mode**: a strictly positive series with >= 3 full periods
-    whose seasonal swing scales with the level (regression of the additive
-    residual on `seasonal × (trend − mean)/mean`: slope >= 0.35 with t >= 3.5,
-    trend max/min >= 1.25, and a smaller remainder than the additive fit) is
-    decomposed in log space: `trend = exp(t)`, `seasonal = exp(t+s) − exp(t)`,
-    `resid = y − trend − seasonal`.
+    whose seasonal swing scales with the level is decomposed in log space
+    (`_prefer_multiplicative`). The test regresses the additive residual on
+    `seasonal × (trend − mean)/mean` and needs a slope `beta > 0` with
+    t >= 3.5 and a trend max/min >= 1.25. With `beta >= 0.35` the log fit's
+    remainder must be smaller than the additive one; with `0 < beta < 0.35`
+    (typical of weekly data with few cycles) it must be below 0.75 × the
+    additive sum of squares (`_MULT_WEAK_SS`). The components are
+    `trend = k·exp(t)` with `k` = mean of `exp(s)` over one period (the
+    season-average level, not the geometric mean),
+    `seasonal = exp(t+s) − trend` and `resid = y − trend − seasonal`.
   * Non-negative series keep a trend >= 0; within half a window of each end
     it is also floored at the lowest deseasonalised value of the edge window.
   * `breaks`: positions where the level may jump; the trend is fitted
@@ -249,8 +314,11 @@ def analyze(series, freq=None, name=None) -> AnalysisResult
 * `compute_metrics` (field docs in `types.TrendMetrics`):
   * growth numbers use the trend: `total_change_pct` first → last,
     `recent_change_pct` over the last `season_length` periods (1 for yearly),
-    `cagr_pct` needs a span >= 0.95 years; `None` when the base is <= 0 or
-    below 1 % of the mean absolute level, and for intermittent demand;
+    `cagr_pct` needs a span >= 0.95 years. They are `None` when
+    `pct_change_undefined` gives a reason (base <= 0 or below 1 % of the mean
+    absolute level, a trend that crossed zero, a base below 0.5 SD for data
+    with negative values) and for intermittent demand. Non-negative series
+    are unaffected by the zero-crossing and SD rules;
   * `momentum` = recent OLS trend slope (last `max(3, min(season_length,
     n//4))` periods) minus the Theil–Sen `slope`, in % of the *recent* trend
     level per period; `acceleration` = change of the recent slope between
@@ -263,16 +331,38 @@ def analyze(series, freq=None, name=None) -> AnalysisResult
     `detect_anomalies` — only from 16 observations on and never at the first
     or last observation; `anomalies` passes the already detected ones
     (`analyze` does, so peak/drawdown exclude exactly the reported spikes).
+    `drawdown_pct` is always a number, even for a series that crossed zero
+    (peak 10, last −8 reads −180 %): the narrative, the report and the
+    payload test it with `pct_change_undefined` and then give the gap in
+    units instead.
 * `lifecycle_phase`: explainable rules over the trend's shape (position and
   size of the peak, drawdown, rebound from the trough, recent slope vs. the
   best past slope, growth multiple over the base) plus significance
   (t-statistic of the recent slope, dependence-corrected Mann–Kendall).
   "Recent" = the last ~15 % of the observations. It can return `'stable'`
   after a level shift followed by a flat stretch, and confidence drops for
-  random-walk-like series. Reasons are Korean with numbers (U+2212 minus,
-  `p < 0.001`); dates before a particle use `2016년에` for yearly data and
-  bracketed dates stay bare (`고점(2016)`); at >= 99.5 % of the trend peak the
-  reason reads `현재 추세는 고점(YYYY-MM) 수준입니다.`
+  random-walk-like series. With fewer than `MIN_PHASE_OBS` (8) observations
+  there is no lifecycle verdict: the label (`'stable'` or `'volatile'`) only
+  says whether noise dominates, and the first reason reads `관측치가 N개뿐이라
+  국면을 판단하기에 데이터가 부족합니다.` The growth multiple behind
+  `'emerging'` needs a base of at least the percentage floor (0.5 SD for data
+  with negative values).
+* Phase reasons are Korean with numbers (U+2212 minus, `p < 0.001`, numbers
+  formatted like `narrative.format_number`, ×10ⁿ from 1e12). Dates before a
+  particle use `2016년에` for yearly data and bracketed dates stay bare
+  (`고점(2016)`). Some templates:
+  * at >= 99.5 % of the trend peak: `현재 추세는 고점(YYYY-MM) 수준입니다.`;
+  * a trend that crossed zero: `추세는 고점(YYYY-MM, X) 이후 0 아래로 내려가
+    현재 Y입니다.`;
+  * no recent percentage: `최근 18개월 동안 추세 기울기는 −0.69/월입니다.`
+    (per-period unit);
+  * a pace ratio above 20 (`_PACE_CAP`): `최근 상승 속도가 전체 기간 평균
+    속도(추세선 처음→끝)의 20배를 넘습니다.`;
+  * a recent break: `…에 구조 변화(하락→상승 반전)가 감지되었습니다.`
+    (`changepoint_label`);
+  * after a level shift: `그 이후 N개월 동안은 …` counts the periods after the
+    break.
+
   `narrative.translate_reason` must know every template.
 * Tests require the archetypes of `samples.EXPECTED_PHASE` to be classified
   correctly for >= 4 of 5 seeds (monthly n=120) and >= 3 of 5 (weekly n=156,
@@ -400,11 +490,17 @@ def norm_cdf(x); norm_ppf(p); t_cdf(x, df); t_ppf(p, df)
    floored so the 95 % band spans every ensemble member (member-disagreement
    floor); made non-decreasing in `k`. With `nonnegative` (default: all
    observations >= 0) bands are centred on the clipped mean, then clipped.
+   An all-zero history (the capped last `max(400, 8·m)` points) has no scale
+   and gets zero-width bands; any other constant keeps a tiny, level-relative
+   band.
 8. **Skill** — see `ForecastResult.skill`; errors below 1e-9 of the mean level
    count as exact (both exact: 1.0).
 9. **Fallback** — fewer than ~8 points (no 2-window backtest) or every
-   candidate failing: equal-weight drift + naive (naive alone for n < 3),
-   wide heuristic intervals, `model_scores == []`, `skill = None`,
+   candidate failing: equal-weight drift + naive only when the series has a
+   significant linear trend (`_significant_trend`: OLS slope, two-sided 5 %
+   t-test on n − 2 dof; an exact line counts), otherwise naive alone with
+   method `fallback(naive) [<reason>; no significant trend]`; naive alone for
+   n < 3. Wide heuristic intervals, `model_scores == []`, `skill = None`,
    `backtest_mase = None`.
 
 The public `backtest()` weights windows equally and scores raw forecasts
@@ -420,11 +516,26 @@ The public `backtest()` weights windows equally and scores raw forecasts
   share of the seasonal pattern the forecast contains; for a multiplicative
   decomposition the continued seasonal component keeps the seasonal *ratio*
   applied to the forecast level (`_future_seasonal(analysis, h, forecast_mean)`).
-  With whole-season windows (default horizons for D/M/Q/Y) the levels are
-  plain means. `outlook_levels` returns exactly these levels and
-  `undefined` (`'zero'`, `'mostly_zero'`, `'sign_change'`, `'near_zero'`).
+  The adjustment (and `adj_cur` / `adj_fut = True`) needs all of:
+  * a partial-season window;
+  * `metrics.seasonal_strength >= 0.2` or unknown (`_ADJ_MIN_STRENGTH`,
+    `_seasonality_matters`);
+  * a removed effect of at least 0.5 % of the window's mean `|level|`
+    (`_ADJ_MIN_SHARE`, `_material`).
+
+  Otherwise, and with whole-season windows (default horizons for D/M/Q/Y),
+  the levels are plain means.
+* `outlook_levels(analysis, forecast) -> OutlookLevels(current, future, k_cur,
+  k_fut, period, adj_cur, adj_fut, undefined)` returns exactly these levels
+  (`period` is `None` without a usable seasonal component) and `undefined` in
+  `{None, 'zero', 'mostly_zero', 'sign_change', 'near_zero'}`
+  (`_pct_undefined`). It is the single source for `compute_outlook`, the
+  narrative, the payload, the report, the CLI ranking note and the JSON export.
 * `expected_change_pct = (future − current)/|current| × 100`, `None` when
-  `undefined` is set.
+  `undefined` is set. For intermittent demand the levels are average demand
+  rates (zeros included), and the percentage is given unless at least half of
+  the current window is zero (`'mostly_zero'`); the analysis' trend-based
+  percentages are `None` for all intermittent demand.
 * `prob_increase = Φ((future − current)/σ_H)` with σ_H from the 80 % band at
   the horizon end (wider side if a bound was clipped). σ_H is the uncertainty
   of one end value, so the probability is conservative. It may be exactly 0
@@ -458,30 +569,59 @@ def llm_narrative(analysis, forecast, outlook, lang="ko", model=DEFAULT_MODEL, c
 def generate_narrative(analysis, forecast, outlook, use_llm=False, lang="ko",
                        model=DEFAULT_MODEL, client=None) -> tuple[str, str]   # (text, 'llm'|'rule')
 def ask(report, question, lang="ko", model=DEFAULT_MODEL, client=None) -> str
-def format_number(x, decimals=None, lang="ko", signed=False) -> str
+def format_number(x, decimals=None, lang="ko", signed=False, scale=None) -> str
 def format_pct(x, lang="ko", decimals=1, signed=True) -> str
 def format_prob(p, lang="ko") -> str
 def format_date(ts, freq, lang="ko") -> str        # D/W 2024-03-05, M 2024-03, Q 2024-Q1, Y 2024
 def period_unit(freq, lang="ko") -> str            # /월 /주 /일 /분기 /년 (/mo ... in English)
 def translate_reason(reason) -> str | None
-def direction_label(direction, expected_change_pct=None, lang="ko") -> str
+def direction_label(direction, expected_change_pct=None, lang="ko", undefined=None) -> str
 def model_label(name, lang="ko") -> str;  describe_method(forecast, lang="ko") -> str
+def scenario_value(value, reference=None, nonnegative=False, lang="ko") -> tuple[str, float | None]
+def format_scenario(value, reference=None, nonnegative=False, lang="ko") -> str   # '12.3 (+4.5%)'
+def is_intermittent(analysis) -> bool;  phase_is_tentative(analysis) -> bool
+changepoint_label                                   # re-exported from analysis
+PHASE_EN                                            # English phase names
 ```
 
+* Imports: `analysis` at module level (`CHANGEPOINT_LABEL_EN`,
+  `MIN_PHASE_OBS`, `changepoint_label`, `pct_change_undefined`,
+  `_is_intermittent`); `forecast.outlook_levels` and
+  `forecast.is_random_walk` lazily. `analysis` imports only `data` and
+  `types`, so there is no cycle.
 * **Format**: Markdown-lite — `## ` headings, `- ` bullets, sub-items of a
   line ending in `:` nested with a two-space indent (`  - `), `**bold**`.
   A bottom line (`**한눈에 보기** — …`) is followed by four sections:
   과거 / 현재 / 미래 전망 / 주의할 점 (Past / Present / Outlook / Caveats).
   Numbers use thousands separators and the U+2212 minus; Korean prose writes
   yearly dates as `2024년` while `format_date` and the payload keep `2024`.
+* `format_number`: magnitudes below 1e-4 or from 1e12 up use `1.05×10⁻⁹` /
+  `1.87×10¹³` notation (no 13-digit integers, no `e+06`). `scale` is the
+  largest magnitude printed next to the number: from 1e12 up, numbers of
+  1,000 or more next to it switch to ×10ⁿ as well (`4.61×10¹¹ → 1.51×10¹⁵`).
 * `format_prob`: whole percent, `>99%` for p >= 0.995 and `<1%` for p <= 0.005
   (exact 1 and 0 included), `해당 없음` / `n/a` for None/NaN. The report, the
   terminal summary and the CLI ranking print the same text.
 * `direction_label`: `'flat'` reads `보합` when `|expected_change_pct| < 2 %`
-  (or no percentage) and `방향 불확실` / `direction uncertain` otherwise.
+  and `방향 불확실` / `direction uncertain` otherwise. With no percentage it
+  reads `보합`, except with `undefined == 'sign_change'`
+  (`forecast.outlook_levels(...).undefined`, a level expected to cross zero):
+  `방향 불확실`. Calls without `undefined` behave as before.
+* `scenario_value` / `format_scenario`: a scenario or interval bound at or
+  below 0 of a `nonnegative` forecast is `0(하한)` / `0 (floor)` without a
+  percentage; otherwise `format_number(value)` and the percentage
+  `(value − reference)/|reference|·100` (none without a reference or for a
+  reference of 0); `해당 없음` / `n/a` for None/NaN.
+* `is_intermittent(analysis)`: `analysis._is_intermittent` on the series (the
+  rule of the analysis and the forecast). `phase_is_tentative(analysis)`:
+  fewer than `analysis.MIN_PHASE_OBS` observations.
 * `translate_reason`: English for one Korean phase reason (input returned
   unchanged if it has no Hangul, `None` if no template matches; untranslated
-  reasons are dropped from English text).
+  reasons are dropped from English text). It knows the old and the new
+  templates.
+* The outlook levels come from `forecast.outlook_levels` (`_outlook_windows`
+  wraps it), so the narrative and the payload print exactly the levels behind
+  `expected_change_pct` and `prob_increase`.
 * **Outlook section order**: expected change (with the two compared windows;
   partial-season adjustment named) → probability (same two levels named) →
   horizon-end scenarios (80 % band, flagged as a different quantity that
@@ -489,32 +629,69 @@ def model_label(name, lang="ko") -> str;  describe_method(forecast, lang="ko") -
   confidence → `정확도:` / `Accuracy:` bullet from `ForecastResult.skill`
   (MASE only as a technical note; "did not beat naive" only when skill > 1) →
   method in plain words. With `expected_change_pct = None` no percentage is
-  stated (scenario percentages omitted too).
-* Past/present details: peak "(일회성 급등 제외)" when a flagged spike was left
-  out; after a level shift followed by a flat stretch (phase stable/volatile
-  while the whole-period trend test and CAGR still count the step) a caveat
-  says the rise/fall came from a one-off step, not a steady trend; momentum
-  differences inside the noise are called noise-level.
+  stated (scenario percentages omitted too); the first line gives the reason
+  in words (a level expected to cross zero, a level near 0 relative to the
+  spread, mostly zeros, a level about 0) and names both levels.
+  * Scenarios at the 0 floor read `0(하한)` with one floor note; the caveats
+    section then drops its own floor line.
+  * Projected phase: a moving phase (emerging, growing, peaking, declining,
+    reviving) that a `'flat'` outlook only kept is "hard to judge"; a phase
+    change from a low-confidence forecast is only what the forecast would
+    imply; a tentative phase is called tentative.
+* Past/present details:
+  * peak "(일회성 급등 제외)" when a flagged spike was left out;
+  * no percentage where `pct_change_undefined` refuses one: the reason gets its
+    own wording and a zero-crossing change or drawdown is given in units
+    (`최근 값(−9.40)은 고점보다 21.0 낮습니다`); `_trend_drawdown` is `None` for a
+    trend that crossed zero;
+  * changepoint lines use `changepoint_label`;
+  * a tentative phase (too few observations) is presented as such in the
+    summary, present, momentum, projection and caveats lines;
+  * a Mann–Kendall direction that contradicts the trend's endpoints is
+    qualified, and the momentum phrase follows it; random-walk-like series get
+    their own trend-strength wording;
+  * after a level shift followed by a flat stretch (phase stable/volatile
+    while the whole-period trend test and CAGR still count the step) a caveat
+    says the rise/fall came from a one-off step, not a steady trend;
+  * momentum differences inside the noise are called noise-level.
 * `build_llm_payload`: JSON-serialisable facts — `series`, `conventions`
   (units; `skill`; `mase` "do not compare with 1"; `probabilities` pointing to
-  `prob_increase_basis`; intermittent and seasonal-strength notes), a history
-  downsampled to ~60 points (recent detail kept) with a note, trend ends,
-  `current_level`, `metrics`, `phase`, `changepoints`, `anomalies`,
-  `forecast` (method + plain-language description, `backtest_mase`, `skill`,
-  table of at most 36 rows), `model_leaderboard`, and `outlook` with
-  `expected_change_pct`, `expected_change_basis` (also explains a null),
-  `compared_levels {current, future}`, `prob_increase`,
-  `prob_increase_basis`, `scenarios_at_horizon_end`, `forecast_peak_date`,
-  `future_phase`, `confidence`.
+  `prob_increase_basis`; intermittent and seasonal-strength notes;
+  `pct_undefined`), a history downsampled to ~60 points (recent detail kept)
+  with a note, trend ends, `current_level`, `metrics`, `phase`,
+  `changepoints`, `anomalies`, `forecast` (method + plain-language
+  description, `backtest_mase`, `skill`, table of at most 36 rows),
+  `model_leaderboard`, and `outlook`. Notable fields:
+  * `metrics.pct_undefined`: why a percentage metric is null, e.g.
+    `{'total_change_pct': 'sign_change', 'drawdown_pct': 'sign_change'}`;
+    `metrics.drawdown_pct` is null when `pct_change_undefined(peak, last)` is
+    not `None`;
+  * `phase.confidence_text` (`format_prob` text) and `phase.tentative`;
+  * `changepoints[].label` (English) and `changepoints[].label_ko`;
+  * `outlook`: `direction_label {ko, en}`, `expected_change_pct`,
+    `expected_change_basis` (also explains a null, including `sign_change`
+    and `near_zero`), `expected_change_undefined` (`None | 'zero' |
+    'mostly_zero' | 'sign_change' | 'near_zero'`), `compared_levels {current,
+    future}`, `prob_increase`, `prob_increase_text`, `prob_increase_basis`,
+    `scenarios_at_horizon_end`, `forecast_peak_date`, `future_phase`,
+    `future_phase_basis` (text or `None`), `confidence`;
+  * numbers are rounded so that they print as the surfaces print them
+    (`prob_increase`, `phase.confidence`, the strengths, `mk_tau`, momentum,
+    `slope_pct`, `volatility_cv`, the % changes).
 * `SYSTEM_PROMPT` tells the model to use only the JSON facts (outside
   explanations at most as labelled hypotheses), quantify, state no
-  percentage when `expected_change_pct` is null, describe `prob_increase` as
-  the chance that the future level exceeds the current one (never as
-  P(horizon-end value > now)), say that the scenarios are a different
-  quantity, use `direction_label`, name models in plain words, judge accuracy
-  by `skill` and never read MASE against 1, write `>99%` / `<1%` instead of
-  certainties, and follow the four-section Markdown-lite format (nested
-  `  - ` bullets allowed); questions are answered directly first.
+  percentage when `expected_change_pct` or a percentage metric is null (for
+  `sign_change` say that the level crosses zero and give both levels), write
+  a 0 bound of a nonnegative forecast as "0 (floor)" without a percentage,
+  describe `prob_increase` as the chance that the future level exceeds the
+  current one (never as P(horizon-end value > now)), say that the scenarios
+  are a different quantity, use `direction_label`, follow
+  `future_phase_basis`, present a tentative phase as tentative, quote
+  `prob_increase_text` and `confidence_text` verbatim, name models in plain
+  words, judge accuracy by `skill` and never read MASE against 1, write
+  `>99%` / `<1%` instead of certainties, and follow the four-section
+  Markdown-lite format (nested `  - ` bullets allowed); questions are
+  answered directly first.
 * **Claude call** (`anthropic` SDK imported lazily):
   `client.beta.messages.create(model=..., max_tokens=16000,
   betas=["server-side-fallback-2026-07-01"], fallbacks="default",
@@ -527,7 +704,9 @@ def model_label(name, lang="ko") -> str;  describe_method(forecast, lang="ko") -
   most-specific-first (`AuthenticationError`, `PermissionDeniedError`,
   `RateLimitError`, `APIStatusError`, `APIConnectionError`, `AnthropicError`,
   plus `TypeError` for missing credentials / an SDK too old for the
-  parameters) and raised as `NarrativeUnavailable` with a Korean message.
+  parameters) and raised as `NarrativeUnavailable` with a message in the
+  request language (English for `lang='en'`, Korean otherwise); the
+  truncation and fallback `RuntimeWarning`s follow the language too.
   `generate_narrative(use_llm=True)` falls back to the rule-based text with a
   `RuntimeWarning` (source `'rule'`). Tests mock the client — no network.
 
@@ -552,10 +731,11 @@ Generic User-Agent, no personal data, 20 s timeout; every failure is a
 ```python
 def sparkline(values, width=None) -> str
 def svg_chart(report, width=960, height=380) -> str
-def render_text(report, width=78) -> str
+def render_text(report, width=78, lang="ko") -> str      # 'en': English summary; else Korean
 def render_html(report, path=None) -> str
 def render_compare_html(reports, ranking, path=None, links=None) -> str
-CHANGEPOINT_KO, DIRECTION_KO, CONFIDENCE_KO, PERIOD_KO, UNIT_KO (Y = '연'), MODEL_KO, PHASE_COLOR ...
+CHANGEPOINT_KO, DIRECTION_KO, DIRECTION_ARROW, CONFIDENCE_KO, PERIOD_KO, UNIT_KO (Y = '연'),
+MODEL_KO, PHASE_COLOR, KIND_COLOR ...
 ```
 
 * Pure functions (byte-identical output for the same report). HTML pages are
@@ -563,27 +743,64 @@ CHANGEPOINT_KO, DIRECTION_KO, CONFIDENCE_KO, PERIOD_KO, UNIT_KO (Y = '연'), MOD
   Fonts link is optional), light/dark themes via CSS custom properties,
   responsive (the chart is embedded in wide/mid/narrow renditions chosen by
   media queries; CSS-only hover read-out). Every user string is HTML-escaped
-  (the terminal summary neutralises `<`/`>` and control characters). The page
-  and the terminal summary are **Korean only** (`<html lang="ko">`); an English
-  narrative is shown as is, and the diagnosis card recognises reasons quoted
-  in translation (`narrative.translate_reason`).
-* `render_html` page: header (name, phase badge, range, frequency, horizon),
-  KPI tiles (현재 값, 전체 변화, 연평균 성장률 CAGR, 최근 변화, 예측 변화,
-  상승 확률), chart, "AI 트렌드 해석" (the narrative), "미래 전망" card,
-  "현재 진단", "과거의 사건" (numbered changepoints, anomalies), "모델 리더보드"
-  (with a `단순 대비` column: MAE / min MAE of the benchmark rows − 1, `—`
-  without them), "예측 표", "분석 방법".
+  (the terminal summary neutralises `<`/`>` and control characters). The HTML
+  pages are **Korean only** (`<html lang="ko">`); an English narrative is
+  shown as is, and the diagnosis card recognises reasons quoted in
+  translation (`narrative.translate_reason`). `render_text(lang='en')` is an
+  English terminal summary with no Hangul apart from the data itself (e.g.
+  the series name).
+* One vocabulary with the narrative: `MODEL_KO` **is** `narrative.MODEL_KO`
+  (`@log` ids read `…(로그 공간)` via `narrative.model_label`); direction words
+  come from `narrative.direction_label` (with `outlook_levels(...).undefined`),
+  changepoint labels from `analysis.changepoint_label` (colour by label,
+  `_CP_COLOR`), the method from `narrative.describe_method`, scenario floors
+  from `narrative.scenario_value`, phase names from `PHASE_KO` /
+  `narrative.PHASE_EN`, a tentative phase from `narrative.phase_is_tentative`
+  (badge `잠정`) and intermittent demand from `narrative.is_intermittent` (or an
+  `sba` / `croston` leaderboard row). The outlook levels and their `undefined`
+  reason come from `forecast.outlook_levels` (imported lazily, computed once
+  per render and cached on `_ChartData.levels`).
+* Numbers: `_fmt_num(x)` with automatic decimals **is**
+  `narrative.format_number(x, signed=…)`. `_sci`, `_fmt_short`, `_axis_labels`
+  and `_fmt_axis_value` use the narrative's ×10ⁿ notation from 1e12 and below
+  1e-4 (`_fmt_short` abbreviates 1e6–1e12 as `M` / `B`; no `T` and no
+  e-notation labels). `_fmt_prob` returns exactly `narrative.format_prob(p)`
+  (`—` for None/NaN).
+* A `—` is never left unexplained: a growth rate that is `None` carries its
+  reason (`0을 지나 음수로 바뀌어 변화율 없음`, `간헐 수요라 계산하지 않음`,
+  `기간이 1년 미만이라 연 환산하지 않음`, …; `_metric_undefined` / `_pct_why`), and
+  an expected change without a percentage gives the reason and both levels
+  (`_change_undefined`).
+* `render_html` page: header (name, phase badge, range, frequency, horizon;
+  the subtitle names the method kind: `단일 모델 예측`, `N개 모델 앙상블 예측` or
+  `백테스트 없이 만든 기본 예측`), KPI tiles (현재 값, 전체 변화, 연평균 성장률
+  CAGR, 최근 변화, 예측 변화, 상승 확률), chart, "AI 트렌드 해석" (the
+  narrative), "미래 전망" card, "현재 진단", "과거의 사건" (numbered
+  changepoints, anomalies; for intermittent demand the `expected` column reads
+  `평소 규모`), "모델 리더보드" (with a `단순 대비` column: error / smallest
+  error of the benchmark rows − 1, in MAE, or RMSE for intermittent demand,
+  with a note when there are no benchmark rows; the final method in words),
+  "예측 표", "분석 방법".
 * KPI "현재 값" peak phrase: with `seasonal_strength >= 0.5` (and a seasonal
   decomposition) the **trend** drawdown is shown (`추세 고점 대비 X%`) when it
   differs from the raw drawdown by >= 5 points — the same rule as the
   narrative; otherwise the observed drawdown, with `(일회성 급등 제외)` when a
-  flagged spike was left out of the peak.
+  flagged spike was left out of the peak. A drawdown that is no percentage
+  (`pct_change_undefined`, e.g. a series that crossed zero) is given in units
+  (`최고점보다 18.2 낮음`); intermittent demand names its largest demand.
+* KPI "예측 변화": a `'flat'` outlook gets a neutral value (no arrow or colour)
+  and, for `방향 불확실`, that word; without a percentage the tile shows the
+  reason and the two levels.
 * "미래 전망" card: change and 상승 확률 both described as the future window
-  average vs. the current window average; the scenario bar compares the
+  average vs. the current window average (prefix `계절 보정한` and a note when
+  `outlook_levels` adjusted a window); the scenario values read `0(하한)` at
+  the floor, with the narrative's floor note; the scenario bar compares the
   horizon-end scenarios with the observation at the same point of the seasonal
   cycle when `seasonal_strength >= 0.3`, else with the latest value
-  (`_scenario_ref`; labelled).
-* `_fmt_prob` returns exactly `narrative.format_prob(p)` (`—` for None/NaN).
+  (`_scenario_ref`; labelled). "미래 단계" is hedged by the narrative's rule
+  (`_future_phase_hedge`, mirroring `narrative._phase_projection`): `판단 보류`
+  for a moving phase only kept by a `'flat'` outlook, `신뢰도 낮아 참고용` for a
+  phase change under low confidence, `관측치가 적어 잠정` for a tentative phase.
 * Narrative rendering (`_markdown_lite`) accepts a superset of the narrative
   format: `#`–`######` headings, `-`/`*`/`•`/`+` bullets and `1.`/`1)` ordered
   lists, nesting by indentation (2+ spaces deeper; tab = 4), continuation
@@ -595,19 +812,29 @@ CHANGEPOINT_KO, DIRECTION_KO, CONFIDENCE_KO, PERIOD_KO, UNIT_KO (Y = '연'), MOD
   nice ticks, legend. **Anomaly-aware y-range**: flagged anomalies are left
   out of the value range when they more than double it and are drawn as edge
   triangles with their values; the last observation always stays; the compare
-  page's mini charts use the same range. Changepoint labels are
-  direction-aware (`성장 가속`, `하락 가속`, `성장 둔화`, `하락세 둔화`).
-* `render_text`: name, phase, key metrics, a sparkline of history │ forecast,
-  `예측 변화 X% (<future window>, <current window> 대비)`, 상승 확률 (same basis),
-  confidence, horizon-end scenarios with their reference, projected phase,
-  method, an `정확도:` line (skill-based, MASE last) and the top models.
+  page's mini charts use the same range. Changepoint labels and colours come
+  from `analysis.changepoint_label` (`성장 가속`, `하락세 둔화`,
+  `하락→상승 반전`, `횡보→상승 전환`, …).
+* `render_text`: name, phase (`잠정` / `tentative` when tentative), key metrics
+  with a `※` line for every unexplained `—`, a sparkline of history │
+  forecast, `예측 변화 X% (<future window>, <current window> 대비)` (or the
+  reason and the two levels), 상승 확률 (same basis), confidence, horizon-end
+  scenarios (`0(하한)` at the floor) with their reference, the projected phase
+  hedged like the page, changepoints, the method in words, an `정확도:` line
+  (skill-based, MASE last) and the top models (by RMSE for intermittent
+  demand).
 * `render_compare_html`: ranking table + small-multiple cards in ranking order
   (reports missing from `ranking` appended). Changes are shown as reported,
   each **with its span always visible** — in the column header when every row
   shares it, otherwise next to each value (no annualised values; the score is
-  unchanged). `links` (series name → href) turns card titles and ranking names
-  into links; only relative and `http(s)` hrefs are used (others such as
-  `javascript:` / `data:` are ignored), percent-encoded and HTML-escaped.
+  unchanged). A `'flat'` outlook's expected change is neutral with its word
+  (`보합` / `방향 불확실`) as a note; a missing one carries its reason. The
+  rising score is described as the outlook (expected change, P(up)) plus the
+  recent momentum (recent change, momentum). Card stats share label / value /
+  note rows through a CSS subgrid. `links` (series name → href) turns card
+  titles and ranking names into links; only relative and `http(s)` hrefs are
+  used (others such as `javascript:` / `data:` are ignored), percent-encoded
+  and HTML-escaped.
 
 ## compare.py — ranking
 
@@ -636,7 +863,18 @@ shorter); `momentum_pm` converts momentum to % per month; `P(up)` is
 `prob_increase` as is. In `'stable'` / `'volatile'` phases the recent-change
 and momentum terms are dropped (the outlook alone decides). Growth is capped
 at +10,000 %/yr; for monthly data with a 12-month horizon the annualised
-values equal the raw ones.
+values equal the raw ones. The score blends the outlook with the recent
+momentum, so it is not an expected rise by itself (the CLI and the compare
+page call it "전망 + 최근 기세").
+
+`recent_change_annualised` is `None` (the term then contributes nothing, and
+the table never shows `—` next to a score driven by it) when
+`metrics.recent_change_pct` is `None`, when the series is intermittent demand
+(`analysis._is_intermittent`), or when
+`analysis.pct_change_undefined(trend[-1-k], trend[-1], series)` gives a
+reason (a P&L that fell through zero is no "−100 %"). `compare` imports
+`analysis` at module level (no cycle: `analysis` imports only `data` and
+`types`).
 
 ## pipeline.py — glue
 
@@ -650,12 +888,26 @@ MAX_HORIZON = 10_000
 ```
 
 `run`: prepare → analyze → auto_forecast (of `analysis.series`, with
-`random_walk=is_random_walk(analysis)`) → compute_outlook → generate_narrative. `DataError` for a non-integer or `< 1` horizon, a horizon
-above `MAX_HORIZON` or forecast dates beyond pandas' range; `DataWarning` when
-the horizon exceeds 5× the history. `run_many` skips failing series with a
-`SeriesFailedWarning` (and fills `errors` if given). JSON exports contain
-history, trend, metrics, phase, changepoints, anomalies, forecast (incl.
-`skill`, model scores, table), outlook and narrative; NaN/inf become `null`.
+`random_walk=is_random_walk(analysis)`) → compute_outlook →
+generate_narrative. The default horizon (`data.default_horizon(freq)`) is
+resolved before the horizon checks, so it gets the same checks and warnings
+as an explicit one. `DataError` for a horizon that is not a whole number
+>= 1 (`inf` and `nan` included), a horizon above `MAX_HORIZON` or forecast
+dates beyond pandas' range; `DataWarning` when the horizon (default included)
+exceeds 5× the history. `run_many` skips failing series with a
+`SeriesFailedWarning` (and fills `errors` if given).
+
+JSON exports (`report_to_dict` / `report_to_json`) contain history, trend,
+metrics, phase, changepoints, anomalies, forecast (incl. `skill`, model
+scores, table), outlook and narrative. `outlook` holds the `Outlook` fields
+plus `direction_label {ko, en}` (the word every human surface shows),
+`expected_change_undefined` (why `expected_change_pct` is `None`) and
+`compared_levels {current, future}` (from `forecast.outlook_levels`; `None`
+for hand-made reports it cannot handle). Floats keep 15 significant digits
+(`_JSON_DIGITS`), NaN/inf become `null`, and dates are written as
+`YYYY-MM-DD` without `strftime` (`_date_str`), so years after 9999 work.
+`pipeline` imports `narrative.direction_label` and `forecast.outlook_levels`
+at module level.
 
 ## cli.py — command line
 
@@ -674,15 +926,23 @@ a note) and answers with Claude (exit 1 if Claude is unavailable).
 * One series: summary + narrative, one HTML report. Several: summaries and a
   ranking (`_format_ranking(df, lang, horizons)`: raw `expected_change_pct`
   with its horizon — in the header when shared, otherwise a `기간` column —
-  then 상승확률 and 점수, plus one note line defining 예측 변화 / 상승확률 as
-  "last forecast cycle mean vs. last observed cycle mean", and a note when
-  frequencies are mixed); `--html out.html` writes the compare page (with
-  `links=`) and `out_<slug>.html` per series. `--json` (written before the
-  HTML) is an object for one series and an array for several.
-* `--lang` changes the narrative and the CLI's own messages; the terminal
-  summary and the HTML pages stay Korean.
+  then 상승확률 and 점수 (title: "상승 점수: 전망 + 최근 기세, 50=중립"), plus
+  one note line from `_rank_basis(reports, lang)` that says which two levels
+  예측 변화 / 상승확률 compare: the mean of the forecast's last season vs. the
+  mean of the last observed season, adding "the whole horizon, seasonally
+  adjusted" only when some horizon is shorter than its season and the yearly
+  rule (last forecast value vs. latest value) only when yearly series are
+  ranked; and a note when frequencies are mixed). `--html out.html` writes
+  the compare page (with `links=`) and `out_<slug>.html` per series.
+  `--json` (written before the HTML) is an object for one series and an
+  array for several.
+* `--lang` changes the narrative, the terminal summary
+  (`render_text(report, lang=…)`, via `_print_report(report, quiet, lang)`)
+  and the CLI's own messages (`_MSG`). The HTML pages stay Korean, and so do
+  the texts of `DataError` / `DataWarning` / `DataNotice`.
 * Warnings are printed once each to stderr as `안내:` (`DataNotice`) or
-  `경고:` (other warnings); numpy floating-point notes are hidden.
+  `경고:` (other warnings), whatever `--lang` says; numpy floating-point notes
+  are hidden.
 * Exit codes: `0` success (also when stdout is a closed pipe), `1` runtime
   failure (network/connector, Claude, file save, unexpected error; set
   `TRENDAI_DEBUG=1` for the traceback), `2` input error (`DataError`, missing
@@ -694,28 +954,42 @@ a note) and answers with Claude (exit 1 if Claude is unavailable).
 These private names are imported across modules and are therefore part of
 the de-facto contract (rename only together):
 
-* `forecast` imports `analysis._is_multiplicative` (periodic seasonal/trend
-  ratio ⇒ log-space branch); `report` imports it lazily.
+* `forecast` imports `analysis._is_multiplicative` at module level (periodic
+  seasonal/trend ratio ⇒ log-space branch); `report` imports it lazily.
   `forecast.is_random_walk` lazily imports `analysis._noise_model` and
-  `analysis._unit`.
-* `narrative._outlook_windows` reproduces the outlook levels with
-  `forecast._seasonal_component`, `_future_seasonal` and `_seasonal_share`
-  (imported read-only); `forecast.outlook_levels` is the public equivalent.
-  `narrative` also uses `analysis._is_intermittent`.
-* `report` imports `narrative.format_prob` and `narrative.translate_reason`
-  at module level (narrative imports only `data` / `types` at module level,
-  so there is no cycle).
+  `analysis._unit` (and reproduces compute_metrics' unit scaling to reuse
+  its cache).
+* `narrative` and `compare` import `analysis._is_intermittent` at module
+  level; it mirrors `forecast._is_intermittent` (>= 30 % zeros overall and in
+  the last `max(m, 12)` points), and a test checks that they agree.
+* `report` imports `narrative._SCI_LARGE`, `_SCI_SMALL` and `_SUPERSCRIPT` at
+  module level (the ×10ⁿ thresholds and digits), next to the public
+  `narrative.MODEL_KO`, `PHASE_EN`, `describe_method`, `direction_label`,
+  `format_number`, `format_prob`, `is_intermittent`, `model_label`,
+  `period_unit`, `phase_is_tentative`, `scenario_value`, `translate_reason`,
+  `analysis.changepoint_label`, `pct_change_undefined` and
+  `data.periods_per_year`.
+* `report._future_phase_hedge` and `_MOVING_PHASES` mirror
+  `narrative._phase_projection` / `narrative._MOVING_PHASES`;
+  `report._CAGR_MIN_YEARS = 0.95` mirrors the 0.95-year rule of
+  `analysis.compute_metrics`; `report._SEASONAL_DD_STRENGTH` / `_SEASONAL_DD_GAP`
+  mirror `narrative._seasonal_drawdown` (0.5 strength, 5 points).
+* `cli` imports `report._fmt_prob` for the ranking (lazily).
 * `compare.expected_change_annualised` follows compute_outlook's window rule
   (`k_cur = min(m, n)`, `k_fut = min(m, h)`).
+* Module-level imports: `analysis` imports only `data` and `types`;
+  `forecast` imports `models` (which imports nothing of the package),
+  `analysis` and `data`; `narrative` and `compare` import `analysis` and
+  `data`; `report` imports `analysis`, `data` and `narrative`; `pipeline`
+  imports `analysis`, `data`, `forecast` and `narrative`. `forecast` is
+  imported lazily by `narrative` (`outlook_levels`, `is_random_walk`),
+  `report` and `cli` (`outlook_levels`), so there is no cycle.
 
 ## Known gaps
 
-* `narrative._outlook_windows` calls `forecast._future_seasonal(analysis, h)`
-  without the forecast mean, while `compute_outlook` passes it. For a
-  multiplicative decomposition with a partial-season forecast window (e.g.
-  monthly data, horizon 6) the narrative's `future` level — and the payload's
-  `compared_levels.future` — then differ from the level behind
-  `expected_change_pct` (switching to `forecast.outlook_levels` fixes this).
+* The HTML pages are Korean only, and the `DataError` / `DataWarning` /
+  `DataNotice` texts (with the CLI's `경고:` / `안내:` prefixes) stay Korean
+  under `--lang en`.
 * No business-day (`'B'`) or sub-daily frequency; daily data models only the
   weekly cycle (season length 7), not the yearly one.
 * Prediction intervals are calibrated on synthetic tests (tests require
@@ -725,7 +999,7 @@ the de-facto contract (rename only together):
 
 ## Tests
 
-`python -m pytest -o addopts="" -q` (about 1,000+ tests, ~90 s). Each module
+`python -m pytest -o addopts="" -q` (about 1,300 tests, ~2.5 min). Each module
 has its own test file (`tests/test_<module>.py`, plus `test_connectors.py`);
 `tests/conftest.py` provides a hand-built `fake_report` fixture. Tests never
 touch the network (the Claude client and HTTP sessions are mocked).

@@ -47,31 +47,75 @@ __all__ = [
     "compute_metrics",
     "lifecycle_phase",
     "analyze",
+    "pct_change_undefined",
+    "changepoint_label",
+    "CHANGEPOINT_LABEL_EN",
+    "MIN_PHASE_OBS",
 ]
 
 _TINY = 1e-12
 
 # Korean unit words used in explanations ("최근 12개월", "최근 8주", ...).
 _UNIT_KO: dict[str, str] = {"D": "일", "W": "주", "M": "개월", "Q": "분기", "Y": "년"}
+# Korean per-period units of slopes ("−0.69/월"), as narrative.period_unit writes them
+_PER_KO: dict[str, str] = {"D": "일", "W": "주", "M": "월", "Q": "분기", "Y": "년"}
 
+#: changepoint labels without a direction (used only when the slopes are missing)
 _KIND_KO: dict[str, str] = {
     "acceleration": "가속",
     "deceleration": "감속",
-    "reversal_up": "상승 전환",
-    "reversal_down": "하락 전환",
+    "reversal_up": "상승 반전",
+    "reversal_down": "하락 반전",
     "level_shift": "수준 변화",
+}
+_KIND_EN: dict[str, str] = {
+    "acceleration": "acceleration",
+    "deceleration": "deceleration",
+    "reversal_up": "upward reversal",
+    "reversal_down": "downward reversal",
+    "level_shift": "level shift",
+}
+#: directed changepoint labels (see :func:`changepoint_label`): (kind, flag) -> (Korean, English)
+_CP_LABELS: dict[tuple[str, bool], tuple[str, str]] = {
+    ("acceleration", True): ("성장 가속", "growth accelerating"),
+    ("acceleration", False): ("하락 가속", "decline accelerating"),
+    ("deceleration", True): ("성장 둔화", "growth slowing"),
+    ("deceleration", False): ("하락세 둔화", "decline easing"),
+    # reversal_* only says that the slope changed sign or started: from a flat stretch it is
+    # a turn, not a reversal
+    ("reversal_up", True): ("하락→상승 반전", "reversal from decline to growth"),
+    ("reversal_up", False): ("횡보→상승 전환", "turn from flat to growth"),
+    ("reversal_down", True): ("상승→하락 반전", "reversal from growth to decline"),
+    ("reversal_down", False): ("횡보→하락 전환", "turn from flat to decline"),
+}
+#: a slope smaller in size than this share of the larger of the two slopes counts as flat
+_CP_FLAT_TOL = 0.1
+#: English for every Korean label :func:`changepoint_label` can return (directed and
+#: undirected), e.g. for translating the ``구조 변화(...)`` phase reason
+CHANGEPOINT_LABEL_EN: dict[str, str] = {
+    **{_KIND_KO[k]: _KIND_EN[k] for k in _KIND_KO},
+    **{ko: en for ko, en in _CP_LABELS.values()},
+    "추세 변화": "trend change",
 }
 
 # The lifecycle rules use these (deliberately round) thresholds.  Relative sizes
 # are fractions of the series' trend scale (max |trend|).
 _MIN_SHORT_N = 8          # below this many observations: no lifecycle verdict
+#: public name of :data:`_MIN_SHORT_N`: with fewer observations ``lifecycle_phase`` gives no
+#: lifecycle verdict -- its label ('stable' or 'volatile') is a tentative placeholder that only
+#: says whether noise dominates (the trend test may still be significant)
+MIN_PHASE_OBS = _MIN_SHORT_N
 _MOVE = 0.15              # a "meaningful" move is >= 15% of the trend scale
 _FAR_BELOW_PEAK = 0.30    # >= 30% below the trend peak counts as "well below"
 _STALL_RATIO = 0.35       # recent slope < 35% of the best past slope = stalled
 _EMERGING_MULTIPLE = 2.5  # now >= 2.5x the long-run base level = small base
 _VOLATILE_CV = 0.20       # unstructured series with CV >= 20% is "volatile"
 _T_SIG = 2.5              # |t| of the recent slope needed to call it a real move
+_PACE_CAP = 20.0          # "recent pace is X times the average pace": beyond this, "more than 20x"
 _EDGE_SHRINK = 4.0        # edge LOESS keeps the narrow one-sided fit only if (D / sd_D)^2 >> this
+#: with a weak (but significant) interaction slope, the log decomposition must leave less
+#: than this share of the additive remainder's sum of squares (see _prefer_multiplicative)
+_MULT_WEAK_SS = 0.75
 
 
 # =========================================================================== helpers
@@ -243,19 +287,140 @@ def _level(values: np.ndarray) -> float:
     return m if m > _TINY else 1.0
 
 
-def _pct_change(new: float, base: float, ref: float) -> Optional[float]:
-    """``(new - base) / base * 100`` or ``None`` if ``base`` is <= 0 or ~0.
+#: a series that takes negative values (net profit, temperature, a growth rate) has no natural
+#: zero for percentages: a change in % is stated only when the base is at least this many
+#: standard deviations of the observations away from 0 (forecast._PCT_MIN_LEVEL_SD, the rule
+#: behind Outlook.expected_change_pct)
+_PCT_MIN_LEVEL_SD = 0.5
 
-    "~0" means at most 1% of ``ref`` (a typical absolute level of the series);
-    the test is relative, so it works in any units.
+
+def _pct_reason(new: float, base: float, ref: float, floor: float = 0.0) -> Optional[str]:
+    """Why ``(new - base) / base * 100`` is no meaningful percentage (``None``: it is).
+
+    * ``'zero'``: ``base`` (or ``new``) is not finite, or ``|base|`` is at most
+      1 % of ``ref`` (a typical absolute level of the series; the test is
+      relative, so it works in any units);
+    * ``'negative'``: ``base < 0`` (a percentage of a negative base reads backwards);
+    * ``'sign_change'``: ``new < 0 < base`` -- the level crossed zero (a P&L
+      going from 10 to -10 is no "-200 %" change);
+    * ``'near_zero'``: ``base < floor`` -- for a series with negative values
+      ``floor`` is half the standard deviation of the observations
+      (:func:`_pct_floor`), 0 otherwise.
     """
     thr = 0.01 * abs(ref) if math.isfinite(ref) else 0.0
-    if not (math.isfinite(new) and math.isfinite(base)) or base <= thr or base <= 0.0:
+    if not (math.isfinite(new) and math.isfinite(base)) or abs(base) <= thr or base == 0.0:
+        return "zero"
+    if base < 0.0:
+        return "negative"
+    if new < 0.0:
+        return "sign_change"
+    if base < floor:
+        return "near_zero"
+    return None
+
+
+def _pct_floor(y: np.ndarray) -> float:
+    """Smallest base of a meaningful percentage for data ``y``: half the standard deviation
+    of ``y`` when it takes negative values, 0 for non-negative (ratio-scale) data."""
+    y = np.asarray(y, dtype=float)
+    y = y[np.isfinite(y)]
+    if len(y) == 0 or float(np.min(y)) >= 0.0:
+        return 0.0
+    return _PCT_MIN_LEVEL_SD * float(np.std(y))
+
+
+def _pct_change(new: float, base: float, ref: float, floor: float = 0.0) -> Optional[float]:
+    """``(new - base) / base * 100``, or ``None`` when :func:`_pct_reason` gives a reason.
+
+    ``None`` if ``base`` is <= 0 or ~0 (at most 1 % of ``ref``), if ``new`` has
+    crossed zero (``new < 0 < base``) or if ``base < floor`` (``floor``: see
+    :func:`_pct_floor`; 0 keeps non-negative series as they are).
+    """
+    if _pct_reason(new, base, ref, floor) is not None:
         return None
     v = (new - base) / base * 100.0
     if not math.isfinite(v):
         return None
     return 0.0 if abs(v) < 1e-9 else float(v)
+
+
+def pct_change_undefined(base: float, new: float, values: object) -> Optional[str]:
+    """Why a change from ``base`` to ``new`` has no meaningful percentage in a series with
+    observations ``values`` (``None``: ``(new - base) / base * 100`` is meaningful).
+
+    The rule of ``TrendMetrics.total_change_pct`` / ``recent_change_pct`` /
+    ``cagr_pct`` and of the phase reasons -- the analysis' counterpart of
+    ``forecast._pct_undefined`` -- so that a narrative or a report can tell
+    *why* such a number is ``None`` and apply the same rule to numbers the
+    metrics cannot leave out (``drawdown_pct`` is typed ``float``: call
+    ``pct_change_undefined(metrics.peak_value, metrics.last_value,
+    analysis.series)`` before printing it).  Reasons:
+
+    * ``'zero'``: ``base`` is ~0 (at most 1 % of the mean absolute value of
+      ``values``) or a number is not finite;
+    * ``'negative'``: ``base`` is negative;
+    * ``'sign_change'``: ``new`` is negative while ``base`` is positive (the
+      level crossed zero: 10 -> -10 is no "-200 %" change);
+    * ``'near_zero'``: ``values`` take negative values and ``base`` is below
+      half their standard deviation (an interval-scale series near its zero).
+
+    Non-negative series only ever get ``'zero'`` (and ``'negative'`` /
+    ``'sign_change'`` for negative inputs they cannot produce themselves).
+    """
+    y = np.asarray(values, dtype=float).ravel()
+    y = y[np.isfinite(y)]
+    try:
+        b, v = float(base), float(new)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "zero"
+    if not (math.isfinite(b) and math.isfinite(v)):
+        return "zero"
+    c = _unit(y, b, v)   # tolerances on a unit scale: no overflow at |y| ~ 1e300
+    yn = y / c
+    ref = float(np.mean(np.abs(yn))) if len(yn) else abs(b / c)
+    return _pct_reason(v / c, b / c, ref, _pct_floor(yn))
+
+
+def changepoint_label(cp: Changepoint, lang: str = "ko") -> str:
+    """Directed name of a structural break, read off its slopes: ``'하락→상승 반전'``.
+
+    * ``acceleration``: ``성장 가속`` (slope after >= 0) / ``하락 가속``;
+    * ``deceleration``: ``성장 둔화`` (slope before > 0) / ``하락세 둔화``;
+    * ``reversal_up``: ``하락→상승 반전`` when the slope before was clearly
+      negative (below -10 % of the larger absolute slope), otherwise
+      ``횡보→상승 전환``; ``reversal_down`` likewise (``상승→하락 반전`` /
+      ``횡보→하락 전환``);
+    * ``level_shift``: ``수준 변화``; missing slopes: an undirected label
+      (``가속``, ``감속``, ``상승 반전``, ``하락 반전``).
+
+    ``lang='en'``: ``growth accelerating``, ``decline easing``, ``reversal
+    from decline to growth``, ``turn from flat to growth``, ``level shift``, ...
+    The one classifier behind the phase reasons, the narrative and the report.
+    """
+    en = str(lang or "ko").strip().lower().startswith("en")
+    kind = str(getattr(cp, "kind", ""))
+
+    def slope(name: str) -> Optional[float]:
+        try:
+            v = float(getattr(cp, name, None))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return v if math.isfinite(v) else None
+
+    before, after = slope("slope_before"), slope("slope_after")
+    key: Optional[tuple[str, bool]] = None
+    if kind == "acceleration" and after is not None:
+        key = (kind, after >= 0)
+    elif kind == "deceleration" and before is not None:
+        key = (kind, before > 0)
+    elif kind in ("reversal_up", "reversal_down") and before is not None and after is not None:
+        tol = _CP_FLAT_TOL * max(abs(before), abs(after), 1e-12)
+        key = (kind, before < -tol if kind == "reversal_up" else before > tol)
+    if key is not None:
+        ko, en_txt = _CP_LABELS[key]
+        return en_txt if en else ko
+    table = _KIND_EN if en else _KIND_KO
+    return table.get(kind, "trend change" if en else "추세 변화")
 
 
 def _fmt_date(ts: pd.Timestamp, freq: str) -> str:
@@ -610,10 +775,16 @@ def _prefer_multiplicative(yn: np.ndarray, trend_a: np.ndarray, seas_a: np.ndarr
     the additive residual is ``r ~ s * (T - mean T) / mean T`` (``s`` the
     additive seasonal pattern), so ``r`` is regressed on that interaction
     term: the slope ``beta`` is ~1 for multiplicative and ~0 for additive
-    seasonality.  The log-space decomposition is used when ``beta >= 0.35``
-    with ``t >= 3.5``, the level moves enough (max/min of the trend >= 1.25)
-    and its (winsorised) remainder is also smaller than the additive one
-    (without ``t_log`` / ``s_log`` only the first, cheap part is checked).
+    seasonality.  The log-space decomposition is used when ``t >= 3.5``, the
+    level moves enough (max/min of the trend >= 1.25) and its (winsorised)
+    remainder is smaller than the additive one: with ``beta >= 0.35`` any
+    reduction counts, with ``0 < beta < 0.35`` it must be clear (below
+    :data:`_MULT_WEAK_SS` of the additive one).  A small ``beta`` with a large
+    ``t`` is typical of long periods with few cycles (weekly data, period 52,
+    3-4 years): the trend window is shorter than the period, so the additive
+    trend soaks up part of the growing swing and the interaction left in the
+    residual is small, although the log fit removes most of the misfit.
+    Without ``t_log`` / ``s_log`` only the first, cheap part is checked.
     """
     n = len(yn)
     if np.min(trend_a) <= 0 or float(np.max(trend_a) / np.min(trend_a)) < 1.25:
@@ -632,7 +803,7 @@ def _prefer_multiplicative(yn: np.ndarray, trend_a: np.ndarray, seas_a: np.ndarr
     beta = float(np.sum(x * rw)) / sxx
     res = rw - beta * x
     se = math.sqrt(float(np.sum(res * res)) / max(n - 2, 1) / sxx)
-    if not (beta >= 0.35 and se > 0 and beta / se >= 3.5):
+    if not (beta > 0 and se > 0 and beta / se >= 3.5):
         return False
     if t_log is None or s_log is None:     # evidence only (the log fit is not done yet)
         return True
@@ -640,7 +811,9 @@ def _prefer_multiplicative(yn: np.ndarray, trend_a: np.ndarray, seas_a: np.ndarr
     if not np.all(np.isfinite(r_m)):
         return False
     rm = np.clip(r_m - float(np.median(r_m)), -4.0 * sd, 4.0 * sd)
-    return bool(float(np.sum(rm * rm)) < float(np.sum(rw * rw)))
+    # a weak interaction slope needs a clearly better log fit (see the docstring)
+    need = 1.0 if beta >= 0.35 else _MULT_WEAK_SS
+    return bool(float(np.sum(rm * rm)) < need * float(np.sum(rw * rw)))
 
 
 def _is_multiplicative(dec: Decomposition) -> bool:
@@ -681,8 +854,10 @@ def decompose(series: pd.Series, period: int, breaks: Optional[list[int]] = None
     *Multiplicative seasonality*: for a strictly positive series with at
     least three full periods whose seasonal swing grows/shrinks with the
     level, the decomposition is done on ``log(series)`` and transformed back:
-    ``trend = exp(t)``, ``seasonal = exp(t + s) - exp(t)`` (so the seasonal
-    swing scales with the trend and no longer sums to exactly 0 per period),
+    ``trend = k * exp(t)`` with ``k`` the mean of ``exp(s)`` over one period
+    (so the trend is the season-average level, not the geometric mean),
+    ``seasonal = exp(t + s) - trend`` (the seasonal swing scales with the
+    trend; ``seasonal / trend`` is periodic and averages 0 over a period),
     ``resid = series - trend - seasonal`` (see :func:`_prefer_multiplicative`).
 
     *Non-negative series* keep a non-negative trend (see :func:`_nonneg_floor`).
@@ -723,7 +898,12 @@ def decompose(series: pd.Series, period: int, breaks: Optional[list[int]] = None
         if (np.all(np.isfinite(t_log)) and np.all(np.isfinite(s_log))
                 and _prefer_multiplicative(yn, trend, seasonal, t_log, s_log)):
             multiplicative = True
-            trend = np.exp(t_log)
+            # exp(s) averages above 1 over a season (Jensen): scale the trend by that average so
+            # that it is the season-average level (seasonal / trend averages 0 over a season, as
+            # an additive pattern sums to 0) -- exp(t) alone is the geometric mean, ~4 % below the
+            # data's level for a +-40 % swing, which every level comparison would then inherit
+            k = float(np.mean(np.exp(s_log[:p])))
+            trend = np.exp(t_log) * (k if math.isfinite(k) and k > 0 else 1.0)
             seasonal = np.exp(t_log + s_log) - trend
     if not multiplicative and float(np.min(yn)) >= 0.0:
         trend = _nonneg_floor(trend, yn - seasonal, window, bounds)
@@ -1714,8 +1894,11 @@ def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition,
     """Descriptive statistics of the past and present (see :class:`TrendMetrics`).
 
     Growth numbers use the trend component; ``None`` when the base is <= 0 or
-    ~0 (below 1% of the mean absolute level), and for intermittent demand
-    (mostly zeros, :func:`_is_intermittent`).  ``cagr_pct`` additionally
+    ~0 (below 1% of the mean absolute level), when the trend crossed zero
+    (end < 0 < base), when a series with negative values has a base below
+    half the standard deviation of its observations (see
+    :func:`pct_change_undefined`), and for intermittent demand (mostly zeros,
+    :func:`_is_intermittent`).  ``cagr_pct`` additionally
     needs a span of about a year (>= 0.95 years).  ``momentum`` is the recent
     trend slope (OLS over the last ``max(3, min(season_length, n//4))``
     periods) minus the long-run Theil-Sen ``slope``, in % of the *recent* trend
@@ -1743,7 +1926,10 @@ def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition,
       as an anomaly, not as the level the series fell from) -- from 16
       observations on, and never the first or last observation, which cannot
       be confirmed as one-off.  ``anomalies``: the already detected anomalies
-      of ``series`` (detected here if omitted).
+      of ``series`` (detected here if omitted).  ``drawdown_pct`` is always a
+      number (typed ``float``); for a series that crossed zero or peaked near
+      zero it is no meaningful percentage --
+      ``pct_change_undefined(peak_value, last_value, series)`` tells.
     """
     y_raw = _clean_values(series)
     n = len(y_raw)
@@ -1762,12 +1948,15 @@ def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition,
     level = _level(y)
     abs_ref = float(np.mean(np.abs(y)))
 
-    # growth numbers (trend based)
-    total = _pct_change(trend[-1], trend[0], abs_ref) if n >= 2 else None
+    # growth numbers (trend based); for data with negative values a base closer to 0 than
+    # half a standard deviation, or a level that crossed zero, gives no percentage
+    floor = _pct_floor(y)
+    total = _pct_change(trend[-1], trend[0], abs_ref, floor) if n >= 2 else None
     cagr: Optional[float] = None
     years = (n - 1) / _data.periods_per_year(freq)
     thr = 0.01 * abs_ref
-    if years >= 0.95 and trend[0] > thr and trend[-1] > thr and trend[0] > 0 and trend[-1] > 0:
+    if (years >= 0.95 and trend[0] > thr and trend[-1] > thr and trend[0] > 0 and trend[-1] > 0
+            and trend[0] >= floor):
         lg = math.log(trend[-1] / trend[0]) / years
         if lg < 50:
             cagr = _finite((math.exp(lg) - 1.0) * 100.0, default=float("nan"))
@@ -1777,7 +1966,7 @@ def compute_metrics(series: pd.Series, freq: str, decomposition: Decomposition,
                 cagr = 0.0
     lag = 1 if freq == "Y" else _data.season_length(freq)
     lag = min(lag, n - 1)
-    recent = _pct_change(trend[-1], trend[-1 - lag], abs_ref) if lag >= 1 else None
+    recent = _pct_change(trend[-1], trend[-1 - lag], abs_ref, floor) if lag >= 1 else None
     if _is_intermittent(y_raw, _data.season_length(freq)):
         # mostly zeros: the trend is a demand rate near 0 that wanders with the timing of
         # a few orders -- its %-changes (+3,192 %, CAGR +240 %) are meaningless
@@ -1988,7 +2177,10 @@ def _phase_features(series: pd.Series, dec: Decomposition) -> dict:
     avg_slope = (T[-1] - T[0]) / max(n - 1, 1)
 
     base = float(np.median(T[: max(1, int(math.ceil(0.6 * n)))]))
-    multiple = t_last / base if (base > 0.01 * ref and t_last > 0) else 0.0
+    # a multiple of a base near 0 says nothing for data with negative values (a sine wave
+    # around +1 is no "2.9x growth from a low base"): same floor as the percentages
+    pct_floor = _pct_floor(y)
+    multiple = t_last / base if (base > 0.01 * ref and t_last > 0 and base >= pct_floor) else 0.0
 
     # noise relative to the level ("coefficient of variation" of the noise);
     # for persistent noise its spread over the sample, not the one-step noise
@@ -2015,7 +2207,7 @@ def _phase_features(series: pd.Series, dec: Decomposition) -> dict:
         i_tr=i_tr, t_tr=t_tr, decline_before_trough=decline_before_trough, rebound=rebound,
         settled=settled, s_max_up=s_max_up, s_rec_t=s_rec_t, stall_ratio=stall_ratio,
         avg_slope=avg_slope, base=base, multiple=multiple, cv=cv, cv_basis=basis,
-        g_tot=(t_last - float(T[0])) / ref,
+        g_tot=(t_last - float(T[0])) / ref, pct_floor=pct_floor,
     )
 
 
@@ -2039,14 +2231,15 @@ def _num_txt(x: float, signed: bool = False) -> str:
     """A number for Korean prose, formatted like ``narrative.format_number``.
 
     Thousands separators and a precision chosen from the magnitude
-    (``2,392,153`` / ``45.2`` / ``1.20`` / ``0.023``); below 1e-4 or from 1e15 up
-    ``1.05\u00d710\u207b\u2079`` notation -- never Python's ``2.392e+06``.  Typographic minus;
+    (``2,392,153`` / ``45.2`` / ``1.20`` / ``0.023``); below 1e-4 or from 1e12 up
+    ``1.05\u00d710\u207b\u2079`` notation (the bounds of ``format_number``: no 13-digit
+    integers) -- never Python's ``2.392e+06``.  Typographic minus;
     ``signed=True`` prefixes positive values with ``+``.
     """
     v = _finite(x)
     a = abs(v)
     sign = _MINUS if v < 0 else ("+" if signed and v > 0 else "")
-    if 0 < a < 1e-4 or a >= 1e15:
+    if 0 < a < 1e-4 or a >= 1e12:
         mant, exp = f"{a:.2e}".split("e")
         mant = mant.rstrip("0").rstrip(".")
         e = int(exp)
@@ -2110,9 +2303,12 @@ def _post_shift(series: pd.Series, dec: Decomposition, changepoints: list[Change
     if p < 0.05 or abs(t) >= 2.0:
         return None
     unit = _UNIT_KO.get(freq, "기간")
+    # "그 이후 N개월": the periods after the break (not counting the break period itself), as the
+    # narrative's "가장 최근 구조 변화(…) 이후 지금까지 N개월" counts them
+    after_n = length - 1
     before = float(np.median(z[max(0, k - length):k]))
     after = float(np.median(seg))
-    pct = _pct_change(after, before, f["ref"])
+    pct = _pct_change(after, before, f["ref"], f["pct_floor"])
     up = after >= before
     jump = (f" (약 {_pct_txt(pct)})" if pct is not None
             else f" (약 {_num_txt((after - before) * c, signed=True)})")
@@ -2120,7 +2316,7 @@ def _post_shift(series: pd.Series, dec: Decomposition, changepoints: list[Change
     return dict(
         p=float(p), length=int(length),
         shift_sentence=f"{when}에 수준이 한 단계 {'높아졌습니다' if up else '낮아졌습니다'}{jump}.",
-        flat_sentence=(f"그 이후 {length}{unit} 동안은 뚜렷한 추세 없이 새 수준에서 안정되어 있습니다 "
+        flat_sentence=(f"그 이후 {after_n}{unit} 동안은 뚜렷한 추세 없이 새 수준에서 안정되어 있습니다 "
                        f"(해당 구간 Mann-Kendall {_p_txt(p)})."),
     )
 
@@ -2150,8 +2346,10 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
         ref, _ = _noise_reference(yn, yn)   # level, or the spread of data that cross zero
         noise_cv = float(np.sqrt(np.mean(res * res))) / ref if ref > _TINY else 0.0
         label = "volatile" if noise_cv >= _VOLATILE_CV else "stable"
-        reasons = [f"관측치가 {n}개뿐이라 추세를 판단하기에 데이터가 부족합니다."]
-        pct = _pct_change(float(yn[-1]), float(yn[0]), lvl) if len(yn) >= 2 else None
+        # "국면", not "추세": the Mann-Kendall test can still find a significant trend in 5 points
+        reasons = [f"관측치가 {n}개뿐이라 국면을 판단하기에 데이터가 부족합니다."]
+        pct = (_pct_change(float(yn[-1]), float(yn[0]), lvl, _pct_floor(yn))
+               if len(yn) >= 2 else None)
         if pct is not None:
             # "...에서 6까지": no particle whose form depends on how the number is read (6으로 / 5로)
             reasons.append(f"관측 기간 동안 값이 {_num_txt(y[0])}에서 {_num_txt(y[-1])}까지 "
@@ -2180,23 +2378,28 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
     def recent_sentence() -> str:
         # measured on the trend line over the last h periods (T[-1-h] -> T[-1]), like
         # TrendMetrics.recent_change_pct over its window -- not from the OLS intercept
-        pct = _pct_change(f["t_last"], f["t_rec0"], f["ref"])
+        pct = _pct_change(f["t_last"], f["t_rec0"], f["ref"], f["pct_floor"])
         if pct is not None:
             return f"최근 {h}{unit} 동안 추세가 {_pct_txt(pct)} 변했습니다."
         slope = (f["t_last"] - f["t_rec0"]) / max(h, 1) * f["unit"]
-        return f"최근 {h}{unit} 동안 추세 기울기는 {_num_txt(slope, signed=True)}/{unit}입니다."
+        return (f"최근 {h}{unit} 동안 추세 기울기는 {_num_txt(slope, signed=True)}"
+                f"/{_PER_KO.get(freq, unit)}입니다.")
 
     def peak_sentence() -> str:
-        pct = _pct_change(f["t_last"], f["t_max"], f["ref"])
+        pct = _pct_change(f["t_last"], f["t_max"], f["ref"], f["pct_floor"])
         if pct is not None:
             return f"현재 추세는 고점({peak_date})보다 {abs(pct):,.1f}% 낮은 수준입니다."
+        if f["t_max"] > 0.0 > f["t_last"]:
+            # crossed zero: "183.6% below the peak" is no percentage -- give the two levels
+            return (f"추세는 고점({peak_date}, {_num_txt(f['t_max'] * f['unit'])}) 이후 0 아래로 "
+                    f"내려가 현재 {_num_txt(f['t_last'] * f['unit'])}입니다.")
         return (f"추세 고점({peak_date}) 대비 현재 수준이 추세 규모(최대 절댓값)의 "
                 f"{f['drop_from_peak'] * 100:.1f}%만큼 낮습니다.")
 
     at_top = f["i_max"] >= n - 1
 
     def rise_sentence() -> str:
-        pct = _pct_change(f["t_max"], f["t_low"], f["ref"])
+        pct = _pct_change(f["t_max"], f["t_low"], f["ref"], f["pct_floor"])
         rise = (f"저점 대비 {_pct_txt(pct, 0)}" if pct is not None
                 else f"저점 대비 추세 규모의 {f['rise_to_peak'] * 100:.0f}%만큼")
         if at_top:   # the maximum is the latest point: no peak has "formed" yet
@@ -2223,7 +2426,7 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
     # random-walk-like noise (phi ~ 1): moves accumulate, so a large swing is
     # not evidence of a trend by itself (see _noise_model)
     walk = f["phi"] >= 0.9
-    walk_sentence = ("변화가 누적되는 무작위 행보(random walk)에 가까운 움직임이라, "
+    walk_sentence = ("변화가 누적되는 무작위 행보에 가까운 움직임이라, "
                      "추세처럼 보이는 등락도 우연일 수 있습니다.")
 
     # a level shift followed by a flat stretch: judge the period since the step
@@ -2260,7 +2463,7 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
         label = "reviving"
         strength = 0.5 * _ramp(f["rebound"] / max(f["decline_before_trough"], _TINY), 0.25, 0.6) \
             + 0.5 * _ramp(f["t_rec"], _T_SIG, 3 * _T_SIG)
-        reb_pct = _pct_change(f["t_last"], f["t_tr"], f["ref"])
+        reb_pct = _pct_change(f["t_last"], f["t_tr"], f["ref"], f["pct_floor"])
         reb_txt = (_pct_txt(reb_pct) if reb_pct is not None
                    else f"추세 규모의 {f['rebound'] * 100:.1f}%만큼")
         reasons = [
@@ -2299,11 +2502,14 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
             label = "emerging"
             strength = 0.5 * _ramp(f["multiple"], _EMERGING_MULTIPLE, 2 * _EMERGING_MULTIPLE) \
                 + 0.5 * _ramp(f["s_rec_t"] / max(f["avg_slope"], _TINY), 1.5, 3.0)
+            pace = f["s_rec_t"] / f["avg_slope"] if f["avg_slope"] > _TINY else math.inf
             reasons = [
                 f"현재 추세 수준이 과거 기반 수준의 {f['multiple']:.1f}배로, 낮은 기반에서 빠르게 성장 중입니다.",
                 recent_sentence(),
-                f"최근 상승 속도가 전체 기간 평균 속도(추세선 처음→끝)의 "
-                f"{f['s_rec_t'] / max(f['avg_slope'], _TINY):.1f}배로 가속되고 있습니다.",
+                # a trend that ends near where it started has an average pace of ~0: no "1.1e11배"
+                (f"최근 상승 속도가 전체 기간 평균 속도(추세선 처음→끝)의 {pace:.1f}배로 가속되고 있습니다."
+                 if pace <= _PACE_CAP else
+                 f"최근 상승 속도가 전체 기간 평균 속도(추세선 처음→끝)의 {_PACE_CAP:.0f}배를 넘습니다."),
             ]
         else:
             label = "growing"
@@ -2359,7 +2565,7 @@ def lifecycle_phase(series: pd.Series, freq: str, decomposition: Decomposition,
     recent_cps = [c for c in changepoints if c.index >= n - max(h, 2 * _data.season_length(freq))]
     if recent_cps and len(reasons) < 4 and post is None:
         c = recent_cps[-1]
-        reasons.append(f"{_when_ko(c.date, freq)}에 구조 변화({_KIND_KO.get(c.kind, c.kind)})가 감지되었습니다.")
+        reasons.append(f"{_when_ko(c.date, freq)}에 구조 변화({changepoint_label(c)})가 감지되었습니다.")
     if walk and label not in ("volatile", "stable") and len(reasons) < 4:
         reasons.append(walk_sentence)
     if len(reasons) < 2 and mk_sentence() not in reasons:

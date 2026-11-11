@@ -37,19 +37,28 @@ from .types import TrendReport
 
 FREQ_CHOICES = ["D", "W", "M", "Q", "Y"]
 
-# CLI chrome per language (the terminal summary and the HTML reports are Korean).  Messages
+# CLI chrome per language (the terminal summary follows --lang too; the HTML reports are Korean).  Messages
 # that quote the data module (DataError / DataWarning texts) keep its Korean wording.
 _MSG: dict[str, dict[str, str]] = {
     "ko": {
         "synthetic": "※ 합성(가상) 샘플 데이터입니다 — 실제 데이터가 아닙니다.",
-        "rank_title": "■ 상승 트렌드 순위 (상승 점수: 50=중립, 높을수록 강한 상승 전망)",
+        # the score blends the outlook with the recent momentum (compare.rising_score): "higher = a
+        # stronger expected rise" overclaimed
+        "rank_title": "■ 상승 트렌드 순위 (상승 점수: 전망 + 최근 기세, 50=중립)",
         "rank_cols": "예측 변화",
         "rank_span": "기간",
         "rank_prob": "상승확률",
         "rank_score": "점수",
         "mixed_freq": ("※ 주기가 다른 시계열이 섞여 있어, 점수는 변화율을 연 단위(모멘텀은 월 단위)로 환산해 "
                        "매겼습니다. 예측 변화는 각 시계열의 기간 기준입니다."),
-        "rank_basis": "※ 예측 변화와 상승확률은 예측 마지막 한 주기의 평균을 최근 한 주기의 평균과 비교한 값입니다.",
+        # the levels of forecast.outlook_levels: the forecast's last season -- the whole horizon,
+        # seasonally adjusted, when it is shorter (weekly default: 26 of 52 weeks) -- versus the
+        # last observed season; yearly data compare single values (see _rank_basis)
+        "rank_cols_span": "{cols}({span})",
+        "rank_basis": "※ 예측 변화와 상승확률은 예측 마지막 한 주기의 평균{partial}을 최근 한 주기의 평균과 비교한 값입니다.",
+        "rank_basis_partial": "(예측 기간이 한 주기보다 짧으면 예측 기간 전체를 계절 보정한 평균)",
+        "rank_basis_yearly": " 연 단위 데이터는 마지막 예측값을 최근 값과 비교합니다.",
+        "rank_basis_only_yearly": "※ 예측 변화와 상승확률은 마지막 예측값을 최근 값과 비교한 값입니다.",
         "narr_hidden": ("※ 시계열이 여러 개라 개별 해석문은 생략했습니다 — HTML(--html)·JSON(--json) "
                         "리포트 또는 --value-col 로 하나씩 실행해 확인하세요."),
         "html_one": "HTML 리포트 저장: {path}",
@@ -71,15 +80,20 @@ _MSG: dict[str, dict[str, str]] = {
     },
     "en": {
         "synthetic": "※ Synthetic sample data — not real data.",
-        "rank_title": "■ Rising-trend ranking (rising score: 50 = neutral, higher = stronger expected rise)",
+        "rank_title": "■ Rising-trend ranking (rising score: outlook + recent momentum, 50 = neutral)",
         "rank_cols": "Exp. change",
         "rank_span": "Horizon",
         "rank_prob": "P(up)",
         "rank_score": "Score",
         "mixed_freq": ("※ Series of different frequencies: changes were annualised (momentum per month) before "
                        "scoring. Expected changes are shown over each series' own horizon."),
-        "rank_basis": ("※ Exp. change and P(up) compare the mean of the last forecast cycle with the mean "
-                       "of the last observed cycle."),
+        "rank_cols_span": "{cols} ({span})",
+        "rank_basis": ("※ Exp. change and P(up) compare the mean of the forecast's last season{partial} with the "
+                       "mean of the last observed season."),
+        "rank_basis_partial": " (the whole horizon, seasonally adjusted, when it is shorter than a season)",
+        "rank_basis_yearly": " For yearly data they compare the last forecast value with the latest observation.",
+        "rank_basis_only_yearly": ("※ Exp. change and P(up) compare the last forecast value with the latest "
+                                   "observation."),
         "narr_hidden": ("※ Several series: individual narratives are not printed — see the HTML (--html) / "
                         "JSON (--json) output or run one column at a time with --value-col."),
         "html_one": "HTML report saved: {path}",
@@ -207,7 +221,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="Claude로 해석문 생성 (ANTHROPIC_API_KEY 필요, 실패 시 규칙 기반으로 대체)")
     p.add_argument("--model", default="claude-opus-5-5", help="--llm 사용 시 Claude 모델 ID")
     p.add_argument("--lang", choices=["ko", "en"], default="ko",
-                   help="해석문과 CLI 안내 문구의 언어 (터미널 요약표·HTML 리포트는 한국어)")
+                   help="해석문·터미널 요약표·CLI 안내 문구의 언어 (HTML 리포트는 한국어)")
     p.add_argument("--quiet", "-q", action="store_true", help="해석문 출력 생략 (요약만)")
 
 
@@ -314,7 +328,7 @@ def _format_ranking(df: pd.DataFrame, lang: str = "ko",
     name_w = min(28, max([_dw(n) for n in names] + [4]))
     phases = [str(p) for p in (df["phase_ko"] if lang == "ko" else df["phase"])]
     phase_w = max([_dw(p) for p in phases] + [4])
-    exp_head = f"{msg['rank_cols']}({shared})" if shared else msg["rank_cols"]
+    exp_head = msg["rank_cols_span"].format(cols=msg["rank_cols"], span=shared) if shared else msg["rank_cols"]
     exps = [_fmt_pct(v) for v in df["expected_change_pct"]]
     exp_w = max([_dw(exp_head)] + [_dw(e) for e in exps])
     span_w = 0 if shared is not None else max([_dw(msg["rank_span"])] + [_dw(sp) for sp in spans])
@@ -329,6 +343,36 @@ def _format_ranking(df: pd.DataFrame, lang: str = "ko",
                      f"{_pad(ex, exp_w, '>')}{span_cell}  {_pad(_fmt_prob(row['prob_increase']), 8, '>')}  "
                      f"{_pad(score, 6, '>')}")
     return "\n".join(lines)
+
+
+def _rank_basis(reports: Any, lang: str = "ko") -> str:
+    """The note under the ranking: which two levels the expected change and P(up) compare.
+
+    The levels of :func:`forecast.outlook_levels`: the mean of the forecast's last
+    season versus the mean of the last observed season.  Only what applies to the
+    ranked series is said: a horizon shorter than the season (weekly data by
+    default: 26 of 52 weeks) uses the whole horizon, seasonally adjusted, and
+    yearly data (a one-period season) compare the last forecast value with the
+    latest observation.
+    """
+    from .forecast import outlook_levels
+
+    partial = yearly = seasonal = False
+    for rep in reports:
+        m = int(getattr(rep.analysis, "season_length", 1) or 1)
+        if m <= 1:
+            yearly = True
+            continue
+        seasonal = True
+        try:
+            k_fut = int(outlook_levels(rep.analysis, rep.forecast).k_fut)
+        except Exception:  # noqa: BLE001 - hand-made reports: the forecast length decides
+            k_fut = min(m, len(getattr(rep.forecast, "mean", ())) or m)
+        partial = partial or k_fut < m
+    if yearly and not seasonal:
+        return _t(lang, "rank_basis_only_yearly")
+    text = _t(lang, "rank_basis", partial=_t(lang, "rank_basis_partial") if partial else "")
+    return text + (_t(lang, "rank_basis_yearly") if yearly else "")
 
 
 def _unique_slugs(names: Sequence[str]) -> dict[str, str]:
@@ -356,10 +400,11 @@ def _slug(name: str) -> str:
 # --------------------------------------------------------------------------- core
 
 
-def _print_report(report: TrendReport, quiet: bool) -> None:
+def _print_report(report: TrendReport, quiet: bool, lang: str = "ko") -> None:
     from .report import render_text
 
-    _say(render_text(report))
+    # the terminal summary in the language of the narrative and the CLI notes (--lang en: no Hangul)
+    _say(render_text(report, lang=lang))
     if not quiet:
         _say()
         _say(report.narrative)
@@ -389,13 +434,13 @@ def _emit(reports: dict[str, TrendReport], args: argparse.Namespace, fail_code: 
         return fail_code
     many = len(reports) > 1
     for rep in reports.values():
-        _print_report(rep, args.quiet or many)
+        _print_report(rep, args.quiet or many, getattr(args, "lang", "ko"))
     ranking = None
     if many:
         ranking = rank_trends(reports)
         horizons = {str(rep.name): len(rep.forecast.mean) for rep in reports.values()}
         _say(_format_ranking(ranking, getattr(args, "lang", "ko"), horizons))
-        _say(_t(args, "rank_basis"))
+        _say(_rank_basis(reports.values(), getattr(args, "lang", "ko")))
         if ranking["freq"].nunique() > 1:
             _say(_t(args, "mixed_freq"))
         if not args.quiet:

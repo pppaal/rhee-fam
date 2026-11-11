@@ -455,3 +455,40 @@ def test_frequency_is_inferred_from_every_dated_row():
         warnings.simplefilter("error")
         s2, f2 = prepare(cal)
     assert f2 == "M" and len(s2) == 36
+
+
+def test_a_few_empty_periods_keep_the_values_own_frequency():
+    """R4-REV-1: Monday values in a full daily calendar with 2 of 104 weeks empty were read as
+    daily data (722 points, 620 interpolated, a false 'weekday-only' warning), and month-start
+    values with 1 of 24 months empty as 97 % interpolated daily data.  A few empty periods of
+    a weekly / monthly series are gaps of that series."""
+    import warnings
+
+    from trendai.data import DataWarning, prepare
+
+    days = pd.date_range("2022-01-01", "2023-12-31", freq="D")
+    mon = days[days.dayofweek == 0]
+    weekly = pd.Series(np.nan, index=days)
+    weekly[mon] = 100 + np.cumsum(np.random.default_rng(0).normal(0, 1, len(mon)))
+    weekly[mon[[10, 60]]] = np.nan
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DataWarning)
+        s, freq = prepare(weekly)
+    assert freq == "W" and len(s) == 104
+
+    monthly = pd.Series(np.nan, index=days)
+    starts = days[days.day == 1]
+    monthly[starts] = 100 + np.arange(len(starts), dtype=float)
+    monthly[starts[7]] = np.nan
+    s2, f2 = prepare(monthly)
+    assert f2 == "M" and len(s2) == 24
+    # the gap is filled on the monthly grid (linear interpolation), not on a daily one
+    assert s2.iloc[7] == pytest.approx(107.0)
+
+    # sparse values still follow the date column: 7 of 12 quarters (58 %) is no quarterly series
+    idx = pd.date_range("2021-01-01", periods=36, freq="MS")
+    v = pd.Series(np.nan, index=idx)
+    v.iloc[[1, 2, 9, 13, 14, 16, 21, 31, 35]] = 100 + np.arange(9.0)
+    with pytest.warns(DataWarning):
+        _, f3 = prepare(v)
+    assert f3 == "M"

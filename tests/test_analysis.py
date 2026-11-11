@@ -1250,3 +1250,227 @@ def test_edge_and_short_series_peaks_are_not_excluded_as_spikes():
     s.iloc[60] += 150.0
     m = _quiet_analyze(s).metrics
     assert m.peak_value < float(s.max())
+
+
+# --------------------------------------------------------------------------- round 4
+
+
+def _pnl(n: int = 48, start: float = 10.0, end: float = -10.0, seed: int = 0) -> pd.Series:
+    rng = np.random.default_rng(seed)
+    y = np.linspace(start, end, n) + rng.normal(0, 1.0, n)
+    return pd.Series(y, index=pd.date_range("2022-01-01", periods=n, freq="MS"))
+
+
+def test_zero_crossing_series_get_no_percent_changes():
+    # U3: a P&L falling from 10 to -10 read 'total change -183.6 %' (and '-196 %' with other
+    # seeds); a percentage of a level that crossed zero is meaningless -> None
+    for seed in range(3):
+        m = _quiet_analyze(_pnl(seed=seed)).metrics
+        assert m.total_change_pct is None and m.cagr_pct is None and m.recent_change_pct is None, seed
+    # the trend crosses zero inside the recent window (12 months ago it was still positive)
+    s = _pnl(n=24, start=10.0, end=-3.0, seed=1)
+    a = _quiet_analyze(s)
+    tr = a.decomposition.trend.to_numpy()
+    assert tr[-13] > 0 > tr[-1]
+    assert a.metrics.recent_change_pct is None and a.metrics.total_change_pct is None
+    # the drawdown stays a float (typed so) but is flagged as meaningless
+    m = a.metrics
+    assert isinstance(m.drawdown_pct, float) and m.drawdown_pct < -100
+    assert A.pct_change_undefined(m.peak_value, m.last_value, s) == "sign_change"
+    # the phase reason gives the two levels instead of "현재 추세는 고점보다 183.6% 낮은 수준"
+    assert not any(re.search(r"\d{3,}(\.\d)?% 낮", r) for r in a.phase.reasons), a.phase.reasons
+    assert any("0 아래로 내려가 현재 −" in r for r in a.phase.reasons), a.phase.reasons
+
+
+def test_near_zero_base_of_data_with_negatives_gets_no_percent_change():
+    # U3: a series with negative values whose starting trend is within half a standard deviation
+    # of 0 (here +1.3 against an SD of ~18) has no meaningful % change (it read +2,625 %, CAGR +133 %)
+    t = np.arange(48.0)
+    y = np.r_[np.linspace(0.6, -30, 24), np.linspace(-30, 35, 24)] + np.sin(t)
+    s = pd.Series(y, index=pd.date_range("2020-01-01", periods=48, freq="MS"))
+    a = _quiet_analyze(s)
+    tr = a.decomposition.trend.to_numpy()
+    assert 0 < tr[0] < 0.5 * np.std(y) and tr[-1] > 0
+    assert a.metrics.total_change_pct is None and a.metrics.cagr_pct is None
+    assert A.pct_change_undefined(tr[0], tr[-1], s) == "near_zero"
+    # far enough from 0 (more than half an SD), a series with negatives keeps its percentages
+    assert A.pct_change_undefined(30.0, 33.0, s) is None
+    assert A.pct_change_undefined(30.0, -1.0, s) == "sign_change"
+    assert A.pct_change_undefined(-30.0, -10.0, s) == "negative"
+    assert A.pct_change_undefined(0.0, 5.0, s) == "zero"
+    # non-negative (ratio-scale) data: any clearly positive base qualifies, as before
+    pos = samples.sample("declining")
+    assert A.pct_change_undefined(0.05 * float(pos.mean()), 1.0, pos) is None
+    assert A.pct_change_undefined(float("nan"), 1.0, pos) == "zero"
+
+
+def test_non_negative_samples_keep_their_metrics():
+    # U3 must not touch ratio-scale data: the new rule only fires for a level that crosses zero
+    # or for data with negative values (none of the archetypes)
+    for nm in samples.list_samples():
+        s = samples.sample(nm)
+        assert float(s.min()) >= 0
+        m = _quiet_analyze(s).metrics
+        tr = _quiet_analyze(s).decomposition.trend.to_numpy()
+        if m.total_change_pct is not None:
+            assert m.total_change_pct == pytest.approx((tr[-1] - tr[0]) / tr[0] * 100, rel=1e-12)
+        assert A._pct_floor(s.to_numpy()) == 0.0
+
+
+def test_emerging_multiple_needs_a_base_away_from_zero():
+    # U3 (same rule): a sine wave around +1 with negative values was 'emerging' because its trend
+    # was "2.9x the base level" (a base near 0) and "113,089,623,815.2x the average pace"
+    idx = pd.date_range("2020-01-01", periods=60, freq="MS")
+    for seed in (2, 8):
+        rng = np.random.default_rng(seed)
+        y = 8 * np.sin(np.arange(60) / 5 + seed) + rng.normal(0, 1, 60) + 1.0
+        a = _quiet_analyze(pd.Series(y, index=idx))
+        assert a.phase.label != "emerging", (seed, a.phase.reasons)
+        assert not any(re.search(r"\d{4,}(\.\d)?배", r.replace(",", "")) for r in a.phase.reasons)
+
+
+@pytest.mark.parametrize("kind,before,after,ko,en", [
+    ("reversal_up", -1.0, 1.0, "하락→상승 반전", "reversal from decline to growth"),
+    ("reversal_up", -0.05, 1.0, "횡보→상승 전환", "turn from flat to growth"),
+    ("reversal_down", 1.0, -1.0, "상승→하락 반전", "reversal from growth to decline"),
+    ("reversal_down", 0.05, -1.0, "횡보→하락 전환", "turn from flat to decline"),
+    ("acceleration", 1.0, 2.0, "성장 가속", "growth accelerating"),
+    ("acceleration", -1.0, -2.0, "하락 가속", "decline accelerating"),
+    ("deceleration", 2.0, 1.0, "성장 둔화", "growth slowing"),
+    ("deceleration", -2.0, -1.0, "하락세 둔화", "decline easing"),
+    ("level_shift", 0.1, 0.1, "수준 변화", "level shift"),
+    ("reversal_up", float("nan"), 1.0, "상승 반전", "upward reversal"),
+])
+def test_changepoint_label_is_directed(kind, before, after, ko, en):
+    # U6: one classifier for the phase reasons, the narrative and the report
+    cp = Changepoint(date=pd.Timestamp("2024-03-01"), index=10, slope_before=before, slope_after=after,
+                     kind=kind, magnitude=1.0)
+    assert A.changepoint_label(cp) == ko and A.changepoint_label(cp, "en") == en
+    assert A.CHANGEPOINT_LABEL_EN[ko] == en
+
+
+def test_phase_reason_names_the_changepoint_with_its_direction():
+    # U6: the reason read '구조 변화(상승 전환)' for a reversal out of a decline; it now uses the
+    # directed vocabulary of the report and the narrative ('하락→상승 반전' / '횡보→상승 전환')
+    from trendai.narrative import translate_reason
+    seen = 0
+    for nm, freq, n in (("reviving", "M", None), ("reviving", "Y", 25), ("breakout", "M", 30),
+                        ("reviving", "M", 30), ("fad", "W", 156)):
+        for seed in range(3):
+            kw = {"freq": freq, "seed": seed, **({"n": n} if n else {})}
+            a = _quiet_analyze(samples.sample(nm, **kw), freq=freq)
+            for r in a.phase.reasons:
+                mt = re.search(r"구조 변화\(([^)]+)\)", r)
+                if not mt:
+                    continue
+                seen += 1
+                assert mt.group(1) not in ("상승 전환", "하락 전환", "가속", "감속"), r
+                cp = [c for c in a.changepoints if A._when_ko(c.date, freq) in r][-1]
+                assert mt.group(1) == A.changepoint_label(cp)
+                assert translate_reason(r) and not HANGUL.search(translate_reason(r))
+    assert seen >= 10
+
+
+# --------------------------------------------------------------------------- round 4 (final)
+
+
+def test_periods_since_a_level_shift_are_counted_like_the_narrative():
+    # F10: '가장 최근 구조 변화(2021-01) 이후 지금까지 59개월의 데이터가 쌓였습니다.' next to
+    # '근거: 그 이후 60개월 동안은 …': "그 이후" counts the periods after the break, not the break itself
+    from trendai.narrative import rule_based_narrative
+    from trendai.pipeline import run
+    for freq, n, rule in (("M", 120, "MS"), ("W", 156, "W-SUN"), ("Q", 40, "QS")):
+        r = np.random.default_rng(1)
+        y = 100 + r.normal(0, 2, n)
+        y[n // 2:] += 30
+        s = pd.Series(y, index=pd.date_range("2016-01-01", periods=n, freq=rule))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rep = run(s, name="ls")
+        a = rep.analysis
+        cp = max(a.changepoints, key=lambda c: c.index)
+        assert cp.kind == "level_shift"
+        since = n - 1 - cp.index
+        flat = [x for x in a.phase.reasons if x.startswith("그 이후")]
+        assert flat and flat[0].startswith(f"그 이후 {since}{A._UNIT_KO[freq]} 동안"), (freq, flat)
+        assert f"이후 지금까지 {since}{A._UNIT_KO[freq]}의 데이터" in rule_based_narrative(
+            a, rep.forecast, rep.outlook)
+
+
+def test_slope_reason_uses_the_per_period_unit():
+    # F11: '최근 18개월 동안 추세 기울기는 −0.69/개월입니다.' while every other Korean slope reads '/월'
+    from trendai.narrative import period_unit, translate_reason
+    a = _quiet_analyze(-samples.sample("growing", n=120, freq="M"), name="neg")
+    slope = [x for x in a.phase.reasons if "추세 기울기는" in x]
+    assert slope and slope[0].startswith("최근 18개월 동안") and slope[0].endswith(f"{period_unit('M')}입니다.")
+    assert "/개월" not in " ".join(a.phase.reasons)
+    assert translate_reason(slope[0]).endswith("per month.")
+    w = _quiet_analyze(-samples.sample("growing", n=156, freq="W"), name="neg", freq="W")
+    assert all("/주입니다" in x for x in w.phase.reasons if "추세 기울기는" in x)
+
+
+def test_korean_reasons_have_no_english_gloss():
+    # F12: '변화가 누적되는 무작위 행보(random walk)에 가까운 움직임이라 …' was the only English word in
+    # Korean prose across 370 sweep reports
+    from trendai.narrative import translate_reason
+    seen = 0
+    for seed in range(4):
+        r = np.random.default_rng(seed)
+        s = pd.Series(100 + np.cumsum(r.normal(0, 1, 400)), index=pd.date_range("2016-01-01", periods=400, freq="D"))
+        a = _quiet_analyze(s, name="rw")
+        for x in a.phase.reasons:
+            assert not re.search(r"[A-Za-z]{3,}", x.replace("Mann-Kendall", "")), x
+            if "무작위 행보" in x:
+                seen += 1
+                assert translate_reason(x) == ("Changes accumulate like a random walk, so trend-like swings "
+                                               "may be due to chance.")
+    assert seen >= 2
+
+
+def test_short_series_reason_is_about_the_phase_not_the_trend():
+    # F3: '관측치가 5개뿐이라 추세를 판단하기에 데이터가 부족합니다' stood next to a significant
+    # Mann-Kendall rise (p = 0.027): it is the lifecycle phase that cannot be judged
+    r = np.random.default_rng(105)
+    a = _quiet_analyze(from_values(10 + np.arange(5) + r.normal(0, 0.3, 5), start="2021-01-01", freq="Y"))
+    assert a.metrics.direction == "up" and a.metrics.n_obs < A.MIN_PHASE_OBS == A._MIN_SHORT_N
+    assert a.phase.reasons[0] == "관측치가 5개뿐이라 국면을 판단하기에 데이터가 부족합니다."
+    assert "MIN_PHASE_OBS" in A.__all__
+
+
+def _weekly_multiplicative(off: int, n: int = 208, horizon: int = 26, growth: float = 0.004,
+                           amp: float = 0.4) -> tuple[pd.Series, np.ndarray]:
+    t = np.arange(n + horizon) + off
+    rng = np.random.default_rng(off)
+    fac = 1 + amp * np.sin(2 * np.pi * t / 52)
+    lvl = 100 * (1 + growth) ** np.arange(n + horizon)
+    y = (lvl * fac * np.exp(rng.normal(0, 0.02, n + horizon)))[:n]
+    return pd.Series(y, index=pd.date_range("2018-01-07", periods=n, freq="W-SUN")), lvl
+
+
+def test_weekly_multiplicative_seasonality_is_decomposed_in_log_space():
+    # R4-REV-4: weekly, 4 years, +0.4 %/week with a 40 % multiplicative season: the additive trend
+    # (26-week window < 52-week period) soaks up part of the growing swing, the interaction slope
+    # came out at 0.26 (< 0.35) with t = 11.4, so the series stayed additive although the log fit
+    # leaves 2.5x less remainder; the outlook then read +29.1 % for a true +16.7 %
+    from trendai.pipeline import run
+    for off in (0, 13, 39):
+        s, lvl = _weekly_multiplicative(off)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rep = run(s, freq="W")
+        d = rep.analysis.decomposition
+        assert A._is_multiplicative(d), off
+        # the trend is the season-average level (seasonal / trend averages ~0 over a period),
+        # not the geometric mean ~4 % below it
+        tr, se = d.trend.to_numpy(), d.seasonal.to_numpy()
+        assert abs(float(np.mean(se[-52:] / tr[-52:]))) < 0.01
+        assert abs(tr[-1] / lvl[207] - 1) < 0.02, (off, tr[-1], lvl[207])
+        truth = (lvl[208:].mean() / lvl[156:208].mean() - 1) * 100
+        assert abs(rep.outlook.expected_change_pct - truth) < 5, (off, rep.outlook.expected_change_pct, truth)
+    # additive seasonality on the same growing level stays additive
+    for off in (0, 13):
+        t = np.arange(208) + off
+        rng = np.random.default_rng(off)
+        y = 100 * 1.004 ** np.arange(208) + 40 * np.sin(2 * np.pi * t / 52) + rng.normal(0, 2, 208)
+        s = pd.Series(y, index=pd.date_range("2018-01-07", periods=208, freq="W-SUN"))
+        assert not A._is_multiplicative(_quiet_analyze(s, freq="W").decomposition)

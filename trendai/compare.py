@@ -22,7 +22,12 @@ file of the same process get about the same score:
   the last season) from its *future level* (mean of the last season of the
   horizon),
 * ``recent_ann`` – year-over-year change of the trend component (last
-  ``periods_per_year`` periods; annualised when the series is shorter),
+  ``periods_per_year`` periods; annualised when the series is shorter).
+  It follows the analysis' percentage rules: ``None`` (no contribution)
+  when the analysis states no recent change in % (``metrics.recent_change_pct``
+  is ``None``: intermittent demand, a level that crossed zero, a base near
+  zero), and when :func:`trendai.analysis.pct_change_undefined` refuses the
+  year-over-year change itself (a P&L that fell through zero is no "−100 %"),
 * ``momentum_pm`` – the analysis' momentum converted from % per period to
   % per month,
 * ``P(up)`` – the outlook's ``prob_increase``: the probability that the
@@ -45,6 +50,7 @@ from typing import Iterable, Mapping, Optional, Union
 import numpy as np
 import pandas as pd
 
+from .analysis import _is_intermittent, pct_change_undefined
 from .data import periods_per_year
 from .types import PHASE_KO, TrendReport
 
@@ -117,8 +123,23 @@ def expected_change_annualised(report: TrendReport) -> Optional[float]:
 
 
 def recent_change_annualised(report: TrendReport) -> Optional[float]:
-    """Year-over-year change of the trend component in % (annualised if shorter than a year)."""
+    """Year-over-year change of the trend component in % (annualised if shorter than a year).
+
+    ``None`` -- the score then leaves the recent change out -- wherever the
+    analysis gives no percentage for it: ``metrics.recent_change_pct`` is
+    ``None`` (intermittent demand, a trend that crossed zero, a base near
+    zero), the series is intermittent demand, or
+    :func:`trendai.analysis.pct_change_undefined` refuses the change over this
+    window (base ~0 or negative, a crossing of zero, a base within half a
+    standard deviation of 0 for data with negative values).  A table showing
+    ``—`` for the recent change never sits next to a score driven by it.
+    """
     a = report.analysis
+    if getattr(a.metrics, "recent_change_pct", 0.0) is None:
+        return None
+    values = np.asarray(a.series, dtype=float)
+    if _is_intermittent(values, int(a.season_length or 1)):
+        return None
     trend = getattr(a.decomposition, "trend", None)
     y = np.asarray(trend if trend is not None and len(trend) == len(a.series) else a.series,
                    dtype=float)
@@ -128,8 +149,7 @@ def recent_change_annualised(report: TrendReport) -> Optional[float]:
     ppy = _ppy(report)
     k = int(min(max(1, round(ppy)), n - 1))
     base, last = float(y[-1 - k]), float(y[-1])
-    scale = float(np.nanmax(np.abs(y))) if np.isfinite(y).any() else 0.0
-    if not math.isfinite(base) or base <= 1e-9 * max(scale, 1e-300):
+    if pct_change_undefined(base, last, values) is not None:
         return None
     return annualise_pct((last / base - 1.0) * 100.0, k, ppy)
 
@@ -140,7 +160,11 @@ def momentum_per_month(report: TrendReport) -> float:
 
 
 def rising_score(report: TrendReport) -> float:
-    """Composite 0–100 score: higher = stronger expected rise (50 = neutral).
+    """Composite 0–100 score: the outlook plus the recent momentum (50 = neutral).
+
+    Higher means a stronger rising picture overall -- the forecast's expected
+    change and ``P(up)`` blended with the recent change and momentum (see the
+    module docstring) -- not an expected rise by itself.
 
     Frequency-neutral: the change components are annualised and momentum is
     per month (see the module docstring), so daily, weekly, monthly and

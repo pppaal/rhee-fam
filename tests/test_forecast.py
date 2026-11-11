@@ -91,8 +91,15 @@ def _assert_valid(fc: ForecastResult, horizon: int) -> None:
 
 
 def _make_analysis(s: pd.Series, freq: str, phase: str = "growing",
-                   seasonal: pd.Series | None = None) -> AnalysisResult:
-    """A minimal hand-built AnalysisResult (only what compute_outlook needs is meaningful)."""
+                   seasonal: pd.Series | None = None,
+                   seasonal_strength: float | None = None) -> AnalysisResult:
+    """A minimal hand-built AnalysisResult (only what compute_outlook needs is meaningful).
+
+    ``seasonal_strength`` defaults to 0.9 when a ``seasonal`` component is given (the
+    analysis found that pattern) and 0 otherwise: compute_outlook removes the seasonal
+    effect of a partial-season window only for seasonality that is not negligible."""
+    if seasonal_strength is None:
+        seasonal_strength = 0.9 if seasonal is not None else 0.0
     m = season_length(freq)
     seas = seasonal if seasonal is not None else pd.Series(np.zeros(len(s)), index=s.index)
     trend = (s - seas).rolling(max(m, 3), center=True, min_periods=1).mean()
@@ -102,8 +109,8 @@ def _make_analysis(s: pd.Series, freq: str, phase: str = "growing",
         n_obs=len(s), freq=freq, start=s.index[0], end=s.index[-1], last_value=float(s.iloc[-1]),
         mean=float(s.mean()), total_change_pct=None, cagr_pct=None, recent_change_pct=None,
         slope=0.0, slope_pct=0.0, momentum=0.0, acceleration=0.0, volatility=0.1,
-        trend_strength=0.5, seasonal_strength=0.0, mk_tau=0.0, mk_pvalue=1.0, direction="flat",
-        peak_date=s.index[peak_i], peak_value=float(s.iloc[peak_i]), drawdown_pct=0.0,
+        trend_strength=0.5, seasonal_strength=float(seasonal_strength), mk_tau=0.0, mk_pvalue=1.0,
+        direction="flat", peak_date=s.index[peak_i], peak_value=float(s.iloc[peak_i]), drawdown_pct=0.0,
     )
     return AnalysisResult(name=str(s.name), series=s, freq=freq, season_length=m, decomposition=dec,
                           metrics=metrics, changepoints=[], anomalies=[],
@@ -1360,7 +1367,7 @@ def _multiplicative_analysis(freq: str, n: int, H: int, growth: float, ratio):
     dec = Decomposition(trend=pd.Series(trend[:n], index=s.index),
                         seasonal=pd.Series(trend[:n] * r[:n], index=s.index),
                         resid=pd.Series(np.zeros(n), index=s.index), period=p)
-    an = dataclasses.replace(_make_analysis(s, freq, "growing"), decomposition=dec)
+    an = dataclasses.replace(_make_analysis(s, freq, "growing", seasonal_strength=0.9), decomposition=dec)
     return s, an, y[n:], trend[n:]
 
 
@@ -1526,3 +1533,106 @@ def test_compounding_growth_offers_log_drift(registry):
     fc = F.auto_forecast(from_values(y, freq="Y"), horizon=5, freq="Y")
     names = {ms.name for ms in fc.model_scores}
     assert ("drift@log" in names) == ("drift@log" in M.MODEL_REGISTRY)
+
+
+# --------------------------------------------------------------------------- round 4: short noise, labels, zeros
+
+
+def test_fallback_extrapolates_only_a_significant_trend():
+    """F2: 7 daily points of flat noise (Mann-Kendall p = 0.37) got drift + naive, whose end-to-end
+    slope over the 30-day default horizon read 'down, −50.7 %, P(up) = 22 %'; 30-70 % of such
+    noise series got a direction call."""
+    rng = np.random.default_rng(107)
+    rng.normal(0, 0.3, 7)
+    s = pd.Series(10 + rng.normal(0, 0.5, 7), index=pd.date_range("2025-12-25", periods=7, freq="D"))
+    fc = F.auto_forecast(s)
+    assert fc.method.startswith("fallback(naive)") and "no significant trend" in fc.method
+    o = F.compute_outlook(_make_analysis(s, "D", "stable"), fc)
+    assert o.direction == "flat" and 0.1 < o.prob_increase < 0.9, o
+    # flat white noise, 5 points: almost never a direction call (was 43 of 60 seeds daily)
+    calls = 0
+    for seed in range(60):
+        y = from_values(10 + np.random.default_rng(seed).normal(0, 0.5, 5), freq="D")
+        calls += F.compute_outlook(_make_analysis(y, "D", "stable"), F.auto_forecast(y)).direction != "flat"
+    assert calls <= 6, calls
+    # a clear short trend keeps its drift and its direction
+    for vals, word in (([10.0, 11.0, 12.0], "up"), ([10.0, 12.0, 14.0, 16.0, 18.0], "up"),
+                       (10 + np.arange(6.0) + np.random.default_rng(1).normal(0, 0.3, 6), "up"),
+                       ([5.0, 4.0, 3.0, 2.5, 1.5], "down")):
+        y = from_values(vals, freq="M")
+        fc = F.auto_forecast(y)
+        assert fc.method.startswith("fallback(drift 0.50, naive 0.50)"), (vals, fc.method)
+        assert F.compute_outlook(_make_analysis(y, "M", "growing"), fc).direction == word
+
+
+def test_significant_trend_helper():
+    assert F._significant_trend(np.array([1.0, 2.0, 3.0]))                      # exact line
+    assert F._significant_trend(1e200 * np.array([1.0, 2.0, 3.0, 4.0]))         # no overflow
+    assert not F._significant_trend(np.full(6, 4.0))                            # no slope
+    assert not F._significant_trend(np.array([1.0, 2.0]))                       # too short
+    assert not F._significant_trend(np.array([10.79, 9.78, 9.7, 10.85, 10.66, 9.83, 9.0]))
+    assert F._significant_trend(np.array([10.1, 11.2, 11.8, 13.1, 14.0, 14.9]))
+
+
+def test_partial_season_adjustment_only_for_material_seasonality():
+    """F17: a constant weekly series (seasonal component ~1e-14) was compared 'seasonally adjusted'
+    (adj_fut True) next to '계절성은 거의 없습니다 (강도 0.00)'.  The adjustment now needs a
+    seasonal strength >= 0.2 and an effect of at least 0.5 % of the window's level."""
+    n, H = 156, 26
+    t = np.arange(n, dtype=float)
+    const = from_values(np.full(n, 100.0), freq="W")
+    tiny = pd.Series(1e-14 * np.sin(2 * np.pi * t / 52), index=const.index)
+    lv = F.outlook_levels(_make_analysis(const, "W", "stable", seasonal=tiny),
+                          _hand_forecast(const, "W", np.full(H, 100.0), np.full(H, 1.0)))
+    assert (lv.adj_cur, lv.adj_fut) == (False, False) and lv.current == lv.future == 100.0
+    # a real seasonal pattern the forecast carries: adjusted (strength 0.9) ...
+    s, an = _weekly_seasonal_analysis()
+    k = np.arange(n, n + H, dtype=float)
+    seasonal_fc = 100 + 8 * np.sin(2 * np.pi * k / 52)
+    lv = F.outlook_levels(an, _hand_forecast(s, "W", seasonal_fc, np.full(H, 1.0)))
+    assert lv.adj_fut and lv.future == pytest.approx(100.0, abs=0.5)
+    # ... but not when the analysis found it negligible (strength < 0.2): plain means
+    weak = dataclasses.replace(an, metrics=dataclasses.replace(an.metrics, seasonal_strength=0.1))
+    lv = F.outlook_levels(weak, _hand_forecast(s, "W", seasonal_fc, np.full(H, 1.0)))
+    assert not lv.adj_fut and lv.future == pytest.approx(float(np.mean(seasonal_fc)))
+    # a flat forecast carries no seasonality: nothing is removed, so nothing is labelled
+    lv = F.outlook_levels(an, _hand_forecast(s, "W", np.full(H, 100.0), np.full(H, 1.0)))
+    assert not lv.adj_fut and lv.future == 100.0
+
+
+def test_all_zero_history_gets_no_float_noise_band():
+    """F18: zeros(36) monthly got scenarios {0, 0, 5.28e-09} ('낙관 5.28×10⁻⁹'); an all-zero
+    history has no scale, so its bands have zero width (short series too)."""
+    for n in (36, 5):
+        s = from_values(np.zeros(n), freq="M")
+        fc = F.auto_forecast(s)
+        _assert_valid(fc, 12)
+        for lv in fc.levels:
+            assert np.all(fc.lower[lv].to_numpy() == 0.0) and np.all(fc.upper[lv].to_numpy() == 0.0)
+        o = F.compute_outlook(_make_analysis(s, "M", "stable"), fc)
+        assert o.scenarios == {"pessimistic": 0.0, "base": 0.0, "optimistic": 0.0}
+        assert o.direction == "flat" and o.expected_change_pct is None
+    # any other constant keeps a (negligible, level-relative) band
+    fc7 = F.auto_forecast(from_values(np.full(36, 7.0), freq="M"))
+    assert np.all((fc7.upper[80] - fc7.lower[80]).to_numpy() > 0)
+
+
+def test_intermittent_demand_percentage_compares_average_demand_rates():
+    """R4-REV-3: the documented contract -- intermittent demand gets a percentage of its average
+    demand rates unless at least half of the current window is zero ('mostly_zero')."""
+    for seed in range(12):
+        rng = np.random.default_rng(seed)
+        y = (rng.random(60) < 0.6) * rng.integers(1, 20, 60).astype(float)
+        if not F._is_intermittent(y, 12):
+            continue
+        s = from_values(y, freq="M")
+        fc = F.auto_forecast(s)
+        lv = F.outlook_levels(_make_analysis(s, "M", "stable"), fc)
+        o = F.compute_outlook(_make_analysis(s, "M", "stable"), fc)
+        if np.mean(y[-12:] == 0) >= 0.5:
+            assert lv.undefined == "mostly_zero" and o.expected_change_pct is None
+        else:
+            assert lv.undefined is None
+            assert lv.current == pytest.approx(np.mean(y[-12:]))          # average demand rate
+            assert lv.future == pytest.approx(np.mean(fc.mean.to_numpy()[-12:]))
+            assert o.expected_change_pct == pytest.approx((lv.future - lv.current) / lv.current * 100)

@@ -168,7 +168,8 @@ def test_rule_based_english(fake_report):
     for h in ("## Past", "## Present", "## Outlook", "## Caveats"):
         assert h in text
     assert "Growing" in text
-    assert "From **2021-12**: growth accelerated" in text
+    # round 4 (U6): the shared changepoint vocabulary (analysis.changepoint_label)
+    assert "From **2021-12**: growth accelerating" in text
     assert "0.02 → 1.20/mo" in text
     assert "+15.0%" in text and "+180.0%" in text
     assert "not financial or investment advice" in text
@@ -437,8 +438,10 @@ def test_generate_narrative_uses_llm(fake_report):
 def test_generate_narrative_falls_back_on_connection_error(fake_report):
     _, errors = _sdk_errors()
     client = FakeClient(exc=errors["conn"])
-    with pytest.warns(RuntimeWarning, match="규칙 기반"):
+    # round 4 (U7): with lang='en' the fallback warning (and the reason in it) is English
+    with pytest.warns(RuntimeWarning, match="rule-based narrative") as rec:
         text, source = generate_narrative(*_parts(fake_report), use_llm=True, lang="en", client=client)
+    assert not any(HANGUL.search(str(w.message)) for w in rec)
     assert source == "rule"
     assert text == rule_based_narrative(*_parts(fake_report), lang="en")
     assert len(client.calls) == 1
@@ -779,7 +782,10 @@ def test_tiny_and_huge_magnitudes_do_not_collapse():
     assert format_number(-2.5e-11, signed=True) == "−2.5×10⁻¹¹"
     assert format_number(3e-5, signed=True) == "+3×10⁻⁵"
     assert format_number(2.5e20) == "2.5×10²⁰"
-    assert format_number(999_999_999_999_999.0) == "999,999,999,999,999"
+    # just below the ×10ⁿ bound stays fixed; the bound moved from 1e15 to 1e12 in round 4 (F8:
+    # '18,698,199,572,300 → 460,927,814,133,102/월' was unreadable), so test its new edge
+    assert format_number(999_999_999_999.0) == "999,999,999,999"
+    assert format_number(18_698_199_572_300.0) == "1.87×10¹³"
     assert format_number(1e-9, decimals=2) == "0.00"           # explicit decimals are honoured
     t = np.arange(48.0)
     rep = _report_from_values(1e-9 * (1 + 0.01 * t), name="tiny")
@@ -1573,3 +1579,460 @@ def test_round3_reasons_from_real_analyses_all_translate():
             a = analyze(s)
         for r in a.phase.reasons:
             assert nv.translate_reason(r), r
+
+
+# --------------------------------------------------------------------------- round 4
+
+
+def _mult_growth(n: int = 120, seed: int = 1) -> pd.Series:
+    """Monthly multiplicative seasonality on exponential growth (analysis decomposes it in logs)."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n)
+    y = 50 * np.exp(0.02 * t) * (1 + 0.35 * np.sin(2 * np.pi * (t + 10) / 12)) * np.exp(0.03 * rng.standard_normal(n))
+    return pd.Series(y, index=pd.date_range("2020-01-05", periods=n, freq="MS"))
+
+
+def _pnl_cross(seed: int) -> pd.Series:
+    """A P&L that rose from -20 to +20 and is falling towards 0 (the forecast crosses zero)."""
+    rng = np.random.default_rng(seed)
+    y = np.r_[np.linspace(-20, 20, 24), np.linspace(20, 0.5, 24)] + rng.normal(0, 1, 48)
+    return pd.Series(y, index=pd.date_range("2020-01-01", periods=48, freq="MS"))
+
+
+@pytest.mark.parametrize("label,series,freq,horizon", [
+    ("mult-M-h6", "mult", "M", 6),             # multiplicative + partial-season forecast window
+    ("mult-M-h18", "mult", "M", 18),
+    ("mult-M-h12", "mult", "M", 12),
+    ("seasonal-W-h26", "seasonal", "W", 26),   # 26 of 52 weeks: both windows partial
+    ("seasonal-W-h8", "seasonal", "W", 8),
+    ("growing-M-h5", "growing", "M", 5),
+    ("seasonal-D-h10", "seasonal", "D", 10),
+    ("fad-Q-h3", "fad", "Q", 3),
+    ("emerging-Y-h4", "emerging", "Y", 4),
+    ("reviving-M-h7", "reviving", "M", 7),
+    ("pnl-M-h12", "pnl", "M", 12),
+])
+def test_narrative_levels_are_outlook_levels(label, series, freq, horizon):
+    # U1: narrative._outlook_windows mirrored compute_outlook but continued the seasonal pattern
+    # without the forecast level, so for a multiplicative decomposition with a partial-season
+    # window the narrative and payload printed 576.4 (+19.0 %) next to expected_change_pct
+    # +17.5 % (outlook_levels 569.09).  forecast.outlook_levels is now the single source.
+    from trendai.forecast import outlook_levels
+    if series == "mult":
+        s = _mult_growth()
+    elif series == "pnl":
+        s = _pnl_cross(1)
+    else:
+        s = sample(series, freq=freq, **({"n": 156} if freq == "W" else {}))
+    rep = _run(s, name=label, freq=freq, horizon=horizon)
+    a, f, o = _parts(rep)
+    lv = outlook_levels(a, f)
+    w = nv._outlook_windows(a, f)
+    assert (w.current, w.future, w.k_cur, w.k_fut, w.period, w.adj_cur, w.adj_fut, w.undefined) == (
+        lv.current, lv.future, lv.k_cur, lv.k_fut, lv.period, lv.adj_cur, lv.adj_fut, lv.undefined)
+    p_out = build_llm_payload(a, f, o)["outlook"]
+    assert p_out["compared_levels"] == {"current": nv._r(lv.current), "future": nv._r(lv.future)}
+    assert p_out["expected_change_undefined"] == lv.undefined
+    if lv.undefined is None:
+        implied = (lv.future - lv.current) / abs(lv.current) * 100
+        assert implied == pytest.approx(o.expected_change_pct, rel=1e-9, abs=1e-9)
+        assert format_pct(o.expected_change_pct) in rep.narrative
+    else:
+        # the narrative prints the two levels themselves
+        assert format_number(lv.future, signed=lv.undefined in ("sign_change", "near_zero")) in rep.narrative
+    if series == "mult" and horizon == 6:
+        from trendai.analysis import _is_multiplicative
+        assert _is_multiplicative(a.decomposition) and lv.adj_fut
+
+
+def test_sign_change_and_near_zero_outlooks_have_their_own_wording():
+    # U2: a level expected to cross zero (or a current level near 0 among negative values) was
+    # explained as '현재 수준이 0에 가까워' -- wrong for +4.7 -> -3.9
+    from trendai.forecast import outlook_levels
+    for seed, word_ko, word_en in ((1, "**하락**", "**downward**"), (2, "**방향 불확실**", "**direction uncertain**")):
+        rep = _run(_pnl_cross(seed), name="pnl", horizon=12)
+        lv = outlook_levels(*_parts(rep)[:2])
+        assert lv.undefined == "sign_change" and lv.current > 0 > lv.future
+        assert rep.outlook.expected_change_pct is None
+        ko = rule_based_narrative(*_parts(rep))
+        first = ko.split("## 미래 전망")[1].splitlines()[1]
+        cur, fut = format_number(lv.current, signed=True), format_number(lv.future, signed=True)
+        assert f"전망은 {word_ko}입니다" in first and "0을 지나 음수로 바뀔 것으로" in first
+        assert f"{cur} → 향후 12개월 예측 평균 {fut}" in first and "0에 가까워" not in first
+        assert "%" not in first.replace("변화율(%)", "")
+        en = rule_based_narrative(*_parts(rep), lang="en")
+        first_en = en.split("## Outlook")[1].splitlines()[1]
+        assert f"is {word_en}" in first_en and "expected to cross zero" in first_en
+        assert f"from {cur} (the average of the last 12 months) to {fut}" in first_en
+        assert not HANGUL.search(en.replace("pnl", ""))
+        p = build_llm_payload(*_parts(rep))["outlook"]
+        assert p["expected_change_undefined"] == "sign_change" and "cross zero" in p["expected_change_basis"]
+        assert p["direction_label"]["ko"] == word_ko.strip("*")
+    # 'near_zero': data with negatives, current level within half an SD of 0, same sign ahead
+    idx = pd.date_range("2020-01-01", periods=60, freq="MS")
+    rng = np.random.default_rng(8)
+    y = 8 * np.sin(np.arange(60) / 5 + 8) + rng.normal(0, 1, 60) + 1.0
+    rep = _run(pd.Series(y, index=idx), name="temp", horizon=6)
+    lv = outlook_levels(*_parts(rep)[:2])
+    assert lv.undefined == "near_zero"
+    ko = rule_based_narrative(*_parts(rep))
+    first = ko.split("## 미래 전망")[1].splitlines()[1]
+    assert f"({format_number(lv.current, signed=True)})이 값의 평소 변동 폭(표준편차" in first
+    assert "0에 가까워 변화율(%)은 의미가 없습니다" in first and "0을 지나" not in first
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "close to zero relative to the typical spread of the values" in en
+    p = build_llm_payload(*_parts(rep))["outlook"]
+    assert p["expected_change_undefined"] == "near_zero" and "half a standard deviation" in p["expected_change_basis"]
+    assert nv.direction_label("flat", None, "ko", "sign_change") == "방향 불확실"
+    assert nv.direction_label("flat", None, "ko", "near_zero") == "보합"
+
+
+def test_zero_crossing_history_gets_no_percentages_in_the_narrative():
+    # U3: P&L 10 -> -10: '추세선 기준으로 10.4에서 −8.69까지 **−183.6%** 변했습니다' and
+    # '최근 값(−8.04)은 고점보다 179.4% 낮아 고점의 1/10 이하로 급감했습니다'
+    rng = np.random.default_rng(0)
+    s = pd.Series(np.linspace(10, -10, 48) + rng.normal(0, 1.0, 48),
+                  index=pd.date_range("2022-01-01", periods=48, freq="MS"))
+    rep = _run(s, name="P&L", horizon=12)
+    m = rep.analysis.metrics
+    assert m.total_change_pct is None and m.drawdown_pct < -100
+    ko = rule_based_narrative(*_parts(rep))
+    past = ko.split("## 과거: 어떻게 여기까지 왔나")[1].split("## 현재")[0]
+    trend_line = next(ln for ln in past.splitlines() if ln.startswith("- 추세선"))
+    assert "그사이 0을 지나 음수로 바뀌어 변화율(%)은 정의되지 않습니다" in trend_line
+    assert "0에 가까워" not in trend_line
+    peak_line = next(ln for ln in past.splitlines() if ln.startswith("- 최고치"))
+    gap = format_number(m.peak_value - m.last_value)
+    assert f"고점보다 {gap} 낮습니다" in peak_line and "하락률(%)은 의미가 없습니다" in peak_line
+    assert not re.search(r"\d+(\.\d)?% 낮", ko) and "급감" not in ko
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "undefined because the level crossed zero" in en
+    assert f"is {format_number(m.peak_value - m.last_value, lang='en')} below it. The value has crossed zero" in en
+    assert not HANGUL.search(en.replace("P&L", ""))
+    metrics = build_llm_payload(*_parts(rep))["metrics"]
+    assert metrics["drawdown_pct"] is None and metrics["total_change_pct"] is None
+    assert metrics["pct_undefined"]["total_change_pct"] == "sign_change"
+    assert metrics["pct_undefined"]["drawdown_pct"] == "sign_change"
+    # the trend-based drawdown (seasonal rule, report tile) follows the same rule
+    assert nv._trend_drawdown(rep.analysis) is None
+    # ratio-scale samples keep their drawdown wording
+    dec = _sample_run("declining")
+    assert nv._drawdown_undefined(dec.analysis) is None
+    assert "고점보다" in dec.narrative and "하락률(%)은 의미가 없습니다" not in dec.narrative
+
+
+def _with_outlook(rep: TrendReport, **kw) -> TrendReport:
+    return dataclasses.replace(rep, outlook=dataclasses.replace(rep.outlook, **kw))
+
+
+def _future(text: str, lang: str = "ko") -> str:
+    head, tail = ("## 미래 전망", "## 주의할 점") if lang == "ko" else ("## Outlook", "## Caveats")
+    return text.split(head)[1].split(tail)[0]
+
+
+def test_flat_outlook_keeping_a_moving_phase_is_not_a_projection():
+    # U4: future_phase keeps the current phase when a flat forecast is uninformative, but the
+    # narrative said '12개월 뒤에도 성장기 국면이 이어질 것으로 전망됩니다'
+    base = _sample_run("growing")
+    assert base.analysis.phase.label == "growing"
+    rep = _with_outlook(base, direction="flat", expected_change_pct=30.0, future_phase="growing",
+                        confidence="medium")
+    fut = _future(rule_based_narrative(*_parts(rep)))
+    assert "이어질 것으로 전망됩니다" not in fut
+    assert "현재 **성장기** 국면이 12개월 뒤에도 이어질지 바뀔지는 아직 판단하기 어렵습니다" in fut
+    en = _future(rule_based_narrative(*_parts(rep), lang="en"), "en")
+    assert "still **Growing**" not in en and "is hard to judge yet" in en
+    # with the reconciliation line (a small change against a rising phase): one message, not two
+    rep2 = _with_outlook(rep, expected_change_pct=0.5)
+    fut2 = _future(rule_based_narrative(*_parts(rep2)))
+    assert fut2.count("판단하기 어려") == 1 and fut2.count("다음 관측치") == 1
+    assert "최근 상승세가 뚜렷하지만" in fut2 and "이어질 것으로 전망됩니다" not in fut2
+    assert "현재 **성장기** 국면이 이어질지는 아직 판단하기 어려우니" in fut2
+    # peaking and declining are moving phases too
+    for nm, ko_name in (("peaking", "정점"), ("declining", "쇠퇴기")):
+        r = _sample_run(nm)
+        lab = r.analysis.phase.label
+        r = _with_outlook(r, direction="flat", expected_change_pct=-15.0, future_phase=lab, confidence="medium")
+        f3 = _future(rule_based_narrative(*_parts(r)))
+        assert "이어질 것으로 전망됩니다" not in f3 and "판단하기 어렵" in f3
+    # a directional outlook keeps the projection; stable/volatile phases too
+    up = _with_outlook(base, direction="up", expected_change_pct=12.0, future_phase="growing", confidence="medium")
+    assert "12개월 뒤에도 **성장기** 국면이 이어질 것으로 전망됩니다" in rule_based_narrative(*_parts(up))
+    p = build_llm_payload(*_parts(rep))["outlook"]
+    assert "hard to judge" in p["future_phase_basis"]
+    assert build_llm_payload(*_parts(up))["outlook"]["future_phase_basis"] is None
+
+
+def test_low_confidence_phase_change_is_not_called_likely():
+    # U4: '…국면으로 넘어갈 가능성이 있습니다' under a low-confidence forecast
+    base = _sample_run("growing")
+    rep = _with_outlook(base, direction="down", expected_change_pct=-20.0, future_phase="declining",
+                        confidence="low")
+    fut = _future(rule_based_narrative(*_parts(rep)))
+    assert "가능성이 있습니다" not in fut
+    assert "예측대로라면 12개월 안에 **성장기**에서 **쇠퇴기** 국면으로 넘어가지만, 예측 신뢰도가 낮아" in fut
+    en = _future(rule_based_narrative(*_parts(rep), lang="en"), "en")
+    assert "Projected phase shift" not in en and "with low forecast confidence" in en
+    assert "never as a likely" in build_llm_payload(*_parts(rep))["outlook"]["future_phase_basis"]
+    sure = _with_outlook(rep, confidence="medium")
+    assert "국면으로 넘어갈 가능성이 있습니다" in rule_based_narrative(*_parts(sure))
+
+
+def test_scenario_bound_at_the_zero_floor():
+    # U5: a nonnegative forecast clipped at 0 printed '비관 0 (−100.0%)'
+    assert nv.format_scenario(0.0, 7.5, True) == "0(하한)"
+    assert nv.format_scenario(0.0, 7.5, True, "en") == "0 (floor)"
+    assert nv.scenario_value(0.0, 7.5, nonnegative=True) == ("0(하한)", None)
+    assert nv.scenario_value(-1e-12, 7.5, True, "en") == ("0 (floor)", None)
+    assert nv.format_scenario(9.0, 7.5, True) == "9.00 (+20.0%)"
+    assert nv.format_scenario(0.0, 7.5, False) == "0 (−100.0%)"     # not clipped: a real zero
+    assert nv.format_scenario(3.0, None, True) == "3.00" and nv.format_scenario(3.0, 0.0) == "3.00"
+    assert nv.scenario_value(None) == ("해당 없음", None) and nv.scenario_value(float("nan"), 1, lang="en")[0] == "n/a"
+    # end to end: a series falling towards 0 (nonnegative forecast, bound clipped at 0)
+    rng = np.random.default_rng(0)
+    s = pd.Series(np.linspace(30, 4, 48) + rng.normal(0, 0.8, 48),
+                  index=pd.date_range("2020-01-01", periods=48, freq="MS"))
+    rep = _run(s, name="parts", horizon=12)
+    f, o = rep.forecast, rep.outlook
+    assert f.nonnegative and o.scenarios["pessimistic"] == 0.0
+    ko = rule_based_narrative(*_parts(rep))
+    scen = next(ln for ln in ko.splitlines() if "시점 시나리오" in ln)
+    assert "비관 0(하한)" in scen and "−100.0%" not in ko
+    assert scen.count("0 아래로 내려갈 수 없음") == 1
+    assert "값이 음수가 될 수 없어" not in ko             # one caveat, not two
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "pessimistic 0 (floor)" in en and "−100.0%" not in en and "cannot go below 0" in en
+    assert "Values cannot be negative" not in en
+    # a 95 % bound alone at the floor keeps the caveat section's note
+    rep95 = _with_outlook(rep, scenarios={"pessimistic": 2.0, "base": 5.0, "optimistic": 8.0})
+    ko95 = rule_based_narrative(*_parts(rep95))
+    assert "비관 2.00" in ko95 and "값이 음수가 될 수 없어 예측 하한을 0으로 제한했습니다" in ko95
+
+
+@pytest.mark.parametrize("key,ko_needle,en_needle", [
+    ("auth", "ANTHROPIC_API_KEY", "authentication failed"),
+    ("perm", "권한", "may not use the model"),
+    ("rate", "rate limit", "rate limit was reached"),
+    ("status", "HTTP 500", "returned an error (HTTP 500)"),
+    ("conn", "연결할 수 없습니다", "Cannot reach the Claude API"),
+])
+def test_narrative_unavailable_messages_follow_lang(fake_report, key, ko_needle, en_needle):
+    # U7: the messages were Korean even with lang='en' (the CLI prints them after an English prefix)
+    _, errors = _sdk_errors()
+    with pytest.raises(NarrativeUnavailable, match=re.escape(en_needle)) as ei:
+        llm_narrative(*_parts(fake_report), lang="en", client=FakeClient(exc=errors[key]))
+    assert not HANGUL.search(str(ei.value))
+    with pytest.raises(NarrativeUnavailable, match=re.escape(en_needle)) as ei:
+        ask(fake_report, "why?", lang="en", client=FakeClient(exc=errors[key]))
+    assert not HANGUL.search(str(ei.value))
+    with pytest.raises(NarrativeUnavailable, match=re.escape(ko_needle)):
+        ask(fake_report, "왜?", client=FakeClient(exc=errors[key]))
+
+
+def test_other_narrative_unavailable_paths_follow_lang(monkeypatch, fake_report):
+    # U7: refusal, empty response, missing SDK, missing credentials, truncation warning
+    cases = [FakeClient(_resp(stop_reason="refusal")),
+             FakeClient(_resp(SimpleNamespace(type="thinking", thinking="..."))),
+             FakeClient(exc=TypeError("Could not resolve authentication method")),
+             FakeClient(exc=TypeError("create() got an unexpected keyword argument 'fallbacks'"))]
+    for client in cases:
+        with pytest.raises(NarrativeUnavailable) as ei:
+            llm_narrative(*_parts(fake_report), lang="en", client=client)
+        assert not HANGUL.search(str(ei.value)), str(ei.value)
+        with pytest.raises(NarrativeUnavailable) as ei:
+            llm_narrative(*_parts(fake_report), client=client)
+        assert HANGUL.search(str(ei.value))
+    with pytest.warns(RuntimeWarning) as rec:
+        ask(fake_report, "why?", lang="en", client=FakeClient(_resp(_text("Because"), stop_reason="max_tokens")))
+    assert not any(HANGUL.search(str(w.message)) for w in rec)
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    with pytest.raises(NarrativeUnavailable, match="not installed: pip install anthropic"):
+        ask(fake_report, "why?", lang="en", client=FakeClient(_resp(_text("x"))))
+
+
+def test_is_intermittent_is_public():
+    # U8: report labels the anomaly table '평소 규모' for intermittent demand
+    inter = _run(_intermittent_series(), name="parts")
+    assert nv.is_intermittent(inter.analysis) is True
+    assert nv.is_intermittent(_sample_run("growing").analysis) is False
+    assert "is_intermittent" in nv.__all__ and "format_scenario" in nv.__all__
+
+
+def test_narrative_changepoints_use_the_shared_labels():
+    # U6: narrative, phase reasons and report name a break with analysis.changepoint_label
+    from trendai.analysis import changepoint_label
+    for nm, kw in (("reviving", {}), ("reviving", {"freq": "Y", "n": 25}), ("breakout", {"n": 30})):
+        rep = _run(sample(nm, **kw), name=nm, freq=kw.get("freq", "M"))
+        cps = [cp for cp in rep.analysis.changepoints if cp.kind != "level_shift"]
+        assert cps
+        for lang in ("ko", "en"):
+            text = rule_based_narrative(*_parts(rep), lang=lang)
+            for cp in cps:
+                d = nv._Ctx(rep.analysis, rep.forecast, rep.outlook, lang).date(cp.date)
+                lead = f"**{d}**부터 " if lang == "ko" else f"From **{d}**: "
+                assert lead + changepoint_label(cp, lang) + " (" in text
+        payload = build_llm_payload(*_parts(rep))
+        assert all(c["label"] and c["label_ko"] for c in payload["changepoints"])
+    assert "하락에서 상승으로" not in rule_based_narrative(*_parts(_run(sample("reviving"), name="r")))
+
+
+# --------------------------------------------------------------------------- round 4 (final): consistency
+
+
+def test_payload_numbers_print_like_every_other_surface():
+    # F1: prob_increase was rounded to 3 significant digits, 0.45452 -> 0.455, which format_prob
+    # (and so an LLM told to quote the payload) prints as '46%' while the narrative, the terminal
+    # and the HTML report print '45%' (16 of 370 sweep reports)
+    rep = _sample_run("growing")
+    a, f, o = _parts(rep)
+    cases = [(0.45452, 0.5949, 0.94501), (0.5949042, 0.45452, 0.955001), (0.99449, 0.99501, 0.9449),
+             (0.0051, 0.00499, 0.125)]
+    for prob, conf, strength in cases:
+        o2 = dataclasses.replace(o, prob_increase=prob)
+        ph = dataclasses.replace(a.phase, confidence=conf)
+        m = dataclasses.replace(a.metrics, trend_strength=strength, seasonal_strength=strength, mk_tau=-strength)
+        a2 = dataclasses.replace(a, phase=ph, metrics=m)
+        pl = build_llm_payload(a2, f, o2)
+        assert nv.format_prob(pl["outlook"]["prob_increase"]) == nv.format_prob(prob)
+        assert pl["outlook"]["prob_increase_text"] == nv.format_prob(prob)
+        assert nv.format_prob(pl["phase"]["confidence"]) == nv.format_prob(conf)
+        assert pl["phase"]["confidence_text"] == nv.format_prob(conf)
+        for key, v in (("trend_strength", strength), ("seasonal_strength", strength), ("mann_kendall_tau", -strength)):
+            assert format_number(pl["metrics"][key], decimals=2) == format_number(v, decimals=2), key
+        # the narrative prints exactly those texts
+        text = rule_based_narrative(a2, f, o2)
+        assert f"상승 확률 {nv.format_prob(prob)}" in text
+        assert f"(판단 신뢰도 {nv.format_prob(conf)})" in text
+    assert "prob_increase_text" in SYSTEM_PROMPT and "confidence_text" in SYSTEM_PROMPT
+    pl = build_llm_payload(*_parts(rep))
+    for key, fmt in (("total_change_pct", format_pct), ("recent_change_pct", format_pct)):
+        assert fmt(pl["metrics"][key]) == fmt(getattr(rep.analysis.metrics, key))
+
+
+def _short_rising(n: int, freq: str = "Y") -> pd.Series:
+    from trendai.data import from_values
+    r = np.random.default_rng(105)
+    return from_values(10 + np.arange(n) + r.normal(0, 0.3, n), start="2021-01-01", freq=freq)
+
+
+def test_short_series_phase_is_a_tentative_call():
+    # F3: 5 yearly values 9.98 -> 13.9 (Mann-Kendall p = 0.027, significant rise) were called
+    # 'Stable' with "it rose over the long run, but lately it has moved without a clear direction":
+    # below analysis.MIN_PHASE_OBS observations the phase is only a placeholder
+    from trendai.analysis import MIN_PHASE_OBS
+    rep = _run(_short_rising(5), name="short up")
+    a = rep.analysis
+    assert a.metrics.n_obs < MIN_PHASE_OBS and a.metrics.direction == "up" and a.phase.label == "stable"
+    assert nv.phase_is_tentative(a) and "phase_is_tentative" in nv.__all__
+    ko = rule_based_narrative(*_parts(rep))
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "뚜렷한 방향 없이" not in ko and "without a clear direction" not in en
+    assert "단계(관측치가 적어 잠정 판단, 신뢰도" in ko.splitlines()[0]
+    assert "(tentative: too few observations; confidence" in en.splitlines()[0]
+    mom_ko = next(ln for ln in ko.splitlines() if ln.startswith("- 모멘텀"))
+    mom_en = next(ln for ln in en.splitlines() if ln.startswith("- Momentum"))
+    assert "데이터가 짧아" in mom_ko and "too short" in mom_en
+    assert "현재 국면은 **안정기**입니다 (관측치가 적어 잠정 판단" in ko
+    assert "국면으로 넘어가" not in ko and "Projected phase shift" not in en
+    assert "여러 국면의 경계" not in ko and "between phases" not in en
+    assert not HANGUL.search(en.replace("short up", ""))
+    pl = build_llm_payload(*_parts(rep))
+    assert pl["phase"]["tentative"] is True and "phase.tentative" in SYSTEM_PROMPT
+    # every frequency and n = 5..7 (the auditor's short_up_{D,W,M,Q,Y}{5,6,7})
+    for freq in ("D", "W", "M", "Q", "Y"):
+        for n in (5, 6, 7):
+            r = _run(_short_rising(n, freq), name="s")
+            text = rule_based_narrative(*_parts(r))
+            assert "뚜렷한 방향 없이" not in text and "잠정 판단" in text.splitlines()[0], (freq, n)
+    # from MIN_PHASE_OBS observations on the phase is a verdict again
+    long = _run(_short_rising(MIN_PHASE_OBS), name="s")
+    assert not nv.phase_is_tentative(long.analysis)
+    assert build_llm_payload(*_parts(long))["phase"]["tentative"] is False
+    assert "잠정" not in rule_based_narrative(*_parts(long)).splitlines()[0]
+
+
+def test_mann_kendall_direction_against_the_total_change_is_qualified():
+    # F6: fad W156 read '6.94에서 5.80까지 −16.5% 변했고 …' followed by 'Mann-Kendall 검정에서
+    # 통계적으로 유의한 상승 추세가 확인됩니다': the rank-based test is driven by the bubble
+    rep = _sample_run("fad", "W", 156)
+    a = rep.analysis
+    tr = a.decomposition.trend.to_numpy()
+    assert a.metrics.direction == "up" and tr[-1] < tr[0]
+    ko = rule_based_narrative(*_parts(rep))
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    mk_ko = next(ln for ln in ko.splitlines() if "Mann-Kendall" in ln)
+    mk_en = next(ln for ln in en.splitlines() if "Mann-Kendall" in ln)
+    assert "확인됩니다" not in mk_ko and "중간의 높은 구간" in mk_ko
+    assert "꾸준한 상승으로 보기는 어렵습니다" in mk_ko and "같은 이유로 양수입니다" in mk_ko
+    assert "finds a statistically significant" not in mk_en and "high stretch in the middle" in mk_en
+    assert "no steady rise" in mk_en
+    # and the momentum line does not compare with a long-run "rise" either
+    mom = next(ln for ln in ko.splitlines() if ln.startswith("- 모멘텀"))
+    assert "장기 흐름과 달리" not in mom and "장기적으로는 상승" not in mom
+    # a series whose test agrees with its ends keeps the plain sentence
+    grow = rule_based_narrative(*_parts(_sample_run("growing")))
+    assert "통계적으로 유의한 **상승** 추세가 확인됩니다" in grow and "같은 이유로" not in grow
+
+
+def test_huge_numbers_use_one_readable_notation():
+    # F8: '기울기 18,698,199,572,300 → 460,927,814,133,102/월' and on the next line
+    # '460,927,814,133,102 → 1.51×10¹⁵/월': 13+-digit integers switch notation mid-line
+    assert format_number(460_927_814_133.1, scale=1.51e15) == "4.61×10¹¹"
+    assert format_number(0.0, scale=1e15) == "0" and format_number(12.5, scale=1e15) == "12.5"
+    assert format_number(1_234_567.8, scale=1e3) == "1,234,568"
+    rep = _run(sample("emerging", n=120, freq="M") * 1e15, name="huge")
+    long_int = re.compile(r"\d{1,3}(?:,\d{3}){4,}")      # 13 digits or more
+    for lang in ("ko", "en"):
+        text = rule_based_narrative(*_parts(rep), lang=lang)
+        assert not long_int.search(text), long_int.search(text)
+        cps = [ln for ln in text.splitlines() if "→" in ln and ("기울기" in ln or "slope" in ln)]
+        assert cps
+        for ln in cps:
+            pair = re.search(r"([+−]?[\d.,]+(?:×10[⁰¹²³⁴⁵⁶⁷⁸⁹⁻]+)?) → ([+−]?[\d.,]+(?:×10[⁰¹²³⁴⁵⁶⁷⁸⁹⁻]+)?)", ln)
+            assert ("×10" in pair.group(1)) == ("×10" in pair.group(2)), ln
+
+
+def test_random_walk_trend_strength_is_not_called_consistency():
+    # F19: a random walk read '추세의 일관성(추세 강도 0.95)은 매우 높습니다' next to '근거: … 무작위
+    # 행보에 가까운 움직임이라, 추세처럼 보이는 등락도 우연일 수 있습니다' -- the smoother absorbs the wander
+    from trendai.forecast import is_random_walk
+    r = np.random.default_rng(0)
+    s = pd.Series(100 + np.cumsum(r.normal(0, 1, 400)), index=pd.date_range("2016-01-01", periods=400, freq="D"))
+    rep = _run(s, name="rw")
+    assert is_random_walk(rep.analysis) and rep.analysis.metrics.trend_strength >= 0.85
+    ko = rule_based_narrative(*_parts(rep))
+    en = rule_based_narrative(*_parts(rep), lang="en")
+    assert "추세의 일관성" not in ko and "무작위 행보에서는 흔한 일이라 꾸준한 추세의 근거는 아닙니다" in ko
+    assert "trend consistency" not in en and "typical of a random walk" in en
+    assert "추세의 일관성" in rule_based_narrative(*_parts(_sample_run("growing")))
+
+
+def test_evidence_gives_a_drawdown_across_zero_in_units():
+    # R4-REV-8: with no usable phase reasons, _evidence printed '최근 값이 고점(2021-09)보다 184.9%
+    # 낮습니다' for a P&L that fell from 10 through zero, where the past section says a % drop is meaningless
+    rng = np.random.default_rng(3)
+    y = np.r_[np.linspace(2, 10, 20), np.linspace(10, -8, 20)] + rng.normal(0, 0.3, 40)
+    rep = _run(pd.Series(y, index=pd.date_range("2020-01-01", periods=40, freq="MS")), name="pnl", freq="M")
+    a = rep.analysis
+    m = a.metrics
+    assert a.phase.label == "declining" and m.drawdown_pct < -100
+    a2 = dataclasses.replace(a, phase=dataclasses.replace(a.phase, reasons=[]))
+    gap = format_number(m.peak_value - m.last_value)
+    for lang, lead in (("ko", "- 근거: "), ("en", "- Evidence: ")):
+        text = rule_based_narrative(a2, rep.forecast, rep.outlook, lang=lang)
+        ev = [ln for ln in text.splitlines() if ln.startswith(lead)]
+        assert ev and not any("%" in ln and ("고점" in ln or "peak" in ln) for ln in ev), ev
+        assert any(gap in ln and ("고점" in ln or "peak" in ln) for ln in ev), ev
+
+
+@pytest.mark.parametrize("ko, en", [
+    ("최근 18개월 동안 추세 기울기는 −0.69/월입니다.", "Over the last 18 months the trend slope was −0.69 per month."),
+    ("최근 6주 동안 추세 기울기는 +1.20/주입니다.", "Over the last 6 weeks the trend slope was +1.20 per week."),
+    ("관측치가 5개뿐이라 국면을 판단하기에 데이터가 부족합니다.",
+     "Only 5 observations: too few to judge the lifecycle phase."),
+    ("변화가 누적되는 무작위 행보에 가까운 움직임이라, 추세처럼 보이는 등락도 우연일 수 있습니다.",
+     "Changes accumulate like a random walk, so trend-like swings may be due to chance."),
+])
+def test_translate_reason_knows_the_round4_templates(ko, en):
+    # F11 ('/월' instead of '/개월'), F3 (a short series' reason is about the phase), F12 (no gloss)
+    assert nv.translate_reason(ko) == en

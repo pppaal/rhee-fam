@@ -269,9 +269,13 @@ def test_html_sections_and_content(fake_report):
     html_text = R.render_html(fake_report)
     for label in KPI_LABELS:
         assert label in html_text, label
+    # (slopes as narrative.format_number writes them: "+0.02", F7; the method in words, not the raw
+    # "ensemble(holt_damped, linear_trend, theta)" tooltip, F14 -- the ids stay in the leaderboard rows,
+    # with line-break opportunities: holt_<wbr>damped)
     for needle in ("성장기", "80%", "2016-01", "2025-12", "월 단위", "규칙 기반 해석", "TrendAI",
-                   "2021-12", "가속", "+0.020", "+1.20", "2018-07", "모델 리더보드", "holt_damped",
-                   "MASE", "sMAPE", "ensemble(holt_damped, linear_trend, theta)", "예측 표", "80% 구간",
+                   "2021-12", "가속", "+0.02", "+1.20", "2018-07", "모델 리더보드", "holt_<wbr>damped",
+                   "MASE", "sMAPE", "최종 방법: 3개 모델 앙상블(감쇠 추세 Holt 50% · 선형 추세 + 계절 항 30% · Theta 방법 20%)",
+                   "linear_<wbr>trend", "theta", "예측 표", "80% 구간",
                    "95% 구간", "2026-12", "비관", "기준", "낙관", "분석 방법", "보장하지 않습니다",
                    "+180.0%", "+11.0%", "+35.0%", "+15.0%", "90%", "미래 단계"):
         assert needle in html_text, needle
@@ -496,9 +500,15 @@ def _y_ticks(svg: str) -> list[tuple[float, str]]:
     return [(float(y), lab) for y, lab in _TICK_RE.findall(svg)]
 
 
+_SUP = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻", "0123456789-")
+
+
 def _tick_value(label: str) -> float:
     s = label.replace(",", "").replace("−", "-")
-    mult = {"k": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(s[-1:], 1.0)
+    if "×10" in s:   # the narrative's notation: 1.25×10¹⁷ / −5×10⁻⁸
+        mant, ex = s.split("×10")
+        return float(mant) * 10.0 ** int(ex.translate(_SUP))
+    mult = {"k": 1e3, "M": 1e6, "B": 1e9}.get(s[-1:], 1.0)
     return float(s[:-1] if mult != 1.0 else s) * mult
 
 
@@ -534,36 +544,41 @@ def test_nice_ticks_extreme_ranges_do_not_crash():
 
 
 def test_axis_labels_tiny_and_huge():
-    assert R._axis_labels([0, 5e-8, 1e-7, 1.5e-7]) == ["0", "5e−8", "1e−7", "1.5e−7"]
-    assert R._axis_labels([0, 5e13, 1e14, 1.5e14]) == ["0", "50T", "100T", "150T"]
+    # (F7: the narrative's ×10ⁿ notation from 1e12 and below 1e-4, not "5e−8" / "50T")
+    assert R._axis_labels([0, 5e-8, 1e-7, 1.5e-7]) == ["0", "5×10⁻⁸", "1×10⁻⁷", "1.5×10⁻⁷"]
+    assert R._axis_labels([0, 5e13, 1e14, 1.5e14]) == ["0", "5×10¹³", "1×10¹⁴", "1.5×10¹⁴"]
     labs = R._axis_labels([1.965e-09, 1.97e-09, 1.975e-09, 1.98e-09])
-    assert len(set(labs)) == 4 and all("e−9" in lab for lab in labs)
+    assert len(set(labs)) == 4 and all("×10⁻⁹" in lab for lab in labs)
 
 
 def test_tiny_values_are_not_printed_as_zero():
-    assert R._fmt_num(4.4e-9) == "4.4e−9" and R._fmt_num(-3e-7) == "−3e−7"
+    # (F7: ×10ⁿ below 1e-4, exactly as narrative.format_number -- was "4.4e−9")
+    assert R._fmt_num(4.4e-9) == "4.4×10⁻⁹" and R._fmt_num(-3e-7) == "−3×10⁻⁷"
     assert R._fmt_num(0.00012) == "0.00012" and R._fmt_num(0.0) == "0"
     rep = build_report(np.linspace(1e-9, 3e-9, 24), slope=1e-11)
     html_text = R.render_html(rep)
-    assert "0.00000000" not in html_text and "e−9" in html_text
+    assert "0.00000000" not in html_text and "×10⁻⁹" in html_text
     labels = [lab for _, lab in _y_ticks(R.svg_chart(rep))]
     assert len(set(labels)) == len(labels) >= 4
-    assert "e−9" in R.render_text(rep)
+    assert "×10⁻⁹" in R.render_text(rep)
 
 
 def test_huge_values_abbreviated_in_tiles_with_exact_tooltip():
-    assert R._fmt_short(1.5e12) == "1.50T" and R._fmt_short(999_400) == "999,400"
+    # (F7: from ~1e12 the narrative's ×10ⁿ notation -- "1.5×10¹²", not "1.50T" / "69,922T")
+    assert R._fmt_short(1.5e12) == "1.5×10¹²" and R._fmt_short(999_400) == "999,400"
     assert R._fmt_short(999_700) == "1.00M" and R._fmt_short(999.7e6) == "1.00B"
+    assert R._fmt_short(999.7e9) == "1×10¹²" and R._fmt_short(6.9922e16) == "6.99×10¹⁶"
     assert R._fmt_short(-2.345e9) == "−2.35B" and R._fmt_short(None) == "—"
     rep = build_report(np.linspace(1.0e14, 1.2e14, 24), slope=1e11)
     html_text = R.render_html(rep)
     kpi = re.search(r'<div class="kpi"><div class="lbl">현재 값</div><div class="val" title="([^"]+)">(.*?)</div>',
                     html_text)
-    assert kpi.group(1) == "120,000,000,000,000"          # exact value on hover
-    assert ">120T<" in kpi.group(2)                       # fits the tile
+    # the value as the narrative prints it, in the tile and on hover (no 15-digit integer anywhere)
+    assert kpi.group(1) == "1.2×10¹⁴" and ">1.2×10¹⁴<" in kpi.group(2)
     scen = re.findall(r'<div class="v" title="([^"]+)">([^<]+)</div>', html_text)
-    assert len(scen) == 3 and all(v.endswith("T") and "," in t for t, v in scen)
-    assert all(lab.endswith("T") or lab == "0" for _, lab in _y_ticks(R.svg_chart(rep)))
+    assert len(scen) == 3 and all("×10¹⁴" in v and "×10¹⁴" in t for t, v in scen)
+    assert all("×10¹" in lab or lab == "0" for _, lab in _y_ticks(R.svg_chart(rep)))
+    assert not re.search(r"\d{13}", html_text.replace(",", "")) and "T<" not in html_text
 
 
 def test_constant_series_axis_not_zoomed_into_noise():
@@ -1269,8 +1284,10 @@ def test_reversal_label_matches_the_narrative_end_to_end():
     text = R.render_text(rep, width=100)
     for cp in ups:
         flat = cp.slope_before >= -0.1 * max(abs(cp.slope_before), abs(cp.slope_after))
-        label, narr = ("횡보→상승 전환", "횡보에서 상승으로 전환") if flat else ("하락→상승 반전", "하락에서 상승으로 반전")
-        assert f"{R._fmt_date(cp.date, 'Y')} {label}" in text and narr in rep.narrative
+        label = "횡보→상승 전환" if flat else "하락→상승 반전"
+        # round 4 (U6/D5): the narrative names a changepoint with the same shared label
+        # (analysis.changepoint_label) instead of its own prose ("횡보에서 상승으로 전환")
+        assert f"{R._fmt_date(cp.date, 'Y')} {label}" in text and f"부터 {label}" in rep.narrative
 
 
 def test_hover_titles_do_not_repeat_the_row_label(fake_report):
@@ -1365,7 +1382,7 @@ def test_charts_render_beyond_1e300(scale):
         ticks = _y_ticks(svg)
         labels = [lab for _, lab in ticks]
         assert 4 <= len(ticks) <= 6 and len(set(labels)) == len(labels)
-        assert all(len(lab) <= 9 for lab in labels), labels
+        assert all(len(lab) <= 11 for lab in labels), labels   # ("−1.25×10³⁰⁸": ×10ⁿ notation, F7)
         vals = sorted(_tick_value(lab) for lab in labels)
         data = rep.analysis.series.to_numpy()
         assert vals[0] <= data.min() * (1 + 1e-9 * np.sign(data.min())) and vals[-1] >= data.max() * (1 - 1e-9 * np.sign(data.max()))
@@ -1401,9 +1418,11 @@ def test_nice_ticks_cover_any_finite_range():
         assert t == sorted(t) and len(set(t)) == len(t)
         labels = R._axis_labels(t)
         assert len(set(labels)) == len(labels) and all(len(lab) <= 12 for lab in labels), labels
-    assert R._axis_labels([0, 5e15, 1e16, 1.5e16]) == ["0", "5e15", "1e16", "1.5e16"]
-    assert R._axis_labels([1.0e300, 1.25e300, 1.5e300, 1.75e300]) == ["1e300", "1.25e300", "1.5e300", "1.75e300"]
-    assert R._fmt_axis_value(1.234e300, 2e300) == "1.23e300"
+    # (F7: the narrative's ×10ⁿ notation instead of Python's "5e15" / "1.25e300")
+    assert R._axis_labels([0, 5e15, 1e16, 1.5e16]) == ["0", "5×10¹⁵", "1×10¹⁶", "1.5×10¹⁶"]
+    assert R._axis_labels([1.0e300, 1.25e300, 1.5e300, 1.75e300]) == ["1×10³⁰⁰", "1.25×10³⁰⁰", "1.5×10³⁰⁰",
+                                                                      "1.75×10³⁰⁰"]
+    assert R._fmt_axis_value(1.234e300, 2e300) == "1.23×10³⁰⁰"
 
 
 def test_english_narrative_reasons_are_not_repeated_in_korean():
@@ -1446,3 +1465,544 @@ def test_intermittent_models_are_labelled():
     # ordinary series: unchanged
     plain = build_report(np.linspace(10, 20, 36))
     assert "RMSE" not in R.render_html(plain) + R.render_text(plain, width=100)
+
+
+# --------------------------------------------------------------------------- round 4: shared vocabulary
+
+
+def _set_forecast_mean(rep: TrendReport, values) -> TrendReport:
+    """Replace the forecast mean (and narrow bands around it) of a hand-built report."""
+    idx = rep.forecast.mean.index
+    rep.forecast.mean = pd.Series(np.asarray(values, dtype=float), index=idx)
+    for lv in list(rep.forecast.lower):
+        rep.forecast.lower[lv] = rep.forecast.mean - 1.0
+        rep.forecast.upper[lv] = rep.forecast.mean + 1.0
+    return rep
+
+
+def _kpi_tile(html_text: str, label: str) -> tuple[str, str]:
+    """``(value html, sub html)`` of the KPI tile ``label``."""
+    m = re.search(rf'<div class="lbl">{re.escape(label)}</div><div class="val"[^>]*>(.*?)</div>'
+                  r'(?:<div class="meter".*?</div>)?<div class="sub">(.*?)</div>', html_text)
+    assert m, label
+    return m.group(1), m.group(2)
+
+
+def _card(html_text: str, title: str) -> str:
+    return re.search(rf"<h2>{re.escape(title)}.*?</section>", html_text, flags=re.S).group(0)
+
+
+def test_direction_word_is_the_narratives_on_every_surface():
+    """D1 / UX-1: a 'flat' outlook with a visible change reads '방향 불확실' (narrative.direction_label),
+    not '보합', in the terminal, the outlook card and the compare page; the KPI and the compare
+    values carry no green ▲ / red ▼ for it."""
+    from trendai.narrative import direction_label
+
+    rep = build_report(np.linspace(10, 20, 36), horizon=6, name="불확실")
+    rep.outlook.direction, rep.outlook.expected_change_pct = "flat", 75.0
+    assert direction_label("flat", 75.0) == "방향 불확실"
+    text, page = R.render_text(rep, width=100), R.render_html(rep)
+    assert "전망 ▶ 방향 불확실 · 예측 변화 +75.0%" in text and "보합" not in text
+    card = _card(page, "미래 전망")
+    assert '<span class="big ">▶ 방향 불확실</span>' in card and "보합" not in card
+    val, sub = _kpi_tile(page, "예측 변화")
+    assert val == "<span>+75.0%</span>" and "▲" not in val and "방향 불확실" in sub
+    comp = R.render_compare_html([rep], _ranking([rep]))
+    cell = re.search(r'<td class="num"><span>\+75\.0%</span>.*?</td>', comp).group(0)
+    assert cell == '<td class="num"><span>+75.0%</span><span class="dl">방향 불확실</span></td>'
+    stats = re.search(r'<div class="stats">.*?</div></div></div>', comp).group(0)
+    assert "방향 불확실" in stats and "▲" not in stats
+    # a genuinely small change stays '보합'; up / down keep their coloured arrows
+    rep.outlook.expected_change_pct = 1.0
+    assert "전망 ▶ 보합" in R.render_text(rep, width=100)
+    assert '<span class="dl">보합</span>' in R.render_compare_html([rep], _ranking([rep]))
+    rep.outlook.direction, rep.outlook.expected_change_pct = "up", 40.0
+    val, _ = _kpi_tile(R.render_html(rep), "예측 변화")
+    assert 'class="pos"' in val and "▲" in val and "전망 ▲ 상승" in R.render_text(rep, width=100)
+
+
+def test_flat_outlook_crossing_zero_is_direction_uncertain_with_its_levels():
+    """D1 + D4: a 'flat' outlook whose level is expected to cross zero (outlook_levels: 'sign_change')
+    is '방향 불확실' as in the narrative, and the '—' of the expected change says why, with both levels."""
+    rep = build_report(np.linspace(20, 2, 36), horizon=6)
+    _set_forecast_mean(rep, np.linspace(-1, -6, 6))
+    rep.outlook.expected_change_pct = None
+    text, page = R.render_text(rep, width=120), R.render_html(rep)
+    assert "전망 ▶ 방향 불확실 · 예측 변화 — (0을 지나 음수로 바뀔 전망)" in text
+    assert "최근 값 +2.00 → 2023-06 예측값 −6.00" in text
+    val, sub = _kpi_tile(page, "예측 변화")
+    assert re.sub("<[^>]+>", "", val) == "—"
+    assert "0을 지나 음수로 바뀔 전망 · 최근 값 +2.00 → 2023-06 예측값 −6.00" in sub
+    card = _card(page, "미래 전망")
+    assert "▶ 방향 불확실" in card and "수준이 0을 지나 음수로 바뀔 것으로 예상되어 변화율(%)은 의미가 없습니다." in card
+    assert "— 예상" not in card
+
+
+@pytest.mark.parametrize("case,short", [
+    ("mostly_zero", "최근 12개월 중 절반 이상이 0"),
+    ("near_zero", "현재 수준이 0에 가까움"),
+    ("zero", "현재 수준이 0에 가까움"),
+])
+def test_missing_expected_change_is_explained(case, short):
+    """D4: KPI '예측 변화' shows '—' with the reason of forecast.outlook_levels (never a bare dash)."""
+    if case == "mostly_zero":
+        rep = build_report(np.where(np.arange(36) % 3 == 0, 5.0, 0.0), horizon=12)
+        rep.analysis.season_length = 12
+    elif case == "near_zero":
+        v = 10 * np.sin(np.arange(36) / 3.0)
+        v[-1] = 0.3
+        rep = build_report(v, horizon=6)
+    else:
+        rep = build_report(np.r_[np.linspace(5, 1, 35), 0.0], horizon=6)
+    rep.outlook.expected_change_pct = None
+    from trendai.forecast import outlook_levels
+
+    assert outlook_levels(rep.analysis, rep.forecast).undefined == case
+    _, sub = _kpi_tile(R.render_html(rep), "예측 변화")
+    assert sub.startswith(short)
+    assert f"예측 변화 — ({short})" in R.render_text(rep, width=120)
+
+
+def test_outlook_windows_are_forecast_outlook_levels():
+    """D4: the page takes its windows, adjustment flags and None reason from forecast.outlook_levels
+    (no private forecast helper), the levels the narrative and compute_outlook use."""
+    import inspect
+
+    from trendai.forecast import outlook_levels
+    from trendai.pipeline import run
+    from trendai.samples import sample
+
+    assert "_seasonal_component" not in inspect.getsource(R)
+    for name, freq, n, h in [("growing", "W", 156, None), ("seasonal", "M", 120, 6), ("fad", "M", 120, None)]:
+        rep = run(sample(name, n=n, freq=freq, seed=0), name=name, horizon=h)
+        lv = outlook_levels(rep.analysis, rep.forecast)
+        d = R._ChartData(rep)
+        k_fut, k_cur, _, period, adj_fut, adj_cur = R._outlook_windows(rep, d)
+        assert (k_fut, k_cur, period, adj_fut, adj_cur) == (lv.k_fut, lv.k_cur, lv.period, lv.adj_fut, lv.adj_cur)
+
+
+def test_method_is_described_in_words():
+    """D2 / UX-11: the terminal '방법:' line and the leaderboard use narrative.describe_method; the page
+    subtitle says '단일 모델 예측' / 'N개 모델 앙상블 예측' / the fallback in words."""
+    from trendai import narrative
+
+    assert R.MODEL_KO is narrative.MODEL_KO
+    rep = build_report(np.linspace(10, 20, 36))
+    rep.forecast.model_scores = [ModelScore("holt_damped", 1.0, 1.2, 5.0, 0.8, 0.6),
+                                 ModelScore("ar", 1.1, 1.3, 5.5, 0.9, 0.4),
+                                 ModelScore("naive", 1.5, 1.8, 7.0, 1.2, 0.0)]
+    rep.forecast.method = "ensemble(holt_damped 0.60, ar 0.40)"
+    text, page = R.render_text(rep, width=120), R.render_html(rep)
+    assert "방법: 2개 모델 앙상블(감쇠 추세 Holt 60% · 자기회귀(AR) 40%)" in text
+    assert "ensemble(" not in text.split("방법:")[1].split("\n")[0]
+    assert "· 2개 모델 앙상블 예측 ·" in re.search(r'<p class="gen">.*?</p>', page).group(0)
+    assert "최종 방법: 2개 모델 앙상블(감쇠 추세 Holt 60% · 자기회귀(AR) 40%)" in page
+    assert "<code>ensemble(" not in page and "통계 모델 앙상블 예측" not in page
+    # one model
+    rep.forecast.model_scores[0].weight, rep.forecast.model_scores[1].weight = 1.0, 0.0
+    rep.forecast.method = "holt_damped"
+    page = R.render_html(rep)
+    assert "· 단일 모델 예측 ·" in page and "최종 방법: 감쇠 추세 Holt 단일 모델" in page
+    assert "방법: 감쇠 추세 Holt 단일 모델" in R.render_text(rep, width=120)
+    # the fallback of very short series
+    rep.forecast.model_scores = []
+    rep.forecast.method = "fallback(drift 0.50, naive 0.50) [too short to backtest]"
+    text, page = R.render_text(rep, width=120), R.render_html(rep)
+    assert "방법: 데이터가 짧아 백테스트 없이 만든 기본 예측(" in text and "fallback" not in text
+    assert "· 백테스트 없이 만든 기본 예측 ·" in page
+
+
+def test_scenario_at_the_zero_floor_reads_floor():
+    """D3 / UX-9: a scenario at the 0 floor of a nonnegative forecast reads '0(하한)' (narrative.scenario_value),
+    in the terminal and in the scenario tiles, with the narrative's one-line note; never '−100.0%'."""
+    rep = build_report(np.linspace(1, 12, 36), horizon=6)
+    rep.forecast.nonnegative = True
+    rep.outlook.scenarios = {"pessimistic": 0.0, "base": 4.2, "optimistic": 11.9}
+    text, page = R.render_text(rep, width=120), R.render_html(rep)
+    assert "비관 0(하한)  기준 4.20  낙관 11.9" in text
+    card = _card(page, "미래 전망")
+    assert '<div class="k">비관</div><div class="v" title="0(하한)">0(하한)</div>' in card
+    assert "예측구간이 넓어 비관 시나리오는 하한인 0에 닿습니다(값은 0 아래로 내려갈 수 없음)." in card
+    assert "−100" not in text + page
+    rep.outlook.scenarios["base"] = 0.0                       # the base case itself at the floor
+    assert "기준 예측이 하한인 0까지 내려갑니다" in R.render_html(rep)
+    rep.forecast.nonnegative = False                          # a real forecast of 0 stays a number
+    rep.outlook.scenarios = {"pessimistic": -2.0, "base": 4.2, "optimistic": 11.9}
+    assert "비관 −2.00" in R.render_text(rep, width=120) and "하한" not in R.render_html(rep)
+
+
+def test_changepoint_labels_come_from_the_shared_classifier():
+    """D5: chart, table, terminal and narrative name a changepoint with analysis.changepoint_label."""
+    from trendai.analysis import changepoint_label
+
+    rep = build_report(np.linspace(10, 60, 60), slope=0.5, changepoints=True)
+    cp = rep.analysis.changepoints[0]
+    for kind, before, after in [("acceleration", 0.5, 2.0), ("acceleration", -0.5, -2.0),
+                                ("deceleration", 2.0, 0.5), ("deceleration", -2.0, -0.5),
+                                ("reversal_up", 0.17, 16.6), ("reversal_up", -0.5, 0.7),
+                                ("reversal_down", 2.0, -1.0), ("reversal_down", 0.05, -1.0),
+                                ("reversal_down", float("nan"), -1.0), ("level_shift", 0.1, 0.1),
+                                ("odd_kind", 0.1, 0.2)]:
+        cp.kind, cp.slope_before, cp.slope_after = kind, before, after
+        label = changepoint_label(cp)
+        assert R._cp_kind(cp)[0] == label, (kind, before, after)
+        assert label in R.svg_chart(rep) and label in _card(R.render_html(rep), "과거의 사건")
+        assert label in R.render_text(rep, width=100)
+    assert R._cp_kind(cp)[0] == "추세 변화"                   # an unknown kind is no raw id
+
+
+def _intermittent_report(with_naive: bool) -> TrendReport:
+    vals = np.where(np.arange(48) % 3 == 0, 5.0, 0.0)
+    vals[[10, 31]] = [40.0, 35.0]
+    rep = build_report(vals, anomalies=True)
+    rep.analysis.season_length = 12
+    rep.analysis.anomalies = [Anomaly(date=rep.analysis.series.index[10], index=10, value=40.0, expected=5.0,
+                                      zscore=6.1)]
+    scores = [ModelScore("theta", 2.0, 2.3, 150.0, 0.80, 0.5), ModelScore("sba", 2.2, 2.28, 150.0, 0.91, 0.5)]
+    if with_naive:   # naive: lower MAE than theta, higher RMSE (the metric that ranked intermittent demand)
+        scores.append(ModelScore("naive", 1.6, 4.6, 190.0, 1.10, 0.0))
+    rep.forecast.model_scores = scores
+    rep.forecast.method = "ensemble(theta 0.50, sba 0.50)"
+    return rep
+
+
+def test_intermittent_tables_use_their_own_terms():
+    """D6: intermittent demand -- anomaly table header '평소 규모' (narrative.is_intermittent); the
+    leaderboard's '단순 대비' uses RMSE like ForecastResult.skill, and says why when no benchmark row
+    is listed instead of leaving bare dashes."""
+    from trendai.narrative import is_intermittent
+
+    rep = _intermittent_report(with_naive=True)
+    assert is_intermittent(rep.analysis)
+    page = R.render_html(rep)
+    events = _card(page, "과거의 사건")
+    assert "평소 규모</abbr></th>" in events and '<th class="num">예상</th>' not in events
+    board = _card(page, "모델 리더보드")
+    # theta: RMSE 2.3 / 4.6 - 1 = −50 % (an MAE ratio would read +25 %)
+    assert re.search(r"theta.*?<td class=\"num\">0\.800</td><td class=\"num\"><span class=\"pos\">−50%</span>", board)
+    assert "제곱 오차(RMSE)가 몇 % 작은지" in board and "+25%" not in board
+    # no benchmark rows: say why
+    rep = _intermittent_report(with_naive=False)
+    board = _card(R.render_html(rep), "모델 리더보드")
+    assert "‘단순 대비’: 0이 잦은 간헐 수요라 수요 수준을 추정하는 모델만 후보로 써서 모델별로는 비교하지 않았습니다" in board
+    assert board.count('title="단순 기준 예측이 비교 후보에 없어 모델별로는 비교하지 않았습니다">—</span>') == 2
+    # explicit candidates of an ordinary series: the same note with its own reason
+    plain = build_report(np.linspace(10, 20, 36))
+    plain.forecast.model_scores = [ModelScore("holt", 1.0, 1.2, 5.0, 0.8, 1.0)]
+    board = _card(R.render_html(plain), "모델 리더보드")
+    assert "후보 목록에 단순 기준 예측(직전값·계절 반복·평균 기울기)이 없어 모델별로는 비교하지 않았습니다" in board
+    # an ordinary series keeps the MAE ratio and the '예상' header
+    plain = build_report(np.linspace(10, 20, 36), anomalies=True)
+    assert '<th class="num">예상</th>' in R.render_html(plain)
+
+
+def test_intermittent_end_to_end_tile_and_tables_agree_with_the_narrative():
+    """D6 + D8: on real intermittent demand the '현재 값' tile names the largest demand (the narrative:
+    a drawdown means nothing), the growth tiles say why they are empty, the anomaly header reads '평소 규모'."""
+    from trendai.pipeline import run
+
+    rng = np.random.default_rng(0)
+    y = np.where(rng.random(104) < 0.4, rng.poisson(3, 104) + 1, 0).astype(float)
+    y[rng.integers(10, 90, 2)] = [25, 30]
+    rep = run(pd.Series(y, index=pd.date_range("2022-01-02", periods=104, freq="W-SUN")), name="간헐")
+    assert rep.analysis.anomalies and "고점 대비 하락률은 의미가 없습니다" in rep.narrative
+    page = R.render_html(rep)
+    _, sub = _kpi_tile(page, "현재 값")
+    assert "최대 " in sub and "%" not in sub
+    for label in ("전체 변화", "연평균 성장률 CAGR", "최근 변화"):
+        assert "간헐 수요라 계산하지 않음" in _kpi_tile(page, label)[1], label
+    assert "평소 규모</abbr></th>" in _card(page, "과거의 사건")
+    assert "※ 전체 변화·CAGR·최근 변화: 간헐 수요라 계산하지 않음" in R.render_text(rep, width=100)
+
+
+def test_rising_score_is_not_called_an_expected_rise():
+    """D7: the score blends the outlook with the recent momentum; the compare page says so."""
+    reports = [make_fake_report(name="a"), make_fake_report(name="b", kind="declining")]
+    page = R.render_compare_html(reports, _ranking(reports))
+    assert "더 강하게 오를 것으로 예상" not in page
+    assert "상승 점수는 앞으로의 전망(예측 변화·상승 확률)과 최근 기세(최근 변화·모멘텀)를 합친 0–100 점수로" in page
+    assert '<th class="th-score"><abbr title="상승 점수: 전망(예측 변화·상승 확률)과 최근 기세' in page
+
+
+def _pnl_report(values, name: str = "P&L") -> TrendReport:
+    from trendai.pipeline import run
+
+    s = pd.Series(values, index=pd.date_range("2022-01-01", periods=len(values), freq="MS"))
+    return run(s, name=name, horizon=12)
+
+
+def test_zero_crossing_history_shows_no_meaningless_percentages():
+    """D8 / U3: a P&L that fell through zero (10 -> -10) -- growth tiles '—' with the reason (and the
+    trend change in units), the peak gap in units (never '최고점 대비 −179.4%'), the same in the text."""
+    rng = np.random.default_rng(0)
+    rep = _pnl_report(np.linspace(10, -10, 48) + rng.normal(0, 1.0, 48))
+    m = rep.analysis.metrics
+    assert m.total_change_pct is None and m.drawdown_pct < -100           # the raw number is meaningless
+    page, text = R.render_html(rep), R.render_text(rep, width=100)
+    _, sub = _kpi_tile(page, "현재 값")
+    gap = R._fmt_short(abs(m.peak_value - m.last_value))
+    assert f"최고점보다 {gap} 낮음" in sub and "%" not in sub
+    assert f"고점보다 {gap} 낮습니다" in rep.narrative                     # the narrative's own wording
+    val, sub = _kpi_tile(page, "전체 변화")
+    assert re.sub("<[^>]+>", "", val) == "—" and "0을 지나 음수로 바뀌어 변화율 없음" in sub and " → " in sub
+    assert _kpi_tile(page, "연평균 성장률 CAGR")[1] == "0을 지나 음수로 바뀌어 변화율 없음"
+    assert "※ 전체 변화·CAGR: 0을 지나 음수로 바뀌어 변화율 없음" in text
+    own = page.replace(_card(page, "AI 트렌드 해석"), "")                 # the page's own tiles and cards
+    assert not re.search(r"−1\d\d\.\d%", own + text)
+    tdd = R._trend_drawdown(rep, R._ChartData(rep))
+    assert tdd is None                                                   # the trend crossed zero too
+
+
+def test_zero_crossing_outlook_names_its_levels_like_the_narrative():
+    """D4 + D8: a P&L whose outlook crosses zero ('sign_change'): '—' with the reason and the two levels,
+    the same numbers the narrative prints."""
+    rng = np.random.default_rng(1)
+    rep = _pnl_report(np.r_[np.linspace(-20, 20, 24), np.linspace(20, 0.5, 24)] + rng.normal(0, 1, 48))
+    from trendai.forecast import outlook_levels
+
+    lv = outlook_levels(rep.analysis, rep.forecast)
+    assert lv.undefined == "sign_change" and rep.outlook.expected_change_pct is None
+    cur, fut = R._fmt_num(lv.current, signed=True), R._fmt_num(lv.future, signed=True)
+    assert f"{cur} → 향후 12개월 예측 평균 {fut}" in rep.narrative
+    page = R.render_html(rep)
+    _, sub = _kpi_tile(page, "예측 변화")
+    assert sub == f"0을 지나 음수로 바뀔 전망 · 최근 12개월 평균 {cur} → 향후 12개월 평균 {fut}"
+    card = _card(page, "미래 전망")
+    assert "변화율 없음" in card and "수준이 0을 지나 음수로 바뀔 것으로 예상되어" in card
+    assert f"{cur} → 향후 12개월 평균 {fut}" in card
+    assert "예측 변화 — (0을 지나 음수로 바뀔 전망)" in R.render_text(rep, width=120)
+    _, sub = _kpi_tile(page, "전체 변화")
+    assert "시작 수준이 음수라 변화율 없음" in sub                          # the trend started below zero
+    assert "시작 수준이 음수여서 변화율(%)은 정의되지 않습니다" in rep.narrative
+
+
+def test_non_positive_peak_has_no_percent_drawdown():
+    """D8: an all-negative series (peak below 0): the drawdown is given in units."""
+    rep = build_report(np.linspace(-2, -10, 36))
+    m = rep.analysis.metrics
+    m.peak_value, m.last_value, m.drawdown_pct = -2.0, -10.0, -400.0
+    _, sub = _kpi_tile(R.render_html(rep), "현재 값")
+    assert "최고점보다 8.00 낮음" in sub and "%" not in sub
+
+
+def test_momentum_is_labelled_against_the_current_trend_level():
+    """D9: momentum is in % of the current (recent) trend level per period, not of the mean level."""
+    rep = make_fake_report(name="a")
+    page = R.render_html(rep) + R.render_compare_html([rep], _ranking([rep]))
+    assert "평균 수준 대비 %p" not in page
+    assert page.count("최근 추세 기울기 − 장기 기울기 (현재 추세 수준 대비 %p, 기간당)") == 2
+
+
+# --------------------------------------------------------------------------- round 4, final fixer
+
+
+_HANGUL = re.compile(r"[가-힣ㄱ-ㆎ]")
+_PY_EXP = re.compile(r"\d(?:\.\d+)?e[+\-−]?\d+")
+
+
+def _sample_report(name: str, n: int = 120, freq: str = "M", scale: float = 1.0) -> TrendReport:
+    from trendai.pipeline import run
+    from trendai.samples import sample
+
+    return run(sample(name, n=n, freq=freq) * scale, name=name)
+
+
+def _future_phase_line(text: str, label: str) -> str:
+    return next(ln for ln in text.splitlines() if ln.startswith(label))
+
+
+def test_future_phase_is_only_stated_as_far_as_the_narrative_projects_it():
+    """F5: when the narrative declines to project the phase -- a 'flat' outlook that only keeps a
+    moving phase ('… 이어질지 바뀔지는 아직 판단하기 어렵습니다'), a phase change implied by a
+    low-confidence forecast ('… 국면이 바뀐다고 보기는 어렵습니다') or a tentative call on too few
+    observations ('… 잠정 판단') -- the terminal and the outlook card no longer state the bare phase."""
+    from trendai.narrative import rule_based_narrative
+
+    # (a) peaking, flat outlook: undecided
+    rep = _sample_report("peaking")
+    assert rep.outlook.direction == "flat" and rep.outlook.future_phase == rep.analysis.phase.label == "peaking"
+    assert "이어질지 바뀔지는 아직 판단하기 어렵습니다" in rep.narrative
+    assert _future_phase_line(R.render_text(rep), "미래 단계") == "미래 단계 판단 보류(예측에 뚜렷한 방향 없음)"
+    assert "Future phase undecided (no clear forecast direction)" in R.render_text(rep, lang="en")
+    card = _card(R.render_html(rep), "미래 전망")
+    assert re.search(r'미래 단계</abbr></dt><dd>판단 보류<span class="dnote">예측에 뚜렷한 방향 없음</span></dd>', card)
+    assert "<dd>정점/성숙기</dd>" not in card
+
+    # (b) a phase change under low confidence: indicative only
+    rep = make_fake_report(name="a")
+    rep.outlook.future_phase, rep.outlook.confidence = "peaking", "low"
+    nar = rule_based_narrative(rep.analysis, rep.forecast, rep.outlook)
+    assert "예측 신뢰도가 낮아 국면이 바뀐다고 보기는 어렵습니다" in nar
+    assert _future_phase_line(R.render_text(rep), "미래 단계") == "미래 단계 정점/성숙기(신뢰도 낮아 참고용)"
+    card = _card(R.render_html(rep), "미래 전망")
+    assert '<dd>정점/성숙기<span class="dnote">신뢰도 낮아 참고용</span></dd>' in card
+    assert "국면이 바뀐다고 보기는 어렵습니다" in card                     # the narrative's sentence as tooltip
+
+    # (c) seven daily values: a tentative call, for the current phase as well
+    from trendai.pipeline import run
+
+    rng = np.random.default_rng(107)
+    rng.normal(0, 0.3, 7)
+    rep = run(pd.Series(10 + rng.normal(0, 0.5, 7), index=pd.date_range("2025-12-25", periods=7, freq="D")),
+              name="flat")
+    assert "관측치가 적어 잠정 판단" in rep.narrative
+    text = R.render_text(rep)
+    assert "미래 단계 안정기(관측치가 적어 잠정)" in text and text.splitlines()[2].startswith("[안정기·잠정]")
+    page = R.render_html(rep)
+    assert '<dd>안정기<span class="dnote">관측치가 적어 잠정</span></dd>' in page
+    assert "안정기 <small>잠정 · 신뢰도" in page
+
+    # (d) a projection the narrative states: the bare phase
+    rep = _sample_report("growing")
+    assert "12개월 뒤에도 **성장기** 국면이 이어질 것으로 전망됩니다" in rep.narrative
+    assert _future_phase_line(R.render_text(rep), "미래 단계").startswith("미래 단계 성장기")
+    assert "<dt>미래 단계</dt><dd>성장기</dd>" in R.render_html(rep)
+
+
+def test_tiny_and_huge_values_read_like_the_narrative_on_every_surface():
+    """F7: ×1e15 / ×1e-7 data printed '6.99e16' (terminal, KPI title), '69,922T' (KPI tile),
+    '1.25e17' (axis), '0.0000070' (terminal) and '+1.87e−9' (changepoint table) where the narrative
+    says '6.99×10¹⁶': every surface now uses narrative.format_number's ×10ⁿ notation."""
+    from trendai.narrative import format_number
+
+    for scale, sup in ((1e15, "¹⁶"), (1e-7, "⁻⁶")):
+        rep = _sample_report("emerging", scale=scale)
+        last = format_number(rep.analysis.metrics.last_value)
+        assert last.startswith("6.99×10") and last.endswith(sup)
+        assert f"가장 최근 값은 {last}" in rep.narrative
+        text = R.render_text(rep)
+        assert f"현재 값 {last}" in text
+        page = R.render_html(rep)
+        val, _ = _kpi_tile(page, "현재 값")
+        assert f">{last}<" in val and f'title="{last}"' in page
+        svg = R.svg_chart(rep)
+        labels = [lab for _, lab in _y_ticks(svg)]
+        assert all("×10" in lab or lab == "0" for lab in labels) and len(set(labels)) == len(labels)
+        visible = re.sub(r"<style.*?</style>|\s(?:d|viewBox|points|style|id|aria-labelledby)=\"[^\"]*\"", "",
+                         page + R.render_compare_html([rep], _ranking([rep])), flags=re.S)
+        for surface in (text, R.render_text(rep, lang="en"), visible):
+            assert not _PY_EXP.search(surface), _PY_EXP.search(surface)
+            assert not re.search(r"\d\.\d{6,}", surface)                    # no '0.0000070'
+            assert not re.search(r"\d[\d,]*(?:\.\d+)?T\b", surface)         # no '69,922T'
+    assert R._fmt_num(6.99e16) == format_number(6.99e16) == "6.99×10¹⁶"
+    assert R._fmt_num(-7e-6, signed=True) == format_number(-7e-6, signed=True) == "−7×10⁻⁶"
+    assert R._fmt_num(1.87e-9, signed=True) == "+1.87×10⁻⁹"
+    assert R._fmt_axis_value(5e11, 2e13) == format_number(5e11, scale=2e13) == "5×10¹¹"
+
+
+def test_cagr_dash_of_a_short_series_is_explained():
+    """F13: a CAGR over less than a year (the analysis annualises only spans of >= 0.95 years) was a
+    bare '—' (terminal) over the generic '연 환산 복리 성장률' (KPI)."""
+    rep = build_report([10.0, 11.0, 12.5], horizon=3)
+    rep.analysis.metrics.cagr_pct = None
+    text = R.render_text(rep)
+    assert "CAGR —" in text and "※ CAGR: 기간이 1년 미만이라 연 환산하지 않음" in text
+    assert "※ CAGR: less than a year of data, not annualised" in R.render_text(rep, lang="en")
+    val, sub = _kpi_tile(R.render_html(rep), "연평균 성장률 CAGR")
+    assert re.sub("<[^>]+>", "", val) == "—" and sub == "기간이 1년 미만이라 연 환산하지 않음"
+    # end to end: three monthly values
+    from trendai.pipeline import run
+
+    rep = run(from_values([10, 11, 12.5], start="2024-01-01", freq="M"), name="short")
+    assert rep.analysis.metrics.cagr_pct is None
+    assert "※ CAGR: 기간이 1년 미만이라 연 환산하지 않음" in R.render_text(rep)
+    # a year or more: a CAGR, or another reason -- never this one
+    long = build_report(np.linspace(10, 20, 24))
+    long.analysis.metrics.cagr_pct = None
+    assert R._metric_undefined(long, R._ChartData(long), "cagr_pct") != "short_span"
+
+
+def test_leaderboard_has_no_raw_method_tooltip():
+    """F14: '최종 방법' carried title="ensemble(linear_trend 0.35, …)" -- raw ids, Python floats and
+    English on the Korean page; the method is in words, the ids and weights are the table rows."""
+    rep = make_fake_report(name="a")
+    page = R.render_html(rep)
+    card = _card(page, "모델 리더보드")
+    assert "최종 방법: 3개 모델 앙상블(" in card
+    assert 'title="ensemble(' not in page and str(rep.forecast.method) not in page
+    rep.forecast.method = "fallback(drift 0.50, naive 0.50) [too short to backtest]"
+    assert "too short to backtest" not in R.render_html(rep)
+
+
+def test_skill_barely_above_one_has_no_zero_percent_size():
+    """R4-REV-9: skill 1.004 read '낫지 않았습니다(오차 약 0% 더 큼)' and '0% · 단순 예측보다 부정확';
+    as narrative._accuracy_line, no size below 1 %, and the shown '0%' is not red."""
+    from trendai.narrative import rule_based_narrative
+
+    assert R._skill_sentence(1.004) == "최종 방법은 백테스트에서 단순 기준 예측보다 낫지 않았습니다."
+    assert R._skill_sentence(1.2) == "최종 방법은 백테스트에서 단순 기준 예측보다 낫지 않았습니다(오차 약 20% 더 큼)."
+    assert R._skill_sentence(2.5).endswith("(오차 약 2.5배).")
+    assert R._rel_error_text(1.004) == "0%" and R._rel_error_class(1.004) == ""
+    assert R._rel_error_class(1.2) == "neg" and R._rel_error_class(0.9) == "pos"
+    rep = make_fake_report(name="a")
+    rep.forecast.skill = 1.004
+    text = R.render_text(rep)
+    assert "단순 예측 대비 오차 0% · 단순 예측보다 낫지 않음" in text and "부정확" not in text
+    assert "0% 더 큼" not in R.render_html(rep)
+    nar = rule_based_narrative(rep.analysis, rep.forecast, rep.outlook)
+    assert "나은 성과를 보이지 못했습니다." in nar and "0% 더 큼" not in nar
+    rep.forecast.skill = 1.2
+    assert "단순 예측보다 부정확" in R.render_text(rep)
+
+
+def test_subnormal_series_render():
+    """R4-REV-11: values of 5e-324 crashed _nice_ticks (math domain error) and _extent_of (empty band
+    after the non-finite forecast points were dropped)."""
+    from trendai.pipeline import run
+
+    for lo, hi in ((0.0, 5e-324), (5e-324, 5e-324), (-5e-324, 5e-324)):
+        t = R._nice_ticks(lo, hi)
+        assert len(t) >= 2 and t == sorted(set(t)) and t[0] <= lo and t[-1] >= hi
+        assert len(set(R._axis_labels(t))) == len(t)
+    import warnings
+
+    for vals in (np.full(24, 5e-324), np.tile([0.0, 5e-324], 12)):
+        with warnings.catch_warnings():       # the models' own warnings on such data: not report code
+            warnings.simplefilter("ignore", RuntimeWarning)
+            rep = run(from_values(vals, start="2020-01-01", freq="M"), name="tiny")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")                  # rendering itself is clean
+            page, svg, text = R.render_html(rep), R.svg_chart(rep), R.render_text(rep)
+        _assert_balanced(page)
+        ET.fromstring(svg)
+        assert "nan" not in svg and text
+
+
+def test_terminal_summary_in_english_has_no_hangul():
+    """F20: `sample all --lang en` printed Korean terminal summaries ('[태동기(신흥)] 신뢰도 95% …');
+    render_text(lang='en') is English throughout, with the narrative's English words."""
+    from trendai.narrative import PHASE_EN, changepoint_label, describe_method, direction_label
+
+    reps = [_sample_report("emerging", n=40, freq="Q"), _sample_report("peaking"),
+            _sample_report("fad", n=156, freq="W"), make_fake_report(name="a"),
+            _intermittent_report(with_naive=False)]
+    rng = np.random.default_rng(1)
+    reps.append(_pnl_report(np.r_[np.linspace(-20, 20, 24), np.linspace(20, 0.5, 24)] + rng.normal(0, 1, 48)))
+    reps.append(build_report([10.0, 11.0, 12.5], horizon=3, name="short"))
+    reps[-1].analysis.metrics.cagr_pct = None
+    reps[3].outlook.confidence, reps[3].outlook.future_phase = "low", "peaking"
+    for i, rep in enumerate(reps):
+        rep.name = f"series {i}"          # (a Korean series name is the user's data, printed as given)
+        en = R.render_text(rep, lang="en")
+        assert not _HANGUL.search(en), [ln for ln in en.splitlines() if _HANGUL.search(ln)]
+        assert all(R._dw(ln) <= 78 for ln in en.splitlines())
+        assert f"[{PHASE_EN[rep.analysis.phase.label]}" in en
+        word = direction_label(rep.outlook.direction, rep.outlook.expected_change_pct, "en",
+                               getattr(R._outlook_levels(rep, R._ChartData(rep)), "undefined", None))
+        assert f" {word}" in next(ln for ln in en.splitlines() if ln.startswith("Outlook"))
+        assert "Method: " + describe_method(rep.forecast, "en").split(" · ")[0] in en
+        for cp in list(rep.analysis.changepoints)[:2]:
+            assert changepoint_label(cp, "en") in en
+        assert R.render_text(rep) == R.render_text(rep, lang="ko")         # Korean stays the default
+    assert "Exp. change — (expected to cross zero to negative)" in R.render_text(reps[5], lang="en", width=120)
+    assert "Future phase Peaking / maturing (low confidence, indicative only)" in R.render_text(reps[3], lang="en")
+    # the fallback of a very short series: the whole method (wrapped at spaces, never cut off with '…')
+    # and the reason behind the accuracy '—'
+    from trendai.pipeline import run
+
+    rep = run(from_values([10, 11, 12.5], start="2024-01-01", freq="M"), name="short")
+    for lang, why in (("en", "too short to backtest"), ("ko", "데이터가 짧아 백테스트하지 못함")):
+        text = R.render_text(rep, lang=lang)
+        assert "…" not in text and f"— · {why}" in text
+        joined = " ".join(ln.strip() for ln in text.splitlines())
+        assert describe_method(rep.forecast, lang) in joined

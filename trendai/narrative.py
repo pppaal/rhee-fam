@@ -31,6 +31,8 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
+from .analysis import CHANGEPOINT_LABEL_EN, MIN_PHASE_OBS, changepoint_label, pct_change_undefined
+from .analysis import _is_intermittent
 from .data import periods_per_year
 from .types import (
     PHASE_KO, AnalysisResult, Anomaly, Changepoint, ForecastResult, Outlook, TrendReport,
@@ -41,6 +43,7 @@ __all__ = [
     "rule_based_narrative", "build_llm_payload", "llm_narrative", "generate_narrative", "ask",
     "format_number", "format_pct", "format_date", "format_prob", "period_unit", "translate_reason",
     "direction_label", "model_label", "describe_method", "MODEL_KO", "MODEL_EN",
+    "format_scenario", "scenario_value", "is_intermittent", "changepoint_label", "phase_is_tentative",
 ]
 
 DEFAULT_MODEL = "claude-opus-5-5"
@@ -71,7 +74,11 @@ reader, you may offer at most one or two, each clearly labelled as an unverified
 slopes before and after each changepoint, peak and drawdown, recent change, momentum, the expected \
 change at the horizon, interval bounds, the probability of increase. Round sensibly and never invent \
 numbers that cannot be read or directly derived from the JSON. If outlook.expected_change_pct is null, \
-state no percentage change (outlook.expected_change_basis says why).
+state no percentage change (outlook.expected_change_basis says why; for 'sign_change' say that the level \
+is expected to cross zero and give both compared_levels). A null percentage metric (metrics.pct_undefined \
+names why, e.g. a level that crossed zero) gets no percentage either: never derive one yourself. A scenario \
+or interval bound of 0 for a nonnegative forecast is the floor of a wide band, not a forecast of zero: write \
+it as 0 (floor) without a percentage.
 - outlook.expected_change_pct and outlook.prob_increase compare the same two levels \
 (outlook.compared_levels: a season-average of the forecast vs. that of the latest data; see \
 outlook.expected_change_basis and outlook.prob_increase_basis). Describe the probability as the chance \
@@ -79,6 +86,8 @@ that this future level is higher than the current one, never as the chance that 
 end ends above today's level; the scenarios are single values at the horizon end, a different quantity \
 -- say so if you put them next to each other. Name the direction as outlook.direction_label gives it: \
 'flat' with a visible change means the direction is uncertain (방향 불확실), not unchanged (보합).
+- If phase.tentative is true the series is too short for a lifecycle verdict: present the phase as a tentative \
+call (too few observations), not as a finding, and do not set it against the trend test.
 - Name forecasting models in plain words (forecast.method_description), not by their raw ids.
 - Be honest about uncertainty. Describe the future as a range built from the prediction intervals and \
 the probability of increase, not as one certain number. State the forecast confidence and judge accuracy \
@@ -87,7 +96,9 @@ by forecast.skill: the backtest error of the final method divided by that of the
 error than naive and skill above 1 means it did not beat naive; if skill is null, do not claim it beats or \
 trails a naive forecast. Never read the raw MASE against 1: it is scaled by the in-sample one-step \
 seasonal-naive error, so multi-step forecasts often exceed 1 while beating naive; mention it at most as a \
-technical detail. Never present a probability as a certainty: write >99% or <1% instead of 100% or 0%. If \
+technical detail. Quote the probability of increase and the phase confidence exactly as \
+outlook.prob_increase_text and phase.confidence_text give them (the report prints the same text); never \
+present a probability as a certainty: write >99% or <1% instead of 100% or 0%. If \
 the series is short, noisy, recently broken by a changepoint, or the confidence is low, say so plainly.
 - Dates in the JSON are already formatted for the series frequency; reuse them as given. Percentages \
 are in percent units. The history is downsampled (older points are block averages), so do not \
@@ -102,7 +113,8 @@ headings given in the user message: (1) past: data range, overall growth, peak a
 structural break with its date and what changed, notable anomalies, seasonality; (2) present: current \
 lifecycle phase with its confidence and reasons, recent change, momentum, volatility; (3) outlook: \
 expected change at the horizon and the probability of increase (same two levels), the 80% scenario \
-range at the horizon end (pessimistic / base / optimistic), any forecast peak, the projected phase, \
+range at the horizon end (pessimistic / base / optimistic), any forecast peak, the projected phase \
+(follow outlook.future_phase_basis when it is given: then do not claim that the phase lasts or changes), \
 forecast confidence and method; (4) caveats: \
 uncertainty that widens with the horizon, the risk of structural breaks the model cannot foresee, \
 data-quality limits, and a clear statement that this is not financial or investment advice.
@@ -125,7 +137,9 @@ class NarrativeUnavailable(RuntimeError):
 _NA = {"ko": "해당 없음", "en": "n/a"}
 _HANGUL = re.compile(r"[가-힣]")
 _MINUS = "−"
-_SCI_SMALL, _SCI_LARGE = 1e-4, 1e15
+#: ×10ⁿ notation below / from these magnitudes: a 13-digit integer such as 18,698,199,572,300 is
+#: unreadable in prose (analysis._num_txt uses the same bounds)
+_SCI_SMALL, _SCI_LARGE = 1e-4, 1e12
 _SUPERSCRIPT = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 _UNIT = {
@@ -183,21 +197,28 @@ def _finite(x: Any) -> Optional[float]:
 
 
 def format_number(x: Any, decimals: Optional[int] = None, lang: str = "ko",
-                  signed: bool = False) -> str:
+                  signed: bool = False, scale: Any = None) -> str:
     """Human-friendly number: thousands separators, sensible decimals, typographic minus.
 
     ``decimals=None`` picks the precision from the magnitude (``1,234`` /
-    ``45.2`` / ``1.20`` / ``0.02``); magnitudes below 1e-4 or from 1e15 up use
-    ``1.05×10⁻⁹`` notation so tiny values never collapse to ``0``.  ``signed=True`` prefixes positive
-    values with ``+``.  ``None`` / NaN / inf become ``'해당 없음'`` (ko) or
-    ``'n/a'`` (en).
+    ``45.2`` / ``1.20`` / ``0.02``); magnitudes below 1e-4 or from 1e12 up use
+    ``1.05×10⁻⁹`` / ``1.87×10¹³`` notation, so tiny values never collapse to ``0``
+    and huge ones are not 13+-digit integers.  ``scale`` (optional): the largest
+    magnitude of the numbers printed next to this one (e.g. both ends of
+    ``a → b``); from 1e12 up, numbers of 1,000 or more next to it use ×10ⁿ too, so
+    one quantity does not switch notation within a line (``460,927,814,133 →
+    1.51×10¹⁵`` reads ``4.61×10¹¹ → 1.51×10¹⁵``).  ``signed=True``
+    prefixes positive values with ``+``.  ``None`` / NaN / inf become
+    ``'해당 없음'`` (ko) or ``'n/a'`` (en).
     """
     lang = _norm_lang(lang)
     v = _finite(x)
     if v is None:
         return _NA[lang]
     a = abs(v)
-    if decimals is None and (0 < a < _SCI_SMALL or a >= _SCI_LARGE):
+    big = max(a, abs(_finite(scale) or 0.0))
+    # (next to a huge number, a 4+-digit one switches too; short ones such as 0 or 12.5 stay)
+    if decimals is None and (0 < a < _SCI_SMALL or a >= _SCI_LARGE or (a >= 1000 and big >= _SCI_LARGE)):
         # fixed notation would print tiny values as "0" (or 20-digit integers): use ×10ⁿ
         mant, exp = f"{a:.2e}".split("e")
         mant = mant.rstrip("0").rstrip(".")
@@ -257,6 +278,47 @@ def format_prob(p: Any, lang: str = "ko") -> str:
     if v <= 0.005:
         return "<1%"
     return f"{v * 100:.0f}%"
+
+
+_FLOOR_TXT = {"ko": "0(하한)", "en": "0 (floor)"}
+
+
+def scenario_value(value: Any, reference: Any = None, nonnegative: bool = False,
+                   lang: str = "ko") -> tuple[str, Optional[float]]:
+    """``(text, pct)`` for a scenario value or interval bound of a forecast.
+
+    ``text`` is :func:`format_number` of ``value``, or ``'0(하한)'`` / ``'0 (floor)'``
+    when ``nonnegative`` is true (the forecast is clipped at 0,
+    ``ForecastResult.nonnegative``) and the value sits at that floor (``<= 0``):
+    the band was cut at 0, so the value is a floor, not a forecast of zero.
+    ``pct`` is ``(value - reference) / |reference| * 100``, or ``None`` at the
+    floor (a clipped bound reads ``−100.0%``, which says nothing), without a
+    ``reference``, or for a ``reference`` of 0 -- pass ``reference=None`` when a
+    percentage should not be shown (e.g. ``Outlook.expected_change_pct`` is
+    ``None``).  ``None`` / NaN values give ``('해당 없음' | 'n/a', None)``.
+    """
+    lang = _norm_lang(lang)
+    v = _finite(value)
+    if v is None:
+        return _NA[lang], None
+    if nonnegative and v <= 0.0:
+        return _FLOOR_TXT[lang], None
+    ref = _finite(reference)
+    pct = None
+    if ref is not None and ref != 0.0:
+        pct = _finite((v - ref) / abs(ref) * 100.0)
+    return format_number(v, lang=lang), pct
+
+
+def format_scenario(value: Any, reference: Any = None, nonnegative: bool = False,
+                    lang: str = "ko") -> str:
+    """A scenario value as prose prints it: ``'12.3 (+4.5%)'``, ``'12.3'`` or ``'0(하한)'``.
+
+    See :func:`scenario_value`; the percentage (vs. ``reference``) is appended in
+    brackets when there is one and never for a value at the 0 floor.
+    """
+    text, pct = scenario_value(value, reference, nonnegative, lang)
+    return text if pct is None else f"{text} ({format_pct(pct, lang)})"
 
 
 def format_date(ts: Any, freq: str, lang: str = "ko") -> str:
@@ -380,8 +442,13 @@ class _Ctx:
     def t(self, ko: str, en: str) -> str:
         return ko if self.lang == "ko" else en
 
-    def num(self, x: Any, decimals: Optional[int] = None, signed: bool = False) -> str:
-        return format_number(x, decimals=decimals, lang=self.lang, signed=signed)
+    def num(self, x: Any, decimals: Optional[int] = None, signed: bool = False, scale: Any = None) -> str:
+        return format_number(x, decimals=decimals, lang=self.lang, signed=signed, scale=scale)
+
+    def nums(self, *xs: Any, signed: bool = False) -> list[str]:
+        """Numbers printed side by side (``a → b``) in one notation (see ``format_number(scale=)``)."""
+        big = max((abs(v) for v in (_finite(x) for x in xs) if v is not None), default=0.0)
+        return [self.num(x, signed=signed, scale=big) for x in xs]
 
     def pct(self, x: Any, decimals: int = 1, signed: bool = True) -> str:
         return format_pct(x, lang=self.lang, decimals=decimals, signed=signed)
@@ -409,7 +476,15 @@ class _Ctx:
 
     def outlook_direction(self) -> str:
         """The outlook's direction word, ``방향 불확실`` for a 'flat' call on a visible change."""
-        return direction_label(self.o.direction, self.o.expected_change_pct, self.lang)
+        return direction_label(self.o.direction, self.o.expected_change_pct, self.lang,
+                               self.windows().undefined)
+
+    def windows(self) -> "_OutlookWindows":
+        """``forecast.outlook_levels`` of this report (computed once)."""
+        w = self.__dict__.get("_windows")
+        if w is None:
+            w = self.__dict__["_windows"] = _outlook_windows(self.a, self.f)
+        return w
 
     def recent_window(self) -> int:
         return _recent_window(self.freq, int(self.a.season_length), int(self.m.n_obs))
@@ -426,17 +501,54 @@ def _recent_window(freq: str, season_len: int, n_obs: int) -> int:
     return max(1, min(lag, int(n_obs) - 1))
 
 
-def _undefined_pct_reason(base: Optional[float], lang: str) -> str:
-    """Why a % change is undefined: the base is negative/zero, or close to zero."""
-    if base is not None and base < 0:
-        return "기준 수준이 음수여서" if lang == "ko" else "the base level is negative"
-    return "기준 수준이 0에 가까워" if lang == "ko" else "the base level is close to zero"
+def _pct_reason_clause(code: Optional[str], lang: str, subject: str = "base",
+                       base: Optional[float] = None) -> str:
+    """Why a % change is undefined, as a Korean clause that leads into the verb
+    (``기준 수준이 음수여서``) or an English clause (``the base level is negative``).
+
+    ``code`` is an :func:`analysis.pct_change_undefined` reason (``'zero'``,
+    ``'negative'``, ``'sign_change'``, ``'near_zero'``); ``None`` (a value left
+    out for another reason) falls back to the sign of ``base``.  ``subject``
+    names the base: ``'base'`` (기준 수준), ``'start'`` (시작 수준) or ``'peak'`` (고점).
+    """
+    if code is None:
+        code = "negative" if base is not None and base < 0 else "zero"
+    ko_subj, en_subj = {"start": ("시작 수준", "the starting level"),
+                        "peak": ("고점", "the peak")}.get(subject, ("기준 수준", "the base level"))
+    if code == "negative":
+        return f"{ko_subj}이 음수여서" if lang == "ko" else f"{en_subj} is negative"
+    if code == "sign_change":
+        # analysis' rule: a positive base and a negative end (the level fell through zero)
+        return "그사이 0을 지나 음수로 바뀌어" if lang == "ko" else "the level crossed zero"
+    if code == "near_zero":
+        return (f"{ko_subj}이 값의 변동 폭에 비해 0에 가까워" if lang == "ko"
+                else f"{en_subj} is close to zero relative to the spread of the values")
+    return f"{ko_subj}이 0에 가까워" if lang == "ko" else f"{en_subj} is close to zero"
+
+
+def _pct_reason_of(analysis: AnalysisResult, base: Optional[float], new: Optional[float]) -> Optional[str]:
+    """:func:`analysis.pct_change_undefined` for a change of ``analysis``' series (None if no numbers)."""
+    if base is None or new is None:
+        return None
+    return pct_change_undefined(base, new, np.asarray(analysis.series, dtype=float))
+
+
+def _drawdown_undefined(analysis: AnalysisResult) -> Optional[str]:
+    """Why ``metrics.drawdown_pct`` is no meaningful percentage (``None``: it is).
+
+    ``drawdown_pct`` is always a number (typed ``float``), but for a series that
+    crossed zero (a P&L from 10 to -10 reads "-179 %") or whose peak is near 0
+    relative to the spread of data with negative values it means nothing:
+    :func:`analysis.pct_change_undefined` from the peak to the latest value.
+    """
+    m = analysis.metrics
+    return _pct_reason_of(analysis, _finite(m.peak_value), _finite(m.last_value))
 
 
 @dataclass
 class _OutlookWindows:
     """The two levels behind ``Outlook.expected_change_pct`` and ``prob_increase``
-    (see ``forecast.compute_outlook``)."""
+    (``forecast.outlook_levels``, plus the horizon)."""
 
     k_fut: int            # last min(season, horizon) forecast points
     k_cur: int            # last min(season, n) observations
@@ -445,74 +557,75 @@ class _OutlookWindows:
     adj_fut: bool         # forecast window is a partial season -> its seasonal effect is removed
     adj_cur: bool         # current window is a partial season -> its seasonal effect is removed
     current: Optional[float] = None  # the compared levels (seasonally adjusted where flagged);
-    future: Optional[float] = None   # None if forecast's helpers are unavailable
-    undefined: Optional[str] = None  # why the % change is undefined: 'zero' | 'mostly_zero' | None
+    future: Optional[float] = None   # None only for an empty series / forecast
+    undefined: Optional[str] = None  # why the % change is undefined: 'zero' | 'mostly_zero' |
+                                     # 'sign_change' | 'near_zero' | None (defined)
 
 
 def _outlook_windows(analysis: AnalysisResult, forecast: ForecastResult) -> _OutlookWindows:
-    """The window logic of ``forecast.compute_outlook``, with the levels it compares.
+    """The levels, windows, adjustment flags and None reason of ``forecast.compute_outlook``.
 
-    current level = mean of the last ``min(m, n)`` observations, future level =
-    mean of the last ``min(m, H)`` forecast means (``m`` = season length); a
-    window that is not a whole number of seasonal periods has the average
-    seasonal effect over it removed (for the forecast window scaled by how much
-    seasonality the forecast contains).  The seasonal component, its
-    continuation and that share come from ``forecast``'s own helpers (imported
-    read-only, so the two cannot drift apart); the percentage is undefined when
-    the current level is ~0 (``'zero'``) or when at least half of the current
-    window is exactly 0 for a non-negative series (``'mostly_zero'``:
-    intermittent demand).
+    Taken from :func:`forecast.outlook_levels` -- the single source of truth that
+    ``compute_outlook`` itself uses -- so the narrative and the payload name and
+    print exactly the levels behind ``expected_change_pct`` and ``prob_increase``
+    (including the forecast-level scaling of a multiplicative seasonal pattern
+    over a partial-season window).
     """
-    m = max(1, int(analysis.season_length))
-    y_all = np.asarray(analysis.series, dtype=float)
-    finite = np.isfinite(y_all)
-    y = y_all[finite]
-    n = len(y)
+    from .forecast import outlook_levels   # lazy: narrative imports forecast only when used
+
     fm = np.asarray(forecast.mean, dtype=float)
     h = len(fm) or max(1, int(forecast.horizon))
-    k_fut, k_cur = min(m, h), min(m, max(1, n))
-    p: Optional[int] = None
-    current = future = None
-    undefined: Optional[str] = None
     try:
-        from .forecast import _future_seasonal, _seasonal_component, _seasonal_share
-    except ImportError:  # pragma: no cover - forecast is part of the package
-        _future_seasonal = _seasonal_component = _seasonal_share = None
-    seas = None
-    if _seasonal_component is not None:
-        seas, p_raw = _seasonal_component(analysis)
-        p = int(p_raw) if seas is not None else None
-    if n and len(fm) and _future_seasonal is not None and _seasonal_share is not None:
-        current = float(np.mean(y[-k_cur:]))
-        future = float(np.mean(fm[-k_fut:]))
-        if seas is not None and p is not None:
-            seas_fut = _future_seasonal(analysis, len(fm))
-            seas_fut = _seasonal_share(fm, seas_fut, p) * seas_fut
-            if k_fut % p:
-                future -= float(np.mean(seas_fut[-k_fut:]))
-            if k_cur % p:
-                current -= float(np.mean(np.asarray(seas, dtype=float)[finite][-k_cur:]))
-    if n:
-        ref = float(np.mean(np.abs(y)))
-        cur_raw = float(np.mean(y[-k_cur:])) if current is None else current
-        if not abs(cur_raw) > 1e-6 * max(ref, 1e-300):
-            undefined = "zero"
-        elif bool(np.all(y >= 0) and np.mean(y[-k_cur:] == 0) >= 0.5):
-            undefined = "mostly_zero"
-    return _OutlookWindows(k_fut=k_fut, k_cur=k_cur, horizon=h, period=p,
-                           adj_fut=p is not None and k_fut % p != 0,
-                           adj_cur=p is not None and k_cur % p != 0,
-                           current=current, future=future, undefined=undefined)
+        lv = outlook_levels(analysis, forecast)
+    except ValueError:   # empty series or forecast: windows only, no levels
+        m = max(1, int(analysis.season_length))
+        y = np.asarray(analysis.series, dtype=float)
+        n = int(np.isfinite(y).sum())
+        return _OutlookWindows(k_fut=min(m, h), k_cur=min(m, max(1, n)), horizon=h, period=None,
+                               adj_fut=False, adj_cur=False)
+    return _OutlookWindows(k_fut=int(lv.k_fut), k_cur=int(lv.k_cur), horizon=h,
+                           period=None if lv.period is None else int(lv.period),
+                           adj_fut=bool(lv.adj_fut), adj_cur=bool(lv.adj_cur),
+                           current=float(lv.current), future=float(lv.future), undefined=lv.undefined)
 
 
-def _intermittent(analysis: AnalysisResult) -> bool:
-    """Mostly-zero (intermittent) demand, by the rule the analysis and the forecast use."""
-    try:
-        from .analysis import _is_intermittent
-    except ImportError:  # pragma: no cover - analysis is part of the package
-        return False
+def is_intermittent(analysis: AnalysisResult) -> bool:
+    """Mostly-zero (intermittent) demand, by the rule the analysis and the forecast use.
+
+    ``analysis._is_intermittent``: at least 30 % exact zeros overall and in the
+    latest season.  For such series ``analysis.anomalies`` are unusually large
+    demands and ``Anomaly.expected`` is the typical (median non-zero) demand
+    size -- a table should label it ``평소 규모`` / ``typical size``, not ``예상``.
+    """
     y = np.asarray(analysis.series, dtype=float)
     return bool(_is_intermittent(y[np.isfinite(y)], int(analysis.season_length)))
+
+
+_intermittent = is_intermittent
+
+
+def _random_walk(analysis: AnalysisResult) -> bool:
+    """``forecast.is_random_walk`` (imported lazily: forecast imports this module's helpers' peers)."""
+    try:
+        from .forecast import is_random_walk
+        return bool(is_random_walk(analysis))
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return False
+
+
+def phase_is_tentative(analysis: AnalysisResult) -> bool:
+    """Is the lifecycle phase only a placeholder for a series too short to judge?
+
+    With fewer than :data:`analysis.MIN_PHASE_OBS` observations
+    ``analysis.lifecycle_phase`` gives no lifecycle verdict: 'stable' /
+    'volatile' only says whether noise dominates, even when the trend test finds
+    a significant rise (5 yearly values from 10 to 14).  Present such a phase as
+    a tentative call ('안정기(관측치가 적어 잠정 판단)'), never as a finding.
+    """
+    try:
+        return int(analysis.metrics.n_obs) < MIN_PHASE_OBS
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def _zero_share(analysis: AnalysisResult) -> float:
@@ -529,18 +642,23 @@ _FLAT_BAND_PCT = 2.0
 _DIR_UNCERTAIN = {"ko": "방향 불확실", "en": "direction uncertain"}
 
 
-def direction_label(direction: str, expected_change_pct: Any = None, lang: str = "ko") -> str:
+def direction_label(direction: str, expected_change_pct: Any = None, lang: str = "ko",
+                    undefined: Optional[str] = None) -> str:
     """User-facing word for ``Outlook.direction``: ``상승`` / ``하락`` / ``보합`` / ``방향 불확실``.
 
     ``'flat'`` means "no clear direction", which has two causes: a genuinely
     small change (``|expected_change_pct| < 2 %``: ``보합``, roughly unchanged)
     or a change that may be large but is swamped by the forecast uncertainty
     (``방향 불확실`` / ``direction uncertain``) -- calling +75 % "보합" would
-    contradict the number next to it.  With no percentage the call stays ``보합``.
+    contradict the number next to it.  With no percentage the call stays
+    ``보합``, except when ``undefined`` (``forecast.outlook_levels(...).undefined``)
+    is ``'sign_change'``: a level expected to cross zero is no "roughly
+    unchanged" either.
     """
     lang = _norm_lang(lang)
     chg = _finite(expected_change_pct)
-    if direction == "flat" and chg is not None and abs(chg) >= _FLAT_BAND_PCT:
+    if direction == "flat" and ((chg is not None and abs(chg) >= _FLAT_BAND_PCT)
+                                or (chg is None and undefined == "sign_change")):
         return _DIR_UNCERTAIN[lang]
     return _DIR[lang].get(direction, direction)
 
@@ -651,7 +769,9 @@ def _model_ids(forecast: ForecastResult) -> list[str]:
 
 
 def _trend_drawdown(analysis: AnalysisResult) -> Optional[float]:
-    """Latest trend value versus the trend maximum, in % (<= 0); ``None`` if undefined."""
+    """Latest trend value versus the trend maximum, in % (<= 0); ``None`` if undefined
+    (a non-positive maximum, or :func:`analysis.pct_change_undefined` from the maximum to
+    the latest trend value: a trend that crossed zero has no % drawdown)."""
     t = np.asarray(analysis.decomposition.trend, dtype=float)
     t = t[np.isfinite(t)]
     if len(t) < 2:
@@ -659,6 +779,8 @@ def _trend_drawdown(analysis: AnalysisResult) -> Optional[float]:
     top = float(np.max(t))
     if not top > 0:
         return None
+    if pct_change_undefined(top, float(t[-1]), np.asarray(analysis.series, dtype=float)) is not None:
+        return None   # the trend crossed zero (or peaked near 0 among negative values)
     dd = (float(t[-1]) - top) / top * 100.0
     return min(0.0, dd) if math.isfinite(dd) else None
 
@@ -699,11 +821,14 @@ _RX_DATE = r"\d{4}(?:-Q[1-4]|-\d{2}(?:-\d{2})?)?"
 #: which the captured group (and so the English) leaves out
 _RX_WHEN = rf"({_RX_DATE})년?"
 _RX_UNIT = r"(?:개월|주|일|분기|년|기간)"
+#: per-period unit of a slope: "/월" (current analysis) or "/개월" (earlier versions)
+_RX_PER = r"(?:개월|월|주|일|분기|년|기간)"
 _RX_P = r"p (?:<|=) [\d.]+"
-_UNIT_EN = {"개월": ("month", "months"), "주": ("week", "weeks"), "일": ("day", "days"),
+_UNIT_EN = {"개월": ("month", "months"), "월": ("month", "months"), "주": ("week", "weeks"), "일": ("day", "days"),
             "분기": ("quarter", "quarters"), "년": ("year", "years"), "기간": ("period", "periods")}
-_KIND_EN = {"가속": "acceleration", "감속": "deceleration", "상승 전환": "turn upward",
-            "하락 전환": "turn downward", "수준 변화": "level shift"}
+#: changepoint labels in the "구조 변화(...)" reason: analysis.changepoint_label's vocabulary
+#: (directed, e.g. "하락→상승 반전"), plus the undirected labels of earlier versions
+_KIND_EN = {"상승 전환": "turn upward", "하락 전환": "turn downward", **CHANGEPOINT_LABEL_EN}
 
 
 def _en_span(k: str, unit_ko: str) -> str:
@@ -723,8 +848,9 @@ def _en_scale_amount(txt: str) -> str:
 
 
 _REASON_EN: tuple[tuple[re.Pattern, Any], ...] = tuple((re.compile(p), fn) for p, fn in (
-    (r"관측치가 ([\d,]+)개뿐이라 추세를 판단하기에 데이터가 부족합니다\.?",
-     lambda g: f"Only {g[0]} observations: too few to judge the trend."),
+    (r"관측치가 ([\d,]+)개뿐이라 (추세를|국면을) 판단하기에 데이터가 부족합니다\.?",
+     lambda g: f"Only {g[0]} observations: too few to judge the "
+               f"{'trend' if g[1] == '추세를' else 'lifecycle phase'}."),
     (rf"관측 기간 동안 값이 ({_RX_NUM})에서 ({_RX_NUM})(?:까지|로) ({_RX_PCT}) 변했습니다\.?",
      lambda g: f"Over the observed period the value moved from {g[0]} to {g[1]} ({g[2]})."),
     (rf"현재 값은 ({_RX_NUM})입니다\.?", lambda g: f"The current value is {g[0]}."),
@@ -732,7 +858,7 @@ _REASON_EN: tuple[tuple[re.Pattern, Any], ...] = tuple((re.compile(p), fn) for p
      lambda g: f"Noise relative to a straight-line trend is {g[0]}%."),
     (rf"최근 ([\d,]+)({_RX_UNIT}) 동안 추세가 ({_RX_PCT}) 변했습니다\.?",
      lambda g: f"Over the last {_en_span(g[0], g[1])} the trend changed by {g[2]}."),
-    (rf"최근 ([\d,]+)({_RX_UNIT}) 동안 추세 기울기는 ({_RX_NUM})/({_RX_UNIT})입니다\.?",
+    (rf"최근 ([\d,]+)({_RX_UNIT}) 동안 추세 기울기는 ({_RX_NUM})/({_RX_PER})입니다\.?",
      lambda g: f"Over the last {_en_span(g[0], g[1])} the trend slope was {g[2]} per "
                f"{_UNIT_EN.get(g[3], ('period',))[0]}."),
     (rf"현재 추세는 고점\({_RX_WHEN}\)보다 ({_RX_NUM})% 낮은 수준입니다\.?",
@@ -748,7 +874,8 @@ _REASON_EN: tuple[tuple[re.Pattern, Any], ...] = tuple((re.compile(p), fn) for p
                f"trend over the whole period (τ = {g[1]}, {g[2]})."),
     (rf"Mann-Kendall 검정에서 전체 기간의 뚜렷한 추세가 확인되지 않습니다 \(({_RX_P})\)\.?",
      lambda g: f"The Mann-Kendall test finds no clear trend over the whole period ({g[0]})."),
-    (r"변화가 누적되는 무작위 행보\(random walk\)에 가까운 움직임이라, 추세처럼 보이는 등락도 우연일 수 있습니다\.?",
+    (r"변화가 누적되는 무작위 행보(?:\(random walk\))?에 가까운 움직임이라, 추세처럼 보이는 등락도 우연일 수 "
+     r"있습니다\.?",
      lambda g: "Changes accumulate like a random walk, so trend-like swings may be due to chance."),
     (rf"{_RX_WHEN}에 수준이 한 단계 (높아졌습니다|낮아졌습니다) \(약 ([^)]+)\)\.?",
      lambda g: f"{_en_when(g[0]).capitalize()} the level stepped {'up' if g[1] == '높아졌습니다' else 'down'} (about {g[2]})."),
@@ -781,6 +908,10 @@ _REASON_EN: tuple[tuple[re.Pattern, Any], ...] = tuple((re.compile(p), fn) for p
      lambda g: f"The trend level is {g[0]}× its earlier base: fast growth from a low base."),
     (rf"최근 상승 속도가 전체 기간 평균 속도\(추세선 처음→끝\)의 ({_RX_NUM})배로 가속되고 있습니다\.?",
      lambda g: f"The recent rise is {g[0]}× the average pace of the whole period (trend start to end): accelerating."),
+    (rf"최근 상승 속도가 전체 기간 평균 속도\(추세선 처음→끝\)의 ({_RX_NUM})배를 넘습니다\.?",
+     lambda g: f"The recent rise is more than {g[0]}× the average pace of the whole period (trend start to end)."),
+    (rf"추세는 고점\({_RX_WHEN}, ({_RX_NUM})\) 이후 0 아래로 내려가 현재 ({_RX_NUM})입니다\.?",
+     lambda g: f"The trend has fallen below zero since its peak ({g[0]}, {g[1]}) and is now {g[2]}."),
     (rf"현재 수준은 추세 고점의 ({_RX_NUM})% 수준입니다\.?",
      lambda g: f"The current level is {g[0]}% of the trend peak."),
     (rf"현재 추세는 고점\({_RX_WHEN}\) 수준입니다\.?", lambda g: f"The trend is at its peak ({g[0]})."),
@@ -831,8 +962,10 @@ def _summary_line(c: _Ctx) -> str:
     chg = _finite(c.o.expected_change_pct)
     conf_word = _CONF[c.lang].get(c.o.confidence, c.o.confidence)
     dir_word = c.outlook_direction()
+    tentative = phase_is_tentative(c.a)
     if c.lang == "ko":
-        head = f"**한눈에 보기** — {name}: 현재 **{c.phase_name(c.a.phase.label)}** 단계(신뢰도 {conf})이며, "
+        conf_ko = f"관측치가 적어 잠정 판단, 신뢰도 {conf}" if tentative else f"신뢰도 {conf}"
+        head = f"**한눈에 보기** — {name}: 현재 **{c.phase_name(c.a.phase.label)}** 단계({conf_ko})이며, "
         if _flat_despite_change(c, chg):
             head += (f"향후 {h} 동안 **{c.pct(chg)}** 변화가 예상되지만 예측 불확실성이 그보다 커서 "
                      f"**방향은 불확실**합니다.")
@@ -841,8 +974,9 @@ def _summary_line(c: _Ctx) -> str:
         else:
             head += f"향후 {h} 전망은 **{dir_word}**입니다."
         return head + f" 상승 확률 {prob}, 예측 신뢰도 {conf_word}."
+    conf_en = f"tentative: too few observations; confidence {conf}" if tentative else f"confidence {conf}"
     head = (f"**At a glance** — {name}: currently **{c.phase_name(c.a.phase.label)}** "
-            f"(confidence {conf}); ")
+            f"({conf_en}); ")
     if _flat_despite_change(c, chg):
         head += (f"over the next {h} the level is expected to change by **{c.pct(chg)}**, but the forecast "
                  f"uncertainty is larger than that, so the **direction is uncertain**.")
@@ -854,9 +988,11 @@ def _summary_line(c: _Ctx) -> str:
 
 
 def _changepoint_line(c: _Ctx, cp: Changepoint) -> str:
+    """One break: date, its directed name (:func:`analysis.changepoint_label`, the vocabulary of
+    the phase reasons and the report), the slopes and the strength; level shifts with their jump."""
     b, a = float(cp.slope_before), float(cp.slope_after)
-    flat_tol = 0.1 * max(abs(a), abs(b), 1e-12)
-    slopes = f"{c.num(b)} → {c.num(a)}{c.unit}"
+    nb, na = c.nums(b, a)
+    slopes = f"{nb} → {na}{c.unit}"
     mag = c.num(cp.magnitude, decimals=2)
     d = c.date(cp.date)
     kind = cp.kind
@@ -870,20 +1006,9 @@ def _changepoint_line(c: _Ctx, cp: Changepoint) -> str:
         prep = "On" if c.freq in ("D", "W") else "In"   # "On 2022-12-04", "In 2022-12"
         return c.t(f"- **{d}**에 {desc} — 기울기 {slopes}, 변화 강도 {mag}",
                    f"- {prep} **{d}** {desc} — slope {slopes}, strength {mag}")
-    if kind == "acceleration":
-        ko, en = ("성장 가속", "growth accelerated") if a >= 0 else ("하락 가속", "the decline accelerated")
-    elif kind == "deceleration":
-        ko, en = ("성장 둔화", "growth slowed") if b > 0 else ("하락세 둔화", "the decline eased")
-    elif kind == "reversal_up":
-        ko, en = (("하락에서 상승으로 반전", "turned from decline to growth") if b < -flat_tol
-                  else ("횡보에서 상승으로 전환", "turned from flat to growth"))
-    elif kind == "reversal_down":
-        ko, en = (("상승에서 하락으로 반전", "turned from growth to decline") if b > flat_tol
-                  else ("횡보에서 하락으로 전환", "turned from flat to decline"))
-    else:
-        ko, en = ("추세 변화", "the trend changed")
-    return c.t(f"- **{d}**부터 {ko} (기울기 {slopes}, 변화 강도 {mag})",
-               f"- From **{d}**: {en} (slope {slopes}, strength {mag})")
+    label = changepoint_label(cp, c.lang)
+    return c.t(f"- **{d}**부터 {label} (기울기 {slopes}, 변화 강도 {mag})",
+               f"- From **{d}**: {label} (slope {slopes}, strength {mag})")
 
 
 def _anomaly_line(c: _Ctx, an: Anomaly, intermittent: bool = False) -> str:
@@ -1050,6 +1175,31 @@ def _seasonal_gap_cause(c: _Ctx, raw_gap_larger: bool) -> tuple[str, str]:
             "the observations mix in seasonal and short-term swings, which hide part of the gap")
 
 
+def _mk_against_endpoints(c: _Ctx) -> Optional[bool]:
+    """Does the significant Mann-Kendall direction contradict the trend line's two ends?
+
+    ``None`` when it does not (or the test found no direction).  Otherwise
+    whether an interior extreme explains it -- a high stretch in the middle for
+    an 'up' test whose trend ends visibly (>= 1 % of the trend scale) below its
+    start, a low stretch for a 'down' test that ends above it.  The rank-based
+    test counts the many early-to-middle rises of a fad: weekly fad n=156 goes
+    6.94 -> 5.80 on the trend line (-16.5 %), yet "a significant upward trend".
+    """
+    m = c.m
+    if m.direction not in ("up", "down"):
+        return None
+    tr = np.asarray(c.a.decomposition.trend, dtype=float)
+    tr = tr[np.isfinite(tr)]
+    if len(tr) < 3:
+        return None
+    diff = float(tr[-1] - tr[0])
+    scale = float(np.max(np.abs(tr)))
+    if scale <= 0 or abs(diff) < 0.01 * scale or (diff > 0) == (m.direction == "up"):
+        return None
+    i = int(np.argmax(tr)) if m.direction == "up" else int(np.argmin(tr))
+    return 0 < i < len(tr) - 1
+
+
 def _past_section(c: _Ctx) -> list[str]:
     m = c.m
     lines: list[str] = []
@@ -1068,8 +1218,7 @@ def _past_section(c: _Ctx) -> list[str]:
     # 2. overall change on the trend line
     trend = np.asarray(c.a.decomposition.trend, dtype=float)
     trend = trend[np.isfinite(trend)]
-    t0 = c.num(trend[0]) if len(trend) else c.num(None)
-    t1 = c.num(trend[-1]) if len(trend) else c.num(None)
+    t0, t1 = c.nums(trend[0], trend[-1]) if len(trend) else (c.num(None), c.num(None))
     total, cagr = _finite(m.total_change_pct), _finite(m.cagr_pct)
     intermittent = _intermittent(c.a)
     if intermittent:
@@ -1090,14 +1239,18 @@ def _past_section(c: _Ctx) -> list[str]:
             s += f" (**{c.pct(cagr)}** per year, CAGR)." if cagr is not None else "."
         lines.append(s)
     else:
-        # % change undefined: say why (negative base vs. ~0 base) and give the absolute change
+        # % change undefined: say why (negative or ~0 start, a level that crossed zero, a start
+        # near 0 for data with negatives -- analysis.pct_change_undefined) and give the change
         base = float(trend[0]) if len(trend) else None
+        end = float(trend[-1]) if len(trend) else None
         diff = c.num(float(trend[-1] - trend[0]), signed=True) if len(trend) else c.num(None)
-        reason = _undefined_pct_reason(base, c.lang)
+        code = _pct_reason_of(c.a, base, end)
+        ko_why = _pct_reason_clause(code, "ko", "start", base)
+        en_why = _pct_reason_clause(code, "en", "start", base)
         lines.append(c.t(
-            f"- 추세선 기준으로 {t0}에서 {t1}까지 {diff} 변했지만, 시작 시점의 {reason} 변화율(%)은 정의되지 않습니다.",
+            f"- 추세선 기준으로 {t0}에서 {t1}까지 {diff} 변했지만, {ko_why} 변화율(%)은 정의되지 않습니다.",
             f"- On the trend line the level moved from {t0} to {t1} ({diff}); the total % change is undefined "
-            f"because {reason.replace('the base level', 'the starting level')}.",
+            f"because {en_why}.",
         ))
     # 3. significance + long-run slope
     p = _finite(m.mk_pvalue)
@@ -1106,7 +1259,40 @@ def _past_section(c: _Ctx) -> list[str]:
     slope = f"{c.num(m.slope, signed=True)}{c.unit}"
     slope_pct = f"{c.pct(m.slope_pct, decimals=2)}{c.unit}"
     why_ko, why_en = _mk_not_significant_why(c)
-    if c.lang == "ko":
+    against = _mk_against_endpoints(c)
+    if against is not None:
+        # the test's direction contradicts the total change printed just above: qualify it
+        up = m.direction == "up"
+        word_ko, word_en = ("상승", "upward") if up else ("하락", "downward")
+        p_ko, p_en = f"(τ = {tau}, 자기상관 보정 p {pstr})", f"(τ = {tau}, p {pstr} after correcting for autocorrelation)"
+        ends_ko = "추세선의 끝은 시작보다 " + ("낮아" if up else "높아")
+        ends_en = "the trend line ends " + ("below" if up else "above") + " where it started"
+        steady_ko, steady_en = ("꾸준한 상승" if up else "꾸준한 하락"), ("steady rise" if up else "steady fall")
+        head_ko = f"- Mann-Kendall 검정에서는 통계적으로 유의한 **{word_ko}** 추세가 나옵니다 {p_ko}."
+        if against:
+            stretch_ko, stretch_en = ("높은", "high") if up else ("낮은", "low")
+            ko = (f"{head_ko} 다만 이는 값의 순위만 보는 검정이 중간의 {stretch_ko} 구간에 끌린 결과로, "
+                  f"{ends_ko} {steady_ko}으로 보기는 어렵습니다.")
+            en = (f"- The Mann-Kendall test comes out as a statistically significant **{word_en}** trend {p_en}, but "
+                  f"this rank-based test is pulled by the {stretch_en} stretch in the middle: {ends_en}, so this "
+                  f"is no {steady_en}.")
+        else:
+            ko = (f"{head_ko} 다만 {ends_ko.replace('낮아', '낮고').replace('높아', '높고')}, 값의 순위만 보는 "
+                  f"검정이어서 {steady_ko}을 뜻하지는 않습니다.")
+            en = (f"- The Mann-Kendall test comes out as a statistically significant **{word_en}** trend {p_en}, but "
+                  f"{ends_en}: the test only ranks the values, so this is no {steady_en}.")
+        slope_v = _finite(m.slope) or 0.0
+        if slope_v != 0 and (slope_v > 0) == up:
+            # Theil-Sen takes the median of the same pairwise comparisons: same sign, same reason
+            ko += (f" 장기 평균 기울기({slope}, 평균 수준 대비 {slope_pct})도 같은 이유로 "
+                   f"{'양수' if up else '음수'}입니다.")
+            en += (f" The long-run slope ({slope}, {slope_pct} of the mean level) is "
+                   f"{'positive' if up else 'negative'} for the same reason.")
+        else:
+            ko += f" 장기 평균 기울기는 {slope}(평균 수준 대비 {slope_pct})입니다."
+            en += f" The long-run slope is {slope} ({slope_pct} of the mean level)."
+        lines.append(c.t(ko, en))
+    elif c.lang == "ko":
         verdict = {"up": "통계적으로 유의한 **상승** 추세가 확인됩니다",
                    "down": "통계적으로 유의한 **하락** 추세가 확인됩니다"}.get(
             m.direction, "통계적으로 유의한 장기 추세는 확인되지 않습니다")
@@ -1135,7 +1321,8 @@ def _past_section(c: _Ctx) -> list[str]:
         ))
     # 4. peak and drawdown
     dd = _finite(m.drawdown_pct) or 0.0
-    pdate, pval, last = c.date(m.peak_date), c.num(m.peak_value), c.num(m.last_value)
+    pdate = c.date(m.peak_date)
+    pval, last = c.nums(m.peak_value, m.last_value)
     at_peak = dd > -0.5 or pd.Timestamp(m.peak_date) >= pd.Timestamp(m.end)
     obs = np.asarray(c.a.series, dtype=float)
     obs = obs[np.isfinite(obs)]
@@ -1178,8 +1365,25 @@ def _past_section(c: _Ctx) -> list[str]:
                          f"all-time high now.{new_en}{spike_en}"))
     else:
         below = c.pct(abs(dd), signed=False)
-        seasonal_dd = _seasonal_drawdown(c, dd)
-        if seasonal_dd is not None:
+        dd_why = _drawdown_undefined(c.a)
+        seasonal_dd = _seasonal_drawdown(c, dd) if dd_why is None else None
+        if dd_why is not None:
+            # a series that crossed zero (or peaked near 0 among negative values): "179.4% 낮아
+            # 고점의 1/10 이하로 급감" is no percentage -- state the gap in the series' units
+            gap = c.num(abs(float(m.peak_value) - float(m.last_value)))
+            if dd_why == "sign_change":
+                why_ko, why_en = "값이 0을 지나 음수로 바뀌어", "The value has crossed zero"
+            else:
+                why_ko = _pct_reason_clause(dd_why, "ko", "peak", _finite(m.peak_value))
+                why_en = _pct_reason_clause(dd_why, "en", "peak", _finite(m.peak_value))
+                why_en = why_en[0].upper() + why_en[1:]
+            lines.append(c.t(
+                f"- 최고치는 {pdate}의 {pval}이며, 최근 값({last})은 고점보다 {gap} 낮습니다. {why_ko} 고점 대비 "
+                f"하락률(%)은 의미가 없습니다.{spike_ko}",
+                f"- The peak was {pval} {_en_when(pdate)}; the latest value ({last}) is {gap} below it. {why_en}, "
+                f"so a % drop from the peak is not meaningful.{spike_en}",
+            ))
+        elif seasonal_dd is not None:
             # a strongly seasonal series: much of the gap to the peak can be the seasonal swing;
             # name the actual cause from the seasonal component at the peak and at the latest point
             tdd = seasonal_dd
@@ -1255,10 +1459,19 @@ def _past_section(c: _Ctx) -> list[str]:
     ts_ = float(c.m.trend_strength)
     t_ko, t_en = ((("낮습니다", "low") if ts_ < 0.3 else ("보통입니다", "moderate")) if ts_ < 0.6
                   else (("높습니다", "high") if ts_ < 0.85 else ("매우 높습니다", "very high")))
+    trend_ko = f"추세의 일관성(추세 강도 {ts_:.2f})은 {t_ko}."
+    trend_en = f"trend consistency is {t_en} (trend strength {ts_:.2f})"
+    # (or the phase reasons already call the moves random-walk-like: analysis' noise phi >= 0.9)
+    walk = any("무작위 행보" in str(r) for r in (c.a.phase.reasons or [])) or _random_walk(c.a)
+    if ts_ >= 0.6 and walk:
+        # a random walk's wander is all "trend" to the smoother: a high strength is no consistency
+        trend_ko = f"추세 강도({ts_:.2f})는 높지만, 무작위 행보에서는 흔한 일이라 꾸준한 추세의 근거는 아닙니다."
+        trend_en = (f"trend strength is high ({ts_:.2f}), but that is typical of a random walk and no evidence "
+                    f"of a steady trend")
     if c.a.decomposition.period <= 1:
         lines.append(c.t(
-            f"- 계절 주기가 없거나 데이터가 짧아 계절성은 추정하지 않았습니다. 추세의 일관성(추세 강도 {ts_:.2f})은 {t_ko}.",
-            f"- No seasonal cycle was estimated (no period or too little data); trend consistency is {t_en} (trend strength {ts_:.2f}).",
+            f"- 계절 주기가 없거나 데이터가 짧아 계절성은 추정하지 않았습니다. {trend_ko}",
+            f"- No seasonal cycle was estimated (no period or too little data); {trend_en}.",
         ))
     else:
         ss = float(c.m.seasonal_strength)
@@ -1278,8 +1491,8 @@ def _past_section(c: _Ctx) -> list[str]:
             pat_ko = " 뚜렷한 반복 패턴은 확인되지 않습니다."
             pat_en = ", with no clear recurring pattern"
         lines.append(c.t(
-            f"- 계절성은 {s_ko} (강도 {ss:.2f}).{pat_ko} 추세의 일관성(추세 강도 {ts_:.2f})은 {t_ko}.",
-            f"- Seasonality is {s_en} (strength {ss:.2f}){pat_en}; trend consistency is {t_en} (trend strength {ts_:.2f}).",
+            f"- 계절성은 {s_ko} (강도 {ss:.2f}).{pat_ko} {trend_ko}",
+            f"- Seasonality is {s_en} (strength {ss:.2f}){pat_en}; {trend_en}.",
         ))
     return lines
 
@@ -1354,7 +1567,16 @@ def _evidence(c: _Ctx) -> list[str]:
                    f"The recent slope differs from the long-run slope (momentum) by {mom} pp{c.unit} "
                    f"of the current trend level."))
     dd = _finite(m.drawdown_pct)
-    if dd is not None and c.a.phase.label in ("declining", "peaking", "reviving"):
+    pk, lst = _finite(m.peak_value), _finite(m.last_value)
+    if (dd is not None and c.a.phase.label in ("declining", "peaking", "reviving")
+            and _drawdown_undefined(c.a) is not None):
+        # crossed zero (or a peak near 0 among negative values): "184.9% 낮습니다" is no
+        # percentage -- give the gap in the series' units, as the past section does
+        if pk is not None and lst is not None and pk > lst:
+            gap, last = c.num(pk - lst), c.num(lst)
+            out.append(c.t(f"최근 값({last})이 고점({c.date(m.peak_date)})보다 {gap} 낮습니다.",
+                           f"The latest value ({last}) is {gap} below the peak ({c.date(m.peak_date)})."))
+    elif dd is not None and c.a.phase.label in ("declining", "peaking", "reviving"):
         tdd = _seasonal_drawdown(c, dd)
         basis = dd if tdd is None else tdd
         if basis <= -5:
@@ -1423,7 +1645,13 @@ def _momentum_phrase(c: _Ctx) -> tuple[str, str]:
     """
     m = c.m
     label = c.a.phase.label
-    long_dir = m.direction if m.direction in ("up", "down") else "flat"
+    if phase_is_tentative(c.a):
+        # a handful of points: the "recent" window is most of the data (the phase is a placeholder)
+        return ("데이터가 짧아 최근 흐름이 장기 흐름과 달라졌는지는 판단하기 어렵습니다",
+                "the series is too short to tell whether the recent pace differs from the long run")
+    # a rise-and-fall (or fall-and-rise) history: the test's direction is no long-run direction
+    mixed = _mk_against_endpoints(c) is not None
+    long_dir = m.direction if m.direction in ("up", "down") and not mixed else "flat"
     if label in ("stable", "volatile"):
         if _step_behind_trend(c) is not None:
             return ("이는 장기 기울기에 한 차례의 수준 변화가 반영된 결과로, 최근에는 새 수준에서 횡보하고 있습니다",
@@ -1446,6 +1674,12 @@ def _momentum_phrase(c: _Ctx) -> tuple[str, str]:
         return "최근에는 상승세가 주춤합니다", "the rise has paused lately"
     if label == "declining" and recent >= 0:
         return "최근에는 하락세가 멈췄습니다", "the decline has paused lately"
+    if mixed:
+        # no long-run path to be faster or slower than (see _mk_against_endpoints): the recent move only
+        if recent > 0:
+            return "최근에는 상승하고 있습니다", "rising recently"
+        if recent < 0:
+            return "최근에는 하락하고 있습니다", "falling recently"
     # the long run as a reader sees it on the trend line: a +1,683 % rise that the
     # (dependence-corrected) test cannot confirm on 12 points is still no "하락·횡보 흐름"
     long_slope = _finite(m.slope_pct) or 0.0
@@ -1470,8 +1704,13 @@ def _momentum_phrase(c: _Ctx) -> tuple[str, str]:
 def _present_section(c: _Ctx) -> list[str]:
     m, ph = c.m, c.a.phase
     conf = _pct0(ph.confidence, c.lang)
-    lines = [c.t(f"- 현재 국면은 **{c.phase_name(ph.label)}**입니다 (판단 신뢰도 {conf}).",
-                 f"- Current lifecycle phase: **{c.phase_name(ph.label)}** (confidence {conf}).")]
+    if phase_is_tentative(c.a):
+        lines = [c.t(f"- 현재 국면은 **{c.phase_name(ph.label)}**입니다 (관측치가 적어 잠정 판단, 신뢰도 {conf}).",
+                     f"- Current lifecycle phase: **{c.phase_name(ph.label)}** (tentative, too few observations; "
+                     f"confidence {conf}).")]
+    else:
+        lines = [c.t(f"- 현재 국면은 **{c.phase_name(ph.label)}**입니다 (판단 신뢰도 {conf}).",
+                     f"- Current lifecycle phase: **{c.phase_name(ph.label)}** (confidence {conf}).")]
     reasons = [str(r).strip() for r in (ph.reasons or []) if str(r).strip()]
     if c.lang == "en":
         # the same reasons as the analysis (and the report's diagnosis card), translated
@@ -1490,9 +1729,11 @@ def _present_section(c: _Ctx) -> list[str]:
         tr = np.asarray(c.a.decomposition.trend, dtype=float)
         k_r = c.recent_window()
         base = float(tr[-1 - k_r]) if len(tr) > k_r and math.isfinite(tr[-1 - k_r]) else None
-        reason = _undefined_pct_reason(base, c.lang)
-        lines.append(c.t(f"- 최근 {win} 변화율은 {reason} 계산하지 않았습니다.",
-                         f"- The % change over the last {win} is undefined ({reason})."))
+        end = float(tr[-1]) if len(tr) and math.isfinite(tr[-1]) else None
+        code = _pct_reason_of(c.a, base, end)
+        lines.append(c.t(f"- 최근 {win} 변화율은 {_pct_reason_clause(code, 'ko', 'base', base)} 계산하지 않았습니다.",
+                         f"- The % change over the last {win} is undefined "
+                         f"({_pct_reason_clause(code, 'en', 'base', base)})."))
     ko, en = _momentum_phrase(c)
     mom = c.num(m.momentum, decimals=2, signed=True)
     lines.append(c.t(f"- 모멘텀(최근 기울기 − 장기 기울기, 현재 추세 수준 대비)은 {mom}%p{c.unit}이며, {ko}.",
@@ -1628,6 +1869,55 @@ def _probability_line(c: _Ctx, win: _OutlookWindows) -> str:
                f"- Probability that {fut_en} is higher than {cur_en}: {approx_en}**{ptxt}** — {p_en}.")
 
 
+def _undefined_change_line(c: _Ctx, win: _OutlookWindows, dir_word: str, fut_ko: str, fut_en: str,
+                           cur_ko: str, cur_en: str) -> str:
+    """The outlook's first line when ``expected_change_pct`` is ``None``, worded by its reason
+    (``forecast.outlook_levels(...).undefined``); the two levels are always named."""
+    h = c.span(c.f.horizon)
+    fc_end = c.date(c.f.mean.index[-1]) if len(c.f.mean) else c.num(None)
+    head_ko = f"- 향후 {h}({fc_end}까지) 전망은 **{dir_word}**입니다"
+    head_en = f"- The outlook for the next {h} (to {fc_end}) is **{dir_word}**"
+    fut_cap = fut_en[0].upper() + fut_en[1:]
+    cur_cap = cur_en[0].upper() + cur_en[1:]
+    has = win.current is not None and win.future is not None
+    if win.undefined == "sign_change" and has:
+        # the level is expected to cross zero: a % change across zero has no meaning
+        cur_v, fut_v = c.nums(win.current, win.future, signed=True)
+        to_ko = "음수로" if win.future < 0 else "양수로"
+        return c.t(
+            f"{head_ko}. 수준이 0을 지나 {to_ko} 바뀔 것으로 예상되어({cur_ko} {cur_v} → {fut_ko} {fut_v}) "
+            f"변화율(%)은 의미가 없습니다.",
+            f"{head_en}. The level is expected to cross zero, from {cur_v} ({cur_en}) to {fut_v} ({fut_en}), "
+            f"so a % change is not meaningful.",
+        )
+    if win.undefined == "near_zero" and has:
+        # data with negative values: a level within half a standard deviation of 0 is no base
+        y = np.asarray(c.a.series, dtype=float)
+        y = y[np.isfinite(y)]
+        sd = c.num(float(np.std(y))) if len(y) else c.num(None)
+        cur_v, fut_v = c.nums(win.current, win.future, signed=True)
+        return c.t(
+            f"{head_ko}. {cur_ko}({cur_v})이 값의 평소 변동 폭(표준편차 {sd})에 비해 0에 가까워 변화율(%)은 "
+            f"의미가 없습니다. {fut_ko}은 {fut_v}입니다.",
+            f"{head_en}. {cur_cap} ({cur_v}) is close to zero relative to the typical spread of the values "
+            f"(standard deviation {sd}), so a % change is not meaningful; {fut_en} is {fut_v}.",
+        )
+    if win.undefined == "mostly_zero":
+        span_cur = c.span(win.k_cur)
+        why_ko = (f"최근 {span_cur} 중 절반 이상이 0이라" if win.k_cur > 1 else "최근 값이 0이라")
+        why_en = (f"at least half of the last {span_cur} are zero" if win.k_cur > 1
+                  else "the latest value is zero")
+    else:
+        why_ko, why_en = "현재 수준이 0에 가까워", "current level near zero"
+    levels_ko = levels_en = ""
+    if has:
+        fut_v, cur_v = c.nums(win.future, win.current)
+        levels_ko = f" {fut_ko}은 {fut_v}, {cur_ko}은 {cur_v}입니다."
+        levels_en = f" {fut_cap} is {fut_v}; {cur_en} is {cur_v}."
+    return c.t(f"{head_ko} ({why_ko} 변화율은 계산하지 않음).{levels_ko}",
+               f"{head_en} (no % change: {why_en}).{levels_en}")
+
+
 def _future_section(c: _Ctx) -> list[str]:
     f, o = c.f, c.o
     lines: list[str] = []
@@ -1635,7 +1925,7 @@ def _future_section(c: _Ctx) -> list[str]:
     fc_end = c.date(f.mean.index[-1]) if len(f.mean) else c.num(None)
     chg = _finite(o.expected_change_pct)
     dir_word = c.outlook_direction()
-    win = _outlook_windows(c.a, f)
+    win = c.windows()
     fut_ko, fut_en, cur_ko, cur_en = _level_names(c, win)
     if chg is not None:
         # exactly the levels of forecast.compute_outlook: the last min(season, horizon)
@@ -1667,22 +1957,7 @@ def _future_section(c: _Ctx) -> list[str]:
     else:
         # no percentage: a % of a ~0 mean, or of a mean of mostly zeros (intermittent demand),
         # says nothing; the two levels themselves are still informative
-        span_cur = c.span(win.k_cur)
-        if win.undefined == "mostly_zero":
-            why_ko = (f"최근 {span_cur} 중 절반 이상이 0이라" if win.k_cur > 1 else "최근 값이 0이라")
-            why_en = (f"at least half of the last {span_cur} are zero" if win.k_cur > 1
-                      else "the latest value is zero")
-        else:
-            why_ko, why_en = "현재 수준이 0에 가까워", "current level near zero"
-        levels_ko = levels_en = ""
-        if win.current is not None and win.future is not None:
-            levels_ko = f" {fut_ko}은 {c.num(win.future)}, {cur_ko}은 {c.num(win.current)}입니다."
-            levels_en = (f" {fut_en[0].upper() + fut_en[1:]} is {c.num(win.future)}; "
-                         f"{cur_en} is {c.num(win.current)}.")
-        lines.append(c.t(
-            f"- 향후 {h}({fc_end}까지) 전망은 **{dir_word}**입니다 ({why_ko} 변화율은 계산하지 않음).{levels_ko}",
-            f"- The outlook for the next {h} (to {fc_end}) is **{dir_word}** (no % change: {why_en}).{levels_en}",
-        ))
+        lines.append(_undefined_change_line(c, win, dir_word, fut_ko, fut_en, cur_ko, cur_en))
     # probability of increase: the same two levels, so it directly follows the expected change
     lines.append(_probability_line(c, win))
     # scenarios (end-of-horizon values; the % in brackets is versus the current level,
@@ -1694,17 +1969,20 @@ def _future_section(c: _Ctx) -> list[str]:
     scale = _scale(c.a)
     with_pct = cur is not None and scale > 0 and abs(cur) > 1e-6 * scale and chg is not None
 
-    def scen(key: str) -> str:
-        v = _finite(o.scenarios.get(key)) if o.scenarios else None
-        if v is None:
-            return c.num(None)
-        if with_pct:
-            return f"{c.num(v)} ({c.pct((v - cur) / abs(cur) * 100)})"
-        return c.num(v)
+    nonneg = bool(getattr(f, "nonnegative", False))
 
+    def scen(key: str) -> str:
+        v = o.scenarios.get(key) if o.scenarios else None
+        return format_scenario(v, cur if with_pct else None, nonneg, c.lang)
+
+    # a bound clipped at the 0 floor prints as "0(하한)" (its "−100.0%" would say nothing)
+    def floored(key: str) -> bool:
+        v = _finite(o.scenarios.get(key)) if (nonneg and o.scenarios) else None
+        return v is not None and v <= 0.0
     band95 = ""
     if 95 in f.lower and 95 in f.upper and len(f.mean):
-        lo95, hi95 = c.num(f.lower[95].iloc[-1]), c.num(f.upper[95].iloc[-1])
+        lo95 = format_scenario(f.lower[95].iloc[-1], None, nonneg, c.lang)
+        hi95 = format_scenario(f.upper[95].iloc[-1], None, nonneg, c.lang)
         band95 = c.t(f" 95% 구간은 {lo95} ~ {hi95}입니다.", f"; 95% interval {lo95} – {hi95}")
     ref_ko, ref_en = (("최근 값", "the latest value") if cw <= 1
                       else (f"최근 {c.span(cw)} 평균", f"the average of the last {c.span(cw)}"))
@@ -1732,11 +2010,19 @@ def _future_section(c: _Ctx) -> list[str]:
             f" 시나리오는 종료 시점 한 값이므로, 기간 평균끼리 비교한 위의 {above_ko}과 다를 수 있습니다.",
             f" These are single end-point values, so they can differ from the average-based {above_en} above.",
         )
+    floor_note = ""
+    if floored("base"):
+        floor_note = c.t(" 기준 예측이 하한인 0까지 내려갑니다(값은 0 아래로 내려갈 수 없음).",
+                         " The base forecast itself falls to the floor of 0 (values cannot go below 0).")
+    elif floored("pessimistic"):
+        floor_note = c.t(" 예측구간이 넓어 비관 시나리오는 하한인 0에 닿습니다(값은 0 아래로 내려갈 수 없음).",
+                         " The interval is wide enough that the pessimistic case reaches the floor of 0 "
+                         "(values cannot go below 0).")
     lines.append(c.t(
         f"- {fc_end} 시점 시나리오{sp_ko}: 비관 {scen('pessimistic')} · 기준 {scen('base')} · "
-        f"낙관 {scen('optimistic')}.{band95}{seasonal_note}",
+        f"낙관 {scen('optimistic')}.{band95}{floor_note}{seasonal_note}",
         f"- Scenarios for {fc_end}{sp_en}: pessimistic {scen('pessimistic')} · base {scen('base')} · "
-        f"optimistic {scen('optimistic')}{band95}.{seasonal_note}",
+        f"optimistic {scen('optimistic')}{band95}.{floor_note}{seasonal_note}",
     ))
     # forecast peak
     if o.forecast_peak_date is not None:
@@ -1748,18 +2034,7 @@ def _future_section(c: _Ctx) -> list[str]:
         lines.append(c.t("- 예측 기간 안에 뚜렷한 정점(고점 후 하락)은 예상되지 않습니다.",
                          "- No distinct forecast peak (rise, then fall) within the horizon."))
     # projected phase
-    cur_ph, fut_ph = c.a.phase.label, o.future_phase
-    if fut_ph == cur_ph:
-        lines.append(c.t(f"- {h} 뒤에도 **{c.phase_name(fut_ph)}** 국면이 이어질 것으로 전망됩니다.",
-                         f"- Projected phase at the horizon: still **{c.phase_name(fut_ph)}**."))
-    else:
-        lines.append(c.t(
-            f"- {h} 안에 현재 **{c.phase_name(cur_ph)}**에서 **{c.phase_name(fut_ph)}** 국면으로 넘어갈 가능성이 있습니다.",
-            f"- Projected phase shift: **{c.phase_name(cur_ph)}** → **{c.phase_name(fut_ph)}**.",
-        ))
-    gap = _phase_outlook_gap(c)
-    if gap is not None:
-        lines.append(gap)
+    lines.extend(_phase_projection(c))
     # confidence and accuracy (skill against the naive benchmarks; MASE only as a technical note)
     conf_word = _CONF_PRED[c.lang].get(o.confidence, o.confidence)
     lines.append(c.t(f"- 예측 신뢰도는 **{conf_word}**입니다.", f"- Forecast confidence: **{conf_word}**."))
@@ -1768,8 +2043,72 @@ def _future_section(c: _Ctx) -> list[str]:
     return lines
 
 
-def _phase_outlook_gap(c: _Ctx) -> Optional[str]:
+#: phases that describe a move: a 'flat' outlook that keeps one of them does not show that it goes on
+_MOVING_PHASES = ("emerging", "growing", "peaking", "declining", "reviving")
+
+
+def _phase_undecided(c: _Ctx) -> bool:
+    """``future_phase`` only *kept* the current moving phase because a 'flat' outlook cannot tell
+    whether the move goes on (``forecast._future_phase``): say it is hard to judge, not that it lasts."""
+    return (c.o.direction == "flat" and c.o.future_phase == c.a.phase.label
+            and c.a.phase.label in _MOVING_PHASES)
+
+
+def _phase_projection(c: _Ctx) -> list[str]:
+    """The projected-phase line(s) of the outlook (with the phase-outlook reconciliation).
+
+    * a moving phase kept by a 'flat' outlook: whether it continues is hard to
+      judge (one line; merged into the reconciliation line when that applies,
+      so the reader is not told the same thing twice);
+    * a phase change under ``'low'`` confidence: only what the forecast would
+      imply, never a likely change;
+    * otherwise the projected phase (unchanged or the change).
+    """
+    h = c.span(c.f.horizon)
+    cur_ph, fut_ph = c.a.phase.label, c.o.future_phase
+    cur_n, fut_n = c.phase_name(cur_ph), c.phase_name(fut_ph)
+    if _phase_undecided(c):
+        gap = _phase_outlook_gap(c, phase_tail=True)
+        if gap is not None:
+            return [gap]
+        return [c.t(f"- 예측에 뚜렷한 방향이 없어, 현재 **{cur_n}** 국면이 {h} 뒤에도 이어질지 바뀔지는 아직 "
+                    f"판단하기 어렵습니다.",
+                    f"- The forecast shows no clear direction, so whether the **{cur_n}** phase lasts or changes "
+                    f"over the next {h} is hard to judge yet.")]
+    if phase_is_tentative(c.a):
+        # the current phase is only a placeholder (too few observations): no phase change to project
+        if fut_ph == cur_ph:
+            out = [c.t(f"- {h} 뒤에도 **{fut_n}** 국면으로 보이지만, 관측치가 적어 잠정 판단입니다.",
+                       f"- Projected phase at the horizon: still **{fut_n}** — a tentative call, given so few "
+                       f"observations.")]
+        else:
+            out = [c.t(f"- 예측대로라면 {h} 뒤에는 **{fut_n}** 국면에 해당하지만, 현재 국면(**{cur_n}**)이 관측치가 "
+                       f"적어 잠정 판단이므로 국면 변화로 단정하기는 어렵습니다.",
+                       f"- Taken at face value the forecast would put the series in the **{fut_n}** phase within "
+                       f"{h}, but the current **{cur_n}** call is only tentative (too few observations), so this "
+                       f"is no reliable phase change.")]
+    elif fut_ph == cur_ph:
+        out = [c.t(f"- {h} 뒤에도 **{fut_n}** 국면이 이어질 것으로 전망됩니다.",
+                   f"- Projected phase at the horizon: still **{fut_n}**.")]
+    elif c.o.confidence == "low":
+        out = [c.t(f"- 예측대로라면 {h} 안에 **{cur_n}**에서 **{fut_n}** 국면으로 넘어가지만, 예측 신뢰도가 낮아 "
+                   f"국면이 바뀐다고 보기는 어렵습니다.",
+                   f"- Taken at face value the forecast would mean a shift from **{cur_n}** to **{fut_n}** within "
+                   f"{h}, but with low forecast confidence no phase change can be expected from it.")]
+    else:
+        out = [c.t(f"- {h} 안에 현재 **{cur_n}**에서 **{fut_n}** 국면으로 넘어갈 가능성이 있습니다.",
+                   f"- Projected phase shift: **{cur_n}** → **{fut_n}**.")]
+    gap = _phase_outlook_gap(c)
+    if gap is not None:
+        out.append(gap)
+    return out
+
+
+def _phase_outlook_gap(c: _Ctx, phase_tail: bool = False) -> Optional[str]:
     """One sentence when the forecast does not continue the move the phase describes.
+
+    ``phase_tail``: end with "whether the phase lasts is hard to judge" (the
+    projected phase is only the current one kept, see :func:`_phase_projection`).
 
     A rising phase (emerging / growing / reviving) with an expected change below
     +2 %, or a declining one with an expected change above −2 % (an opposite move
@@ -1809,11 +2148,18 @@ def _phase_outlook_gap(c: _Ctx) -> Optional[str]:
                 "rise": "오히려 높아질 것으로"}[where]
     en_where = {"flat": "stay near its current level", "fall": "fall instead",
                 "rise": "rise instead"}[where]
+    tail_ko, tail_en = ("흐름이 이어지는지는 다음 관측치로 확인해 보세요.",
+                        "Check the next observations to see whether the move continues.")
+    if phase_tail:
+        # the projected phase is only the current one kept: this line also says that
+        ph = c.phase_name(label)
+        tail_ko = f"현재 **{ph}** 국면이 이어질지는 아직 판단하기 어려우니 다음 관측치로 확인해 보세요."
+        tail_en = (f"Whether the **{ph}** phase lasts is hard to judge yet — check the next observations.")
     return c.t(
         f"- 최근 {ko_move}가 뚜렷하지만, 백테스트로 고른 예측 모델은 이 흐름이 이어진다고 보지 않고 {ko_where} "
-        f"예측합니다. 흐름이 이어지는지는 다음 관측치로 확인해 보세요.",
+        f"예측합니다. {tail_ko}",
         f"- The recent {en_move} is clear, but the models chosen by the backtest do not extend it: they expect "
-        f"the level to {en_where}. Check the next observations to see whether the move continues.",
+        f"the level to {en_where}. {tail_en}",
     )
 
 
@@ -1907,11 +2253,22 @@ def _caveats_section(c: _Ctx) -> list[str]:
             f"- Only {n} observations — less than two seasonal cycles ({c.span(sl)}) — so seasonality and "
             f"trend estimates may be unstable.",
         ))
+    tentative = phase_is_tentative(c.a)
+    ph_conf = _finite(c.a.phase.confidence)
+    ph_word = c.phase_name(c.a.phase.label)
+    tent_ko = f"국면(**{ph_word}**)도 잠정 판단입니다(신뢰도 {format_prob(ph_conf)})"
+    tent_en = f"the phase (**{ph_word}**) is only a tentative call (confidence {format_prob(ph_conf, 'en')})"
+    if tentative and not (sl > 1 and n < 2 * sl):
+        # one line for both: few observations limit the results, and the phase is a placeholder
+        lines.append(c.t(f"- 관측치가 {n}개로 적어 결과의 신뢰도가 제한적이며, {tent_ko}.",
+                         f"- With only {n} observations the results are of limited reliability, and {tent_en}."))
+    elif tentative:
+        lines.append(c.t(f"- 관측치가 적어 {tent_ko}. 데이터가 더 쌓이면 달라질 수 있습니다.",
+                         f"- With so few observations {tent_en} and may change as data accumulate."))
     elif n < 24:
         lines.append(c.t(f"- 관측치가 {n}개로 적어 결과의 신뢰도가 제한적입니다.",
                          f"- With only {n} observations the results are of limited reliability."))
-    ph_conf = _finite(c.a.phase.confidence)
-    if ph_conf is not None and ph_conf < 0.5:
+    if not tentative and ph_conf is not None and ph_conf < 0.5:
         lines.append(c.t(
             f"- 국면 판단의 신뢰도가 {format_prob(ph_conf)}로 낮아, 여러 국면의 경계에 있을 수 있습니다.",
             f"- The phase call has low confidence ({format_prob(ph_conf, 'en')}); the series may sit between phases.",
@@ -1954,7 +2311,12 @@ def _caveats_section(c: _Ctx) -> list[str]:
             f"- The {na} anomal{'ies' if na != 1 else 'y'} may reflect one-off events (campaigns, news, data "
             f"errors) — worth checking.",
         ))
-    if f.nonnegative and 95 in f.lower and len(f.lower[95]) and float(np.nanmin(np.asarray(f.lower[95], dtype=float))) <= 0:
+    floor_in_scenarios = f.nonnegative and o.scenarios and any(
+        _finite(o.scenarios.get(k)) is not None and float(o.scenarios[k]) <= 0.0
+        for k in ("pessimistic", "base"))
+    if (f.nonnegative and not floor_in_scenarios and 95 in f.lower and len(f.lower[95])
+            and float(np.nanmin(np.asarray(f.lower[95], dtype=float))) <= 0):
+        # (the scenario line already says it when a scenario itself sits at the floor)
         lines.append(c.t("- 값이 음수가 될 수 없어 예측 하한을 0으로 제한했습니다.",
                          "- Values cannot be negative, so the lower forecast bound is clipped at 0."))
     lines.append(c.t(
@@ -1998,6 +2360,34 @@ def _r(x: Any, sig: int = 4) -> Optional[float]:
     return float(round(v, d))
 
 
+def _r_as(x: Any, shown: Any, sig: int = 3) -> Optional[float]:
+    """:func:`_r` with as many extra digits as needed for ``shown`` to print the same text.
+
+    ``shown`` is the formatter the rule-based narrative and the report print the
+    value with (``format_prob``, two decimals, ...): rounding to ``sig`` digits
+    first can move a value across that formatter's rounding edge (0.45452 -> 0.455
+    prints ``46%`` where every other surface prints ``45%``), and the LLM is told to
+    quote the payload, so the payload must round the same way.
+    """
+    v = _finite(x)
+    if v is None:
+        return None
+    target = shown(v)
+    for k in range(int(sig), 18):
+        r = _r(v, k)
+        if r is not None and shown(r) == target:
+            return r
+    return float(v)
+
+
+def _two_dec(v: float) -> str:
+    return format_number(v, decimals=2)
+
+
+def _pct_text(v: float) -> str:
+    return format_pct(v)
+
+
 def _pick(n: int, max_n: int) -> list[int]:
     """Up to ``max_n`` evenly spaced indices of ``range(n)`` (always incl. first and last)."""
     if n <= max_n:
@@ -2027,9 +2417,10 @@ def _downsample_history(series: pd.Series, freq: str, max_points: int = 60,
     return rows, note
 
 
-def _expected_change_basis(analysis: AnalysisResult, forecast: ForecastResult) -> str:
+def _expected_change_basis(analysis: AnalysisResult, forecast: ForecastResult,
+                           w: Optional[_OutlookWindows] = None) -> str:
     """Plain-English definition of ``expected_change_pct`` as ``forecast.compute_outlook`` computes it."""
-    w = _outlook_windows(analysis, forecast)
+    w = w or _outlook_windows(analysis, forecast)
     txt = (f"mean of the last {w.k_fut} forecast periods vs. current_level (mean of the last {w.k_cur} "
            f"observed periods)")
     adj = [name for name, flag in (("forecast", w.adj_fut), ("current", w.adj_cur)) if flag]
@@ -2045,18 +2436,39 @@ def _expected_change_basis(analysis: AnalysisResult, forecast: ForecastResult) -
                 "demand): state no percentage change, compare the two levels in compared_levels instead")
     elif w.undefined == "zero":
         txt += "; null here because the current level is about 0: state no percentage change"
+    elif w.undefined == "sign_change":
+        txt += ("; null here because the future level has the opposite sign of the current level (the level "
+                "is expected to cross zero): a % change across zero is meaningless -- say that the level "
+                "crosses zero and give the two levels in compared_levels")
+    elif w.undefined == "near_zero":
+        txt += ("; null here because the series takes negative values and the current level is within half a "
+                "standard deviation of 0, so a % of it is meaningless: state no percentage change, compare the "
+                "two levels in compared_levels instead")
     return txt
 
 
-def _prob_increase_basis(analysis: AnalysisResult, forecast: ForecastResult) -> str:
+def _prob_increase_basis(analysis: AnalysisResult, forecast: ForecastResult,
+                         w: Optional[_OutlookWindows] = None) -> str:
     """Plain-English definition of ``Outlook.prob_increase`` (see ``forecast.compute_outlook``)."""
-    w = _outlook_windows(analysis, forecast)
+    w = w or _outlook_windows(analysis, forecast)
     fut = ("the horizon-end forecast" if w.k_fut <= 1
            else f"the mean of the last {w.k_fut} forecast periods")
     cur = "the latest observation" if w.k_cur <= 1 else f"the mean of the last {w.k_cur} observed periods"
     return (f"P({fut} > {cur}): the same two levels as expected_change_pct (compared_levels), so it describes "
             f"that change; it is NOT the probability that the value at the horizon end exceeds the current level "
             f"(scenarios_at_horizon_end are single end-date values, a different quantity)")
+
+
+def _future_phase_basis(analysis: AnalysisResult, outlook: Outlook) -> Optional[str]:
+    """How far ``Outlook.future_phase`` can be read as a projection (``None``: as it stands)."""
+    cur, fut = str(analysis.phase.label), str(outlook.future_phase)
+    if outlook.direction == "flat" and fut == cur and cur in _MOVING_PHASES:
+        return ("kept from the current phase only because the outlook is flat: the forecast cannot tell whether "
+                "the current move goes on, so say that whether the phase lasts or changes is hard to judge")
+    if fut != cur and outlook.confidence == "low":
+        return ("the change follows from a low-confidence forecast: mention it at most as what the forecast "
+                "would imply, never as a likely phase change")
+    return None
 
 
 def build_llm_payload(analysis: AnalysisResult, forecast: ForecastResult, outlook: Outlook) -> dict:
@@ -2094,6 +2506,7 @@ def build_llm_payload(analysis: AnalysisResult, forecast: ForecastResult, outloo
 
     top_cps = sorted(analysis.changepoints, key=lambda x: -float(x.magnitude))[:10]
     changepoints = [{"date": fd(cp.date), "kind": str(cp.kind),
+                     "label": changepoint_label(cp, "en"), "label_ko": changepoint_label(cp, "ko"),
                      "slope_before_per_period": _r(cp.slope_before),
                      "slope_after_per_period": _r(cp.slope_after),
                      "magnitude": _r(cp.magnitude)}
@@ -2104,6 +2517,20 @@ def build_llm_payload(analysis: AnalysisResult, forecast: ForecastResult, outloo
                  for a in sorted(top_an, key=lambda x: pd.Timestamp(x.date))]
     peak_date = outlook.forecast_peak_date
     windows = _outlook_windows(analysis, forecast)
+    # why a percentage metric is null (or, for drawdown_pct, left out): analysis.pct_change_undefined
+    tv_ok = tv[np.isfinite(tv)]
+    k_r = _recent_window(freq, int(analysis.season_length), int(m.n_obs))
+    pct_undefined: dict[str, str] = {}
+    if not _intermittent(analysis) and len(tv_ok) >= 2:
+        if _finite(m.total_change_pct) is None:
+            pct_undefined["total_change_pct"] = (_pct_reason_of(analysis, float(tv_ok[0]), float(tv_ok[-1]))
+                                                 or "zero")
+        if _finite(m.recent_change_pct) is None and len(tv_ok) > k_r:
+            pct_undefined["recent_change_pct"] = (
+                _pct_reason_of(analysis, float(tv_ok[-1 - k_r]), float(tv_ok[-1])) or "zero")
+    dd_undefined = _drawdown_undefined(analysis)
+    if dd_undefined is not None:
+        pct_undefined["drawdown_pct"] = dd_undefined
     payload: dict[str, Any] = {
         "series": {
             "name": str(analysis.name),
@@ -2124,14 +2551,19 @@ def build_llm_payload(analysis: AnalysisResult, forecast: ForecastResult, outloo
                       "(0.6 = about 40% lower error), > 1 = did not beat naive; null = not available"),
             "mase": ("mean absolute scaled error, scaled by the in-sample ONE-STEP seasonal-naive MAE; multi-step "
                      "forecasts often exceed 1 even when they beat naive, so do not compare it with 1 -- use skill"),
-            "probabilities": ("0..1; never present one as a certainty (write >99% / <1%, not 100% / 0%); "
-                              "outlook.prob_increase compares the same two levels as expected_change_pct "
-                              "(see outlook.prob_increase_basis), not the horizon-end value"),
+            "probabilities": ("0..1; quote them as outlook.prob_increase_text and phase.confidence_text give "
+                              "them (whole percent, '>99%' / '<1%' instead of a certainty), the text every other "
+                              "trendai surface prints; outlook.prob_increase compares the same two levels as "
+                              "expected_change_pct (see outlook.prob_increase_basis), not the horizon-end value"),
             "intermittent": ("series.intermittent = true: mostly-zero demand; total/recent change and CAGR are "
                              "null on purpose, and each anomaly is an unusually large demand ('expected' = the "
                              "median non-zero demand), not a deviation from the trend"),
             "seasonal_strength": ("0..1, already discounted by a significance test of the repeating pattern; "
                                   "below 0.3 do not describe high and low months"),
+            "pct_undefined": ("metrics.pct_undefined names why a percentage metric is null: 'sign_change' = the "
+                              "level crossed zero (say so and give the levels, never a % such as -180%), "
+                              "'negative' = negative base, 'zero' = base about 0, 'near_zero' = base within half a "
+                              "standard deviation of 0 in data with negative values; state no percentage for it"),
         },
         "history": history,
         "history_note": note,
@@ -2139,22 +2571,28 @@ def build_llm_payload(analysis: AnalysisResult, forecast: ForecastResult, outloo
         "current_level": _r(_current_level(analysis)),
         "metrics": {
             "last_value": _r(m.last_value), "mean": _r(m.mean),
-            "total_change_pct": _r(m.total_change_pct), "cagr_pct": _r(m.cagr_pct),
-            "recent_change_pct": _r(m.recent_change_pct),
+            "total_change_pct": _r_as(m.total_change_pct, _pct_text, 4),
+            "cagr_pct": _r_as(m.cagr_pct, _pct_text, 4),
+            "recent_change_pct": _r_as(m.recent_change_pct, _pct_text, 4),
             "recent_window_periods": _recent_window(freq, int(analysis.season_length), int(m.n_obs)),
-            "slope_per_period": _r(m.slope), "slope_pct_per_period": _r(m.slope_pct),
-            "momentum": _r(m.momentum), "acceleration": _r(m.acceleration),
-            "volatility_cv": _r(m.volatility), "trend_strength": _r(m.trend_strength, 3),
-            "seasonal_strength": _r(m.seasonal_strength, 3),
-            "mann_kendall_tau": _r(m.mk_tau, 3), "mann_kendall_p": _r(m.mk_pvalue, 3),
+            "slope_per_period": _r(m.slope),
+            "slope_pct_per_period": _r_as(m.slope_pct, lambda v: format_pct(v, decimals=2), 4),
+            "momentum": _r_as(m.momentum, _two_dec, 4), "acceleration": _r(m.acceleration),
+            "volatility_cv": _r_as(m.volatility, lambda v: format_number(v * 100, decimals=1), 4),
+            "trend_strength": _r_as(m.trend_strength, _two_dec, 3),
+            "seasonal_strength": _r_as(m.seasonal_strength, _two_dec, 3),
+            "mann_kendall_tau": _r_as(m.mk_tau, _two_dec, 3), "mann_kendall_p": _r(m.mk_pvalue, 3),
             "direction": str(m.direction),
             "peak_date": fd(m.peak_date), "peak_value": _r(m.peak_value),
-            "drawdown_pct": _r(m.drawdown_pct),
+            "drawdown_pct": None if dd_undefined else _r(m.drawdown_pct),
+            "pct_undefined": pct_undefined,
         },
         "phase": {
             "label": str(analysis.phase.label),
             "label_ko": analysis.phase.label_ko,
-            "confidence": _r(analysis.phase.confidence, 3),
+            "confidence": _r_as(analysis.phase.confidence, format_prob, 3),
+            "confidence_text": format_prob(analysis.phase.confidence, "en"),
+            "tentative": phase_is_tentative(analysis),
             "reasons": [str(r) for r in analysis.phase.reasons][:6],
         },
         "changepoints": changepoints,
@@ -2181,18 +2619,21 @@ def build_llm_payload(analysis: AnalysisResult, forecast: ForecastResult, outloo
         ],
         "outlook": {
             "direction": str(outlook.direction),
-            "direction_label": {"ko": direction_label(outlook.direction, outlook.expected_change_pct, "ko"),
-                                "en": direction_label(outlook.direction, outlook.expected_change_pct, "en")},
-            "expected_change_pct": _r(outlook.expected_change_pct),
-            "expected_change_basis": _expected_change_basis(analysis, forecast),
+            "direction_label": {lg: direction_label(outlook.direction, outlook.expected_change_pct, lg,
+                                                    windows.undefined) for lg in ("ko", "en")},
+            "expected_change_pct": _r_as(outlook.expected_change_pct, _pct_text, 4),
+            "expected_change_basis": _expected_change_basis(analysis, forecast, windows),
+            "expected_change_undefined": windows.undefined,
             "compared_levels": {"current": _r(windows.current), "future": _r(windows.future)},
-            "prob_increase": _r(outlook.prob_increase, 3),
-            "prob_increase_basis": _prob_increase_basis(analysis, forecast),
+            "prob_increase": _r_as(outlook.prob_increase, format_prob, 3),
+            "prob_increase_text": format_prob(outlook.prob_increase, "en"),
+            "prob_increase_basis": _prob_increase_basis(analysis, forecast, windows),
             "scenarios_at_horizon_end": {str(k): _r(v) for k, v in (outlook.scenarios or {}).items()},
             "scenario_interval_level": lv80,
             "forecast_peak_date": fd(peak_date) if peak_date is not None else None,
             "future_phase": str(outlook.future_phase),
             "future_phase_ko": PHASE_KO.get(outlook.future_phase, outlook.future_phase),
+            "future_phase_basis": _future_phase_basis(analysis, outlook),
             "confidence": str(outlook.confidence),
         },
     }
@@ -2228,17 +2669,60 @@ def _question_request(payload: dict, question: str, lang: str) -> str:
             f"Answer the following question in English, based on the facts above.\n\nQuestion: {question}")
 
 
+#: messages of NarrativeUnavailable (and the related warnings), per language -- the CLI prints
+#: them after its own localised prefix, so an English run must not show Korean here
+_UNAVAILABLE: dict[str, dict[str, str]] = {
+    "no_sdk": {"ko": "anthropic 패키지가 설치되어 있지 않습니다: pip install anthropic",
+               "en": "the anthropic package is not installed: pip install anthropic"},
+    "auth": {"ko": "Claude API 인증에 실패했습니다. ANTHROPIC_API_KEY 환경 변수(또는 `ant auth login`)를 확인하세요.",
+             "en": "Claude API authentication failed. Check the ANTHROPIC_API_KEY environment variable "
+                   "(or run `ant auth login`)."},
+    "permission": {"ko": "이 API 키로는 모델 '{model}' 또는 요청한 기능을 사용할 권한이 없습니다. 키 권한과 모델 이름을 확인하세요.",
+                   "en": "This API key may not use the model '{model}' or the requested features. Check the key's "
+                         "permissions and the model name."},
+    "rate": {"ko": "Claude API 사용량 한도(rate limit)에 도달했습니다. 잠시 후 다시 시도하세요.",
+             "en": "The Claude API rate limit was reached. Try again in a moment."},
+    "status": {"ko": "Claude API 오류가 발생했습니다 (HTTP {code}). 잠시 후 다시 시도하거나 요청 내용을 확인하세요.",
+               "en": "The Claude API returned an error (HTTP {code}). Try again later or check the request."},
+    "connection": {"ko": "Claude API에 연결할 수 없습니다 (네트워크 오류 또는 시간 초과). 인터넷 연결과 프록시 설정을 확인하세요.",
+                   "en": "Cannot reach the Claude API (network error or timeout). Check the internet connection "
+                         "and proxy settings."},
+    "other": {"ko": "Claude API 호출에 실패했습니다: {msg}", "en": "The Claude API call failed: {msg}"},
+    "no_credentials": {"ko": "Claude API 인증 정보를 찾을 수 없습니다. ANTHROPIC_API_KEY 환경 변수를 설정하거나 "
+                             "`ant auth login`을 실행하세요.",
+                       "en": "No Claude API credentials were found. Set the ANTHROPIC_API_KEY environment variable "
+                             "or run `ant auth login`."},
+    "old_sdk": {"ko": "설치된 anthropic SDK가 너무 오래되어 필요한 매개변수를 지원하지 않습니다 ({msg}). "
+                      "pip install -U anthropic 으로 업데이트하세요.",
+                "en": "The installed anthropic SDK is too old for the required parameters ({msg}). Update it with "
+                      "pip install -U anthropic."},
+    "refusal": {"ko": "Claude가 이 요청에 대한 응답을 거절했습니다(stop_reason=refusal). 규칙 기반 해설을 사용하세요.",
+                "en": "Claude declined to answer this request (stop_reason=refusal). Use the rule-based narrative."},
+    "empty": {"ko": "Claude 응답에 텍스트가 없습니다.", "en": "The Claude response contains no text."},
+    "truncated_warning": {"ko": "Claude 응답이 길이 제한에 걸려 잘렸을 수 있습니다 (stop_reason={stop}).",
+                          "en": "The Claude response may have been cut off by a length limit (stop_reason={stop})."},
+    "fallback_warning": {"ko": "LLM 해설을 사용할 수 없어 규칙 기반 해설로 대체합니다: {exc}",
+                         "en": "The LLM narrative is unavailable, so the rule-based narrative is used instead: {exc}"},
+}
+
+
 def _call_claude(content: str, model: str, client: Any, lang: str = "ko") -> str:
-    """One ``beta.messages.create`` call; every failure becomes :class:`NarrativeUnavailable`.
+    """One ``beta.messages.create`` call; every failure becomes :class:`NarrativeUnavailable`
+    with a message in ``lang`` (Korean or English).
 
     A response cut off by a length limit (``stop_reason`` ``max_tokens``) is still
     returned, but with a ``RuntimeWarning`` and a short note appended in ``lang``
     so the reader knows the end may be missing.
     """
+    lang = "en" if lang == "en" else "ko"
+
+    def fail(key: str, **kw: Any) -> NarrativeUnavailable:
+        return NarrativeUnavailable(_UNAVAILABLE[key][lang].format(**kw))
+
     try:
         import anthropic
     except ImportError as exc:
-        raise NarrativeUnavailable("anthropic 패키지가 설치되어 있지 않습니다: pip install anthropic") from exc
+        raise fail("no_sdk") from exc
     try:
         client = client or anthropic.Anthropic()
         resp = client.beta.messages.create(
@@ -2251,56 +2735,37 @@ def _call_claude(content: str, model: str, client: Any, lang: str = "ko") -> str
             messages=[{"role": "user", "content": content}],
         )
     except anthropic.AuthenticationError as exc:
-        raise NarrativeUnavailable(
-            "Claude API 인증에 실패했습니다. ANTHROPIC_API_KEY 환경 변수(또는 `ant auth login`)를 확인하세요."
-        ) from exc
+        raise fail("auth") from exc
     except anthropic.PermissionDeniedError as exc:
-        raise NarrativeUnavailable(
-            f"이 API 키로는 모델 '{model}' 또는 요청한 기능을 사용할 권한이 없습니다. 키 권한과 모델 이름을 확인하세요."
-        ) from exc
+        raise fail("permission", model=model) from exc
     except anthropic.RateLimitError as exc:
-        raise NarrativeUnavailable(
-            "Claude API 사용량 한도(rate limit)에 도달했습니다. 잠시 후 다시 시도하세요."
-        ) from exc
+        raise fail("rate") from exc
     except anthropic.APIStatusError as exc:
-        raise NarrativeUnavailable(
-            f"Claude API 오류가 발생했습니다 (HTTP {getattr(exc, 'status_code', '?')}). "
-            "잠시 후 다시 시도하거나 요청 내용을 확인하세요."
-        ) from exc
+        raise fail("status", code=getattr(exc, "status_code", "?")) from exc
     except anthropic.APIConnectionError as exc:
-        raise NarrativeUnavailable(
-            "Claude API에 연결할 수 없습니다 (네트워크 오류 또는 시간 초과). 인터넷 연결과 프록시 설정을 확인하세요."
-        ) from exc
+        raise fail("connection") from exc
     except anthropic.AnthropicError as exc:
-        raise NarrativeUnavailable(f"Claude API 호출에 실패했습니다: {exc}") from exc
+        raise fail("other", msg=exc) from exc
     except TypeError as exc:
         msg = str(exc)
         # the SDK raises TypeError when no credentials can be resolved at all
         if "auth" in msg.lower():
-            raise NarrativeUnavailable(
-                "Claude API 인증 정보를 찾을 수 없습니다. ANTHROPIC_API_KEY 환경 변수를 설정하거나 `ant auth login`을 실행하세요."
-            ) from exc
+            raise fail("no_credentials") from exc
         # an older SDK that does not know `fallbacks` / `output_config` yet: the optional
         # LLM feature must degrade to the rule-based text, not crash the whole pipeline
         if "unexpected keyword" in msg:
-            raise NarrativeUnavailable(
-                f"설치된 anthropic SDK가 너무 오래되어 필요한 매개변수를 지원하지 않습니다 ({msg}). "
-                "pip install -U anthropic 으로 업데이트하세요."
-            ) from exc
-        raise NarrativeUnavailable(f"Claude API 호출에 실패했습니다: {msg}") from exc
+            raise fail("old_sdk", msg=msg) from exc
+        raise fail("other", msg=msg) from exc
     if getattr(resp, "stop_reason", None) == "refusal":
-        raise NarrativeUnavailable(
-            "Claude가 이 요청에 대한 응답을 거절했습니다(stop_reason=refusal). 규칙 기반 해설을 사용하세요."
-        )
+        raise fail("refusal")
     text = "".join(str(getattr(block, "text", "") or "")
                    for block in (getattr(resp, "content", None) or [])
                    if getattr(block, "type", None) == "text").strip()
     if not text:
-        raise NarrativeUnavailable("Claude 응답에 텍스트가 없습니다.")
+        raise fail("empty")
     stop = getattr(resp, "stop_reason", None)
     if stop in _TRUNCATED_STOPS:
-        warnings.warn(f"Claude 응답이 길이 제한에 걸려 잘렸을 수 있습니다 (stop_reason={stop}).",
-                      RuntimeWarning, stacklevel=3)
+        warnings.warn(_UNAVAILABLE["truncated_warning"][lang].format(stop=stop), RuntimeWarning, stacklevel=3)
         text += ("\n\n※ 응답이 최대 길이에 도달해 끝부분이 잘렸을 수 있습니다." if lang == "ko"
                  else "\n\nNote: the response reached the maximum length, so the end may be cut off.")
     return text
@@ -2331,8 +2796,7 @@ def generate_narrative(analysis: AnalysisResult, forecast: ForecastResult, outlo
         try:
             return llm_narrative(analysis, forecast, outlook, lang=lang, model=model, client=client), "llm"
         except NarrativeUnavailable as exc:
-            warnings.warn(f"LLM 해설을 사용할 수 없어 규칙 기반 해설로 대체합니다: {exc}",
-                          RuntimeWarning, stacklevel=2)
+            warnings.warn(_UNAVAILABLE["fallback_warning"][lang].format(exc=exc), RuntimeWarning, stacklevel=2)
     return rule_based_narrative(analysis, forecast, outlook, lang=lang), "rule"
 
 

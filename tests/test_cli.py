@@ -356,7 +356,9 @@ def test_korean_rank_title_has_no_english():
     df = pd.DataFrame([{"name": "a", "phase": "growing", "phase_ko": "성장기", "expected_change_pct": 3.0,
                         "prob_increase": 0.7, "score": 60.0, "freq": "M"}], index=[1])
     out = _format_ranking(df, horizons={"a": 12})
-    assert "■ 상승 트렌드 순위 (상승 점수: 50=중립, 높을수록 강한 상승 전망)" in out
+    # round 4 (D7): the score blends the outlook with the recent momentum (compare.rising_score), so the
+    # title no longer says "높을수록 강한 상승 전망" (higher = a stronger expected rise)
+    assert "■ 상승 트렌드 순위 (상승 점수: 전망 + 최근 기세, 50=중립)" in out
     assert "rising" not in out
     assert "Rising-trend ranking (rising score" in _format_ranking(df, lang="en", horizons={"a": 12})
 
@@ -395,3 +397,96 @@ def test_json_is_kept_when_the_html_report_fails(tmp_path, capsys, monkeypatch):
     assert json.loads(js.read_text(encoding="utf-8"))["name"] == "growing"
     assert not html.exists()
     assert "render failed" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- round 4
+
+
+def test_rank_title_does_not_overclaim_in_either_language():
+    """D7: the rising score blends the outlook with the recent momentum (compare.rising_score), so the
+    title says so instead of "higher = stronger expected rise" / "높을수록 강한 상승 전망"."""
+    from trendai.cli import _format_ranking
+
+    df = pd.DataFrame([{"name": "a", "phase": "growing", "phase_ko": "성장기", "expected_change_pct": 3.0,
+                        "prob_increase": 0.7, "score": 60.0, "freq": "M"}], index=[1])
+    ko, en = _format_ranking(df, horizons={"a": 12}), _format_ranking(df, lang="en", horizons={"a": 12})
+    assert "높을수록" not in ko and "전망 + 최근 기세" in ko
+    assert "stronger expected rise" not in en
+    assert "■ Rising-trend ranking (rising score: outlook + recent momentum, 50 = neutral)" in en
+
+
+def test_ask_error_line_is_english_under_lang_en(tmp_path, capsys, monkeypatch):
+    """U7 / D (cli): NarrativeUnavailable follows lang, so 'Error: cannot ask Claude — …' has no Korean."""
+    import re
+
+    g = sample("growing")
+    f = tmp_path / "g.csv"
+    pd.DataFrame({"date": g.index.strftime("%Y-%m-%d"), "v": g.values}).to_csv(f, index=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert main(["ask", str(f), "why?", "--lang", "en", "-H", "3"]) == 1
+    line = [ln for ln in capsys.readouterr().err.splitlines() if ln.startswith("Error: cannot ask Claude")]
+    assert line and not re.search(r"[가-힣]", line[0]), line
+
+
+# --------------------------------------------------------------------------- round 4, final fixer
+
+
+def test_rank_basis_names_the_levels_that_were_compared():
+    """F16: the note said 'the last forecast cycle vs the last observed cycle' for every ranking, but
+    with weekly data the default 26-week horizon is shorter than the 52-week season (the future level
+    is the seasonally adjusted 26-week mean) and yearly data compare single values."""
+    from trendai.cli import _rank_basis
+    from trendai.pipeline import run
+
+    m = run(sample("growing", n=36), name="m")
+    w = run(sample("growing", n=156, freq="W"), name="w")
+    y = run(sample("growing", n=12, freq="Y"), name="y")
+    assert len(w.forecast.mean) == 26 and w.analysis.season_length == 52
+    ko_m = _rank_basis([m])
+    assert ko_m == "※ 예측 변화와 상승확률은 예측 마지막 한 주기의 평균을 최근 한 주기의 평균과 비교한 값입니다."
+    ko_w = _rank_basis([w, m])
+    assert "예측 마지막 한 주기의 평균(예측 기간이 한 주기보다 짧으면 예측 기간 전체를 계절 보정한 평균)을" in ko_w
+    assert _rank_basis([y]) == "※ 예측 변화와 상승확률은 마지막 예측값을 최근 값과 비교한 값입니다."
+    assert _rank_basis([m, y]).endswith(" 연 단위 데이터는 마지막 예측값을 최근 값과 비교합니다.")
+    en_w = _rank_basis([w], "en")
+    assert "the forecast's last season (the whole horizon, seasonally adjusted, when it is shorter than a " \
+           "season)" in en_w and "cycle" not in en_w
+    assert _rank_basis([y], "en") == ("※ Exp. change and P(up) compare the last forecast value with the latest "
+                                      "observation.")
+
+
+def test_weekly_ranking_note_and_english_header(tmp_path, capsys):
+    """F16: under a weekly ranking the note names the seasonally adjusted 26-week level; the English
+    header reads 'Exp. change (26 wk)', not 'Exp. change(26 wk)'."""
+    files = []
+    for nm in ("growing", "fad"):
+        s = sample(nm, n=156, freq="W")
+        f = tmp_path / f"{nm}.csv"
+        pd.DataFrame({"date": s.index.strftime("%Y-%m-%d"), "v": s.values}).to_csv(f, index=False)
+        files.append(str(f))
+    assert main(["compare", *files, "-q"]) == 0
+    out = capsys.readouterr().out
+    assert "예측 변화(26주)" in out
+    assert "예측 기간이 한 주기보다 짧으면 예측 기간 전체를 계절 보정한 평균" in out
+    assert main(["compare", *files, "-q", "--lang", "en"]) == 0
+    out = capsys.readouterr().out
+    assert "Exp. change (26 wk)" in out and "change(" not in out
+    assert "(the whole horizon, seasonally adjusted, when it is shorter than a season)" in out
+
+
+def test_lang_en_output_has_no_hangul(tmp_path, capsys):
+    """F20: the terminal summaries stayed Korean under --lang en ('[태동기(신흥)] 신뢰도 95% · 월 단위
+    120개 …'); render_text now follows --lang, so English output carries no Hangul."""
+    import re
+
+    assert main(["sample", "emerging", "--lang", "en", "-H", "6"]) == 0
+    out = capsys.readouterr().out
+    assert "[Emerging] confidence" in out and "Outlook ▲ upward" in out and "Method: " in out
+    assert not re.search(r"[가-힣]", out), [ln for ln in out.splitlines() if re.search(r"[가-힣]", ln)]
+    assert main(["compare", "--samples", "emerging,fad,seasonal,peaking", "--lang", "en", "-q", "-H", "3"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("Future phase ") == 4 and "Rising-trend ranking" in out
+    assert not re.search(r"[가-힣]", out), [ln for ln in out.splitlines() if re.search(r"[가-힣]", ln)]
+    # Korean stays the default
+    assert main(["sample", "emerging", "-q", "-H", "6"]) == 0
+    assert "[태동기(신흥)] 신뢰도" in capsys.readouterr().out

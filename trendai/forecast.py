@@ -1057,19 +1057,52 @@ def _describe(weights: dict[str, float], prefix: str = "ensemble") -> str:
 # --------------------------------------------------------------------------- fallback (very short series)
 
 
+def _significant_trend(y: np.ndarray) -> bool:
+    """Whether the OLS slope of ``y`` on time is significant (two-sided 5 % t-test, n - 2 dof).
+
+    An exact line (no residual) with a non-zero slope counts as significant;
+    fewer than 3 points or a zero slope do not.
+    """
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < 3 or not np.all(np.isfinite(y)):
+        return False
+    x = np.arange(n, dtype=float) - (n - 1) / 2.0
+    c = float(np.max(np.abs(y))) or 1.0          # unit scale: no overflow at |y| ~ 1e200
+    z = y / c
+    sxx = float(np.sum(x * x))
+    b = float(np.sum(x * (z - z.mean())) / sxx)
+    resid = z - z.mean() - b * x
+    s2 = float(np.sum(resid * resid)) / (n - 2)
+    if b == 0.0:
+        return False
+    if s2 <= (1e-12 * max(abs(b) * n, 1e-300)) ** 2:
+        return True                               # an exact line
+    return abs(b) / math.sqrt(s2 / sxx) >= t_ppf(0.975, n - 2)
+
+
 def _fallback_forecast(y: np.ndarray, m: int, horizon: int, reason: str
                        ) -> tuple[np.ndarray, np.ndarray, dict[str, float], str]:
-    """Equal-weight drift + naive (naive alone for n < 3) with wide heuristic intervals.
+    """Equal-weight drift + naive with wide heuristic intervals; naive alone when there is no
+    trend to extrapolate.
 
-    Uses the built-in classes directly (not the registry) so it cannot be
-    broken by a re-registered model.  No model scores are produced: a
-    handful of one-step errors is no backtest, and the numbers it gave (e.g.
-    a naive "MASE" of 10 for n = 2) only looked like evidence.
+    The drift is used only when the series has at least 3 points and a
+    significant linear trend (:func:`_significant_trend`: OLS slope, two-sided
+    5 % t-test).  Without that test 7 daily points of flat noise
+    (Mann-Kendall p = 0.37) had their end-to-end slope extrapolated over the
+    30-day default horizon: "down, −50.7 %, P(up) = 22 %" -- 30 to 70 % of
+    such noise series got a direction call.  Uses the built-in classes
+    directly (not the registry) so it cannot be broken by a re-registered
+    model.  No model scores are produced: a handful of one-step errors is no
+    backtest, and the numbers it gave (e.g. a naive "MASE" of 10 for n = 2)
+    only looked like evidence.
     """
     n = len(y)
     factories: dict[str, type[_models.Forecaster]] = {"naive": _models.Naive}
-    if n >= 3:
+    if n >= 3 and _significant_trend(y):
         factories = {"drift": _models.Drift, "naive": _models.Naive}
+    elif n >= 3:
+        reason = f"{reason}; no significant trend"
     w = 1.0 / len(factories)
     weights = {nm: w for nm in factories}
     mean = np.zeros(horizon)
@@ -1220,8 +1253,13 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
       pick naive/drift and anchor the forecast on the last observation).  They
       are ranked and weighted by backtest RMSE rather than MASE: MAE is
       minimised by the median, about 0 for mostly-zero data, so it favours
-      forecasts that under-state the demand rate.  Spikes are not cleaned and
-      ``compute_outlook`` reports no percentage change.
+      forecasts that under-state the demand rate.  Spikes are not cleaned.
+      ``compute_outlook`` compares average demand rates (the mean of the
+      last season, zeros included, with the mean of the forecast's last
+      season) and reports no percentage change only when at least half of
+      the current window is zero (``outlook_levels(...).undefined ==
+      'mostly_zero'``); the analysis' trend-based percentages
+      (``recent_change_pct`` etc.) are ``None`` for all intermittent demand.
     * Intervals: ``mean ± q·σ_k``.  ``σ_k = s₁·k^b`` is fitted to the final
       method's backtest errors (``b`` in ``[0.1, 1]``, at least ``√k`` growth
       beyond the backtest horizon, ``s₁`` floored by a robust in-sample noise
@@ -1239,6 +1277,8 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
       intervals; finally ``σ_k`` is large enough for the 95 % band to contain
       every ensemble member's forecast and is made non-decreasing in ``k``.  With
       ``nonnegative`` the bands are centred on the clipped mean, then clipped.
+      An all-zero history has no scale and gets zero-width bands (any other
+      constant keeps a negligible, level-relative band).
     * ``skill`` = backtest MAE of the final method / MAE of the best of the
       naive benchmarks (naive, drift, seasonal naive when ``m > 1`` and the
       windows hold a season) on the same windows -- always backtested, even
@@ -1273,9 +1313,14 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
     n = len(y)
     W_target = int(n_windows) if n_windows is not None else _default_n_windows(n)
     plan = _make_plan(n, m, H, W_target, prefer_seasonal=m > 1 and n >= 2 * m)
+    # an all-zero history has no scale at all: every band would be float noise in absolute
+    # units (a '낙관 5.28e−9' scenario for a series that never moved), so it gets none
+    no_scale = not bool(np.any(y_raw))
 
     def fallback(reason: str) -> ForecastResult:
         mean, sigma, _, method = _fallback_forecast(y, m, H, reason)
+        if no_scale:
+            sigma = np.zeros_like(sigma)
         mean_s, lower, upper = _bands(mean, sigma, lvls, nonnegative, index)
         return ForecastResult(mean=mean_s, lower=lower, upper=upper, horizon=H, levels=lvls,
                               model_scores=[], method=method, backtest_mase=None,
@@ -1430,6 +1475,8 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
     sigma, dof = _shrink_sigma(sigma_bt, prior, plan.n_targets - 1, dof_factor)
     sigma = np.maximum(sigma, _member_spread(fitted, weights))
     sigma = np.maximum.accumulate(sigma)
+    if no_scale:
+        sigma = np.zeros_like(sigma)
     mean_s, lower, upper = _bands(mean, sigma, lvls, nonnegative, index, dof)
 
     # reported best (lowest MASE) first, whatever metric selected the models
@@ -1716,6 +1763,34 @@ def _pct_undefined(y: np.ndarray, current: float, future: float, k_cur: int) -> 
     return None
 
 
+#: partial-season adjustment (see compute_outlook): only for seasonality the analysis found to be
+#: more than negligible -- metrics.seasonal_strength >= 0.2, below which the narrative calls it
+#: "거의 없습니다" -- and only when the removed effect is material: at least 0.5 % of the window's
+#: mean absolute level.  A constant weekly series (seasonal component ~1e-14) was "seasonally
+#: adjusted" next to "계절성은 거의 없습니다 (강도 0.00)".
+_ADJ_MIN_STRENGTH = 0.2
+_ADJ_MIN_SHARE = 0.005
+
+
+def _seasonality_matters(analysis: AnalysisResult) -> bool:
+    """Whether the analysis found seasonality worth adjusting for (unknown strength: yes)."""
+    ss = getattr(getattr(analysis, "metrics", None), "seasonal_strength", None)
+    try:
+        ss = float(ss)
+    except (TypeError, ValueError):
+        return True
+    return not math.isfinite(ss) or ss >= _ADJ_MIN_STRENGTH
+
+
+def _material(effect: float, window: np.ndarray) -> bool:
+    """A seasonal effect worth removing from a window: ``|effect|`` >= 0.5 % of its mean |level|."""
+    if not math.isfinite(effect) or effect == 0.0:
+        return False
+    with np.errstate(over="ignore"):
+        ref = float(np.mean(np.abs(window))) if len(window) else 0.0
+    return not (math.isfinite(ref) and abs(effect) < _ADJ_MIN_SHARE * ref)
+
+
 class OutlookLevels(NamedTuple):
     """The two levels :func:`compute_outlook` compares (see :func:`outlook_levels`)."""
 
@@ -1724,8 +1799,9 @@ class OutlookLevels(NamedTuple):
     k_cur: int               # observations in the current window: min(season length, n)
     k_fut: int               # forecast steps in the future window: min(season length, horizon)
     period: Optional[int]    # period of the usable seasonal component (None: there is none)
-    adj_cur: bool            # current window is a partial season: seasonal effect removed
-    adj_fut: bool            # future window is a partial season: (scaled) seasonal effect removed
+    adj_cur: bool            # current window is a partial season and its (material, not
+                             # negligible) seasonal effect was removed
+    adj_fut: bool            # future window likewise: the (scaled) seasonal effect was removed
     undefined: Optional[str]  # why expected_change_pct is None ('zero', 'mostly_zero',
                               # 'sign_change', 'near_zero'), None when it is defined
 
@@ -1751,14 +1827,19 @@ def _levels(analysis: AnalysisResult, forecast: ForecastResult
     seas_fut = _future_seasonal(analysis, H, fm)
     seas_fut = _seasonal_share(fm, seas_fut, p) * seas_fut
     adj_cur = adj_fut = False
-    if seas is not None:
-        # compare like with like: remove the seasonal effect of partial-season windows
+    if seas is not None and _seasonality_matters(analysis):
+        # compare like with like: remove the seasonal effect of partial-season windows (only a
+        # material one: removing ~0 would only add a "seasonally adjusted" note to plain means)
         if k_fut % p:
-            future -= float(np.mean(seas_fut[-k_fut:]))
-            adj_fut = True
+            eff = float(np.mean(seas_fut[-k_fut:]))
+            if _material(eff, fm[-k_fut:]):
+                future -= eff
+                adj_fut = True
         if k_cur % p:
-            current -= float(np.mean(seas[finite][-k_cur:]))
-            adj_cur = True
+            eff = float(np.mean(seas[finite][-k_cur:]))
+            if _material(eff, y[-k_cur:]):
+                current -= eff
+                adj_cur = True
     levels = OutlookLevels(current=current, future=future, k_cur=k_cur, k_fut=k_fut,
                            period=p if seas is not None else None, adj_cur=adj_cur,
                            adj_fut=adj_fut, undefined=_pct_undefined(y, current, future, k_cur))
@@ -1806,9 +1887,13 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
       forecast actually contains (0 for a flat / straight-line forecast) --
       so that a seasonal high or low is not reported as a trend change.  For
       a multiplicative decomposition the continued seasonal component scales
-      with the forecast level (see :func:`_future_seasonal`).  For windows of
-      whole seasons (the default for D/M/Q/Y) nothing changes and the two
-      levels are plain means.
+      with the forecast level (see :func:`_future_seasonal`).  Nothing is
+      removed -- and ``OutlookLevels.adj_cur`` / ``adj_fut`` stay ``False`` --
+      when the analysis found negligible seasonality
+      (``metrics.seasonal_strength < 0.2``) or the window's seasonal effect is
+      below 0.5 % of its mean absolute level.  For windows of whole seasons
+      (the default for D/M/Q/Y) nothing changes and the two levels are plain
+      means.
 
     Fields:
 
@@ -1822,7 +1907,14 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
       demand: a percentage of a mean of mostly zeros is meaningless), or --
       for a series with negative values (net profit, temperature) -- when the
       current level is within 0.5 standard deviations of the history from 0
-      (see :func:`_pct_defined`).
+      (see :func:`_pct_undefined`; :func:`outlook_levels` gives the reason).
+      Intermittent demand whose current window is less than half zeros (it
+      has ``>= 30 %`` zeros overall and recently) keeps a percentage: the two
+      levels are then average demand rates over a season each.  A negative
+      current level far enough from 0 keeps a percentage, signed by the
+      direction of the move (``|current|`` in the denominator: −25.9 → −34.2
+      is −32 %); note that the analysis' own growth numbers refuse a negative
+      base (``analysis.pct_change_undefined`` -> ``'negative'``).
     * ``prob_increase`` = P(future level > current level) =
       ``Φ((future − current) / σ_H)``, σ_H recovered from the 80 % interval
       at the horizon end (the wider side when a bound was clipped at 0).
