@@ -45,7 +45,8 @@ import numpy as np
 import pandas as pd
 
 from . import models as _models
-from .analysis import _is_multiplicative
+from .analysis import _is_intermittent as _analysis_is_intermittent
+from .analysis import _is_multiplicative, _pct_reference, pct_change_undefined
 from .data import default_horizon, future_index, prepare
 from .data import season_length as _freq_season_length
 from .types import AnalysisResult, ForecastResult, ModelScore, Outlook
@@ -58,6 +59,8 @@ __all__ = [
     "compute_outlook",
     "outlook_levels",
     "OutlookLevels",
+    "interval_level",
+    "fit_history",
     "norm_cdf",
     "norm_ppf",
     "t_cdf",
@@ -135,12 +138,10 @@ _SPIKE_Z = 5.0
 #: at most this share of points may be spikes (otherwise the noise is heavy-tailed and
 #: nothing is replaced); 4 news spikes in 3 years of monthly data are 11 %
 _SPIKE_MAX_SHARE = 0.15
-#: share of exact zeros (overall and recently) from which demand counts as intermittent
-_INTERMITTENT_ZEROS = 0.3
 #: the only candidates for intermittent demand (those that are registered): they estimate a
 #: level (a demand rate) instead of following the last observations; 'croston' / 'sba' are
 #: picked up automatically if the models module registers them
-_INTERMITTENT_MODELS = ("ses", "theta", "holt_damped", "croston", "sba")
+_INTERMITTENT_MODELS = ("ses", "theta", "holt_damped", "croston", "sba", "tsb")
 #: backtest metric that ranks and weights the candidates for intermittent demand.  MAE (and so
 #: MASE) is minimised by the median, which for mostly-zero data is 0 or close to it, so it
 #: prefers forecasts that under-state the demand rate; squared error is minimised by the mean
@@ -540,21 +541,28 @@ def _clean_spikes(y: np.ndarray, m: int) -> tuple[np.ndarray, int]:
     return out, replaced
 
 
+def fit_history(y: np.ndarray, season_length: int) -> np.ndarray:
+    """The observations :func:`auto_forecast` backtests and fits on: the last
+    ``max(400, 8 * season_length)`` of ``y`` (see ``_BT_MAX_HISTORY``).
+
+    The one definition of the forecast's history: when it is all zeros the forecast
+    and its bands are exactly 0 (no scale at all), which ``narrative.forecast_is_zero``
+    -- and with it the scenario floor, the probability of a rise and the zero-width
+    caveat on every surface -- reads through this function.
+    """
+    return np.asarray(y)[-max(_BT_MAX_HISTORY, 8 * max(1, int(season_length))):]
+
+
 def _is_intermittent(y: np.ndarray, m: int) -> bool:
     """Intermittent demand: non-negative, many exact zeros overall *and* recently.
 
     ``>= 30 %`` zeros in the history and in the last ``max(m, 12)`` points
     (a series that was 0 before a new trend took off is not intermittent any
-    more), with at least two non-zero values.
+    more), with at least two non-zero values -- :func:`analysis._is_intermittent`,
+    the one rule of the analysis, the forecast and every surface (``y`` here is
+    already the capped history, which the analysis rule caps the same way).
     """
-    y = np.asarray(y, dtype=float)
-    if len(y) < 8 or np.any(y < 0):
-        return False
-    zero = y == 0
-    if (~zero).sum() < 2:
-        return False
-    k = min(len(y), max(m, 12))
-    return bool(zero.mean() >= _INTERMITTENT_ZEROS and zero[-k:].mean() >= _INTERMITTENT_ZEROS)
+    return _analysis_is_intermittent(y, m)
 
 
 def _multiplicative_growth(y: np.ndarray) -> bool:
@@ -1248,8 +1256,10 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
       behind a compounding series).
     * Intermittent demand (``>= 30 %`` zeros overall and recently): only
       level-type models (``ses``, ``theta``, ``holt_damped``, ``croston``,
-      ``sba`` -- those registered; ``sba`` is offered for intermittent
-      demand only) are default candidates (MAE-based ranking would otherwise
+      ``sba``, ``tsb`` -- those registered; ``sba`` and ``tsb`` are offered
+      for intermittent demand only; ``tsb`` lowers its rate through a run of
+      zeros, so a product that stopped selling is not forecast at last
+      year's rate) are default candidates (MAE-based ranking would otherwise
       pick naive/drift and anchor the forecast on the last observation).  They
       are ranked and weighted by backtest RMSE rather than MASE: MAE is
       minimised by the median, about 0 for mostly-zero data, so it favours
@@ -1307,7 +1317,7 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
     nonnegative = bool(nonnegative)
     index = future_index(s.index[-1], freq, H)
 
-    y_raw = y_full[-max(_BT_MAX_HISTORY, 8 * m):]
+    y_raw = fit_history(y_full, m)
     intermittent = _is_intermittent(y_raw, m)
     y = y_raw if intermittent else _clean_spikes(y_raw, m)[0]
     n = len(y)
@@ -1403,8 +1413,14 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
     if k >= 2:
         top = ranked[:k]
         vals = [results[nm][1][key] for nm in top]
-        floor = 1e-9 if key == "mase" else 1e-12 * max(max(vals), 1e-300)
-        inv = np.array([1.0 / max(v, floor) for v in vals])
+        vmax = max(vals)
+        if not vmax > 0:
+            # every member was exact in the backtest (e.g. a run of zeros forecast as zeros): equal
+            # weights -- 1 / max(0, 1e-312) overflowed to inf and inf / inf gave NaN weights
+            inv = np.ones(len(vals))
+        else:
+            floor = 1e-9 if key == "mase" else 1e-12 * vmax
+            inv = np.array([1.0 / max(v, floor) for v in vals])
         ens_w = inv / inv.sum()
         ens_fc = np.tensordot(ens_w, np.stack([results[nm][0] for nm in top]), axes=1)
         ens_score = _scores(ens_fc, actuals, scales, wts)[key]
@@ -1495,12 +1511,22 @@ def auto_forecast(series: pd.Series, horizon: int | None = None, freq: str | Non
 # --------------------------------------------------------------------------- outlook
 
 
-def _interval_level(forecast: ForecastResult, target: int = 80) -> Optional[int]:
-    """The available interval level closest to ``target`` (``None`` if there is none)."""
-    avail = [lv for lv in forecast.levels if lv in forecast.lower and lv in forecast.upper]
+def interval_level(forecast: ForecastResult, target: int = 80) -> Optional[int]:
+    """The available interval level closest to ``target`` (``None`` if there is none; ties: the
+    lower level).
+
+    With the default ``target`` this is the band behind ``Outlook.scenarios`` and the
+    uncertainty of :func:`compute_outlook`, so every surface that labels the scenarios
+    ("80% 예측구간") names the band they came from -- also for custom levels such as
+    ``(50, 95)``, where it is the 95 % band.
+    """
+    avail = [int(lv) for lv in forecast.levels if lv in forecast.lower and lv in forecast.upper]
     if not avail:
         return None
     return min(avail, key=lambda lv: (abs(lv - target), lv))
+
+
+_interval_level = interval_level
 
 
 def _has_inner_peak(f: np.ndarray, min_rise: float = 0.0, anchor: Optional[float] = None,
@@ -1727,40 +1753,56 @@ def _future_phase(current: str, direction: str, strong: bool, change_pct: Option
     return "stable"
 
 
-#: a series that takes negative values (net profit, temperature, a growth rate) has no natural
-#: zero for percentages: a change in % is stated only when the current level is at least this
-#: many standard deviations of the history away from 0 (a level near 0 made a P&L that went
-#: from 10 to -10 read as a -578,465 % change)
-_PCT_MIN_LEVEL_SD = 0.5
+#: share of the future window whose forecast means sit at the 0 floor of a nonnegative forecast from
+#: which the future level is the floor rather than a forecast ('floor', see _pct_undefined): the
+#: mirror of 'mostly_zero' for the current window
+_FLOOR_SHARE = 0.5
 
 
-def _pct_undefined(y: np.ndarray, current: float, future: float, k_cur: int) -> Optional[str]:
-    """Why ``(future - current) / |current|`` is no meaningful percentage (``None``: it is).
+def _pct_undefined(y: np.ndarray, current: float, future: float, k_cur: int,
+                   fut_window: Optional[np.ndarray] = None, nonnegative: bool = False) -> Optional[str]:
+    """Why ``(future - current) / current`` is no meaningful percentage (``None``: it is).
 
-    * ``'zero'``: the current level is ~0 (or not finite);
+    The analysis' percentage rule (:func:`analysis.pct_change_undefined`, the rule
+    behind ``TrendMetrics.total_change_pct`` / ``recent_change_pct`` / ``cagr_pct``
+    and every surface that prints such a number), applied to the two outlook
+    levels, plus outlook-specific refinements:
+
+    * ``'zero'``: the current level is ~0 (at most 1 % of the mean absolute
+      level of the history) or a level is not finite;
     * ``'mostly_zero'``: at least half of the current window is exactly 0 for
       a non-negative series (intermittent demand: a percentage of a mean of
       mostly zeros is meaningless);
-    * ``'sign_change'``: the future level has the opposite sign (a change
-      across zero has no percentage);
+    * ``'floor'``: at least half of the future window (``fut_window``, the
+      forecast means) sits at the 0 floor of a ``nonnegative`` forecast while the
+      current level is positive.  Those means were clipped at 0 -- they are the
+      floor, not an expected value (the band above them stays wide) -- so the
+      "−100.0 %" (or −99.4 %) they give says only that the forecast hit the floor,
+      next to a probability of a rise taken from the whole band;
+    * ``'sign_change'``: the future level has the opposite sign of the current
+      one -- in either direction (the analysis rule names a negative base by
+      its sign or its closeness to 0; a level expected to cross zero *upwards*
+      is named for the crossing, like a downward one);
+    * ``'negative'``: the current level is negative, at least 0.5 standard
+      deviations of the history away from 0 (a percentage of a negative base
+      reads backwards: −25.9 → −34.2 is no "−32 %"; the two levels are
+      compared in units instead);
     * ``'near_zero'``: the series takes negative values and the current level
-      is closer to 0 than 0.5 standard deviations of the history.
-      Non-negative series are on a ratio scale, so any positive level
-      qualifies there.
+      is closer to 0 than 0.5 standard deviations of the history (either side).
+
+    Non-negative series only get ``'zero'``, ``'mostly_zero'`` or ``'floor'``.
     """
-    ref = float(np.mean(np.abs(y))) if len(y) else 0.0
-    if not (math.isfinite(current) and abs(current) > 1e-6 * max(ref, 1e-300)):
-        return "zero"
-    nonneg = bool(np.all(y >= 0))
-    if nonneg and np.mean(y[-k_cur:] == 0) >= 0.5:
+    why = pct_change_undefined(current, future, y)
+    if why == "zero":
+        return why
+    if len(y) and bool(np.all(y >= 0)) and np.mean(y[-k_cur:] == 0) >= 0.5:
         return "mostly_zero"
-    if not math.isfinite(future) or (future != 0.0 and (future > 0) != (current > 0)):
+    if (nonnegative and current > 0.0 and fut_window is not None and len(fut_window)
+            and float(np.mean(np.asarray(fut_window, dtype=float) <= 0.0)) >= _FLOOR_SHARE):
+        return "floor"
+    if why in ("negative", "near_zero") and current < 0.0 < future:
         return "sign_change"
-    if not nonneg:
-        sd = float(np.std(y / ref)) * ref  # on a unit scale: no overflow at |y| ~ 1e200
-        if abs(current) < _PCT_MIN_LEVEL_SD * sd:
-            return "near_zero"
-    return None
+    return why
 
 
 #: partial-season adjustment (see compute_outlook): only for seasonality the analysis found to be
@@ -1802,8 +1844,11 @@ class OutlookLevels(NamedTuple):
     adj_cur: bool            # current window is a partial season and its (material, not
                              # negligible) seasonal effect was removed
     adj_fut: bool            # future window likewise: the (scaled) seasonal effect was removed
-    undefined: Optional[str]  # why expected_change_pct is None ('zero', 'mostly_zero',
-                              # 'sign_change', 'near_zero'), None when it is defined
+    undefined: Optional[str]  # why expected_change_pct is None ('zero', 'mostly_zero', 'floor',
+                              # 'sign_change', 'negative', 'near_zero'), None when it is defined
+    scale: float = 0.0       # typical absolute level of the history (the reference of the % rule,
+                             # analysis._pct_reference): what a move of a level at or near 0 is
+                             # measured against where no % applies (narrative.direction_label)
 
 
 def _levels(analysis: AnalysisResult, forecast: ForecastResult
@@ -1842,7 +1887,10 @@ def _levels(analysis: AnalysisResult, forecast: ForecastResult
                 adj_cur = True
     levels = OutlookLevels(current=current, future=future, k_cur=k_cur, k_fut=k_fut,
                            period=p if seas is not None else None, adj_cur=adj_cur,
-                           adj_fut=adj_fut, undefined=_pct_undefined(y, current, future, k_cur))
+                           adj_fut=adj_fut,
+                           undefined=_pct_undefined(y, current, future, k_cur, fm[-k_fut:],
+                                                    bool(getattr(forecast, "nonnegative", False))),
+                           scale=_pct_reference(y)[0])
     return levels, seas_fut
 
 
@@ -1901,20 +1949,22 @@ def compute_outlook(analysis: AnalysisResult, forecast: ForecastResult) -> Outlo
       level| × 100: the change of the *seasonally comparable level* from the
       last season to the last season of the horizon -- not the change of the
       horizon-end value (that is ``scenarios['base']``, a single date that
-      carries its own seasonal effect).  ``None`` when the current level is
-      ~0, when the future level has the opposite sign, when at least half of
-      the current window is exactly 0 for a non-negative series (intermittent
-      demand: a percentage of a mean of mostly zeros is meaningless), or --
-      for a series with negative values (net profit, temperature) -- when the
-      current level is within 0.5 standard deviations of the history from 0
-      (see :func:`_pct_undefined`; :func:`outlook_levels` gives the reason).
+      carries its own seasonal effect).  ``None`` when the analysis'
+      percentage rule refuses the change (:func:`analysis.pct_change_undefined`:
+      a current level ~0, a negative current level, a level crossing zero, a
+      level within 0.5 standard deviations of 0 for data with negative values)
+      when at least half of the current window is exactly 0 for a
+      non-negative series (intermittent demand: a percentage of a mean of
+      mostly zeros is meaningless), and when at least half of the future
+      window sits at the 0 floor of a nonnegative forecast ('floor': a mean
+      clipped at 0 is no expected value, its "−100 %" only says that the
+      forecast hit the floor); see :func:`_pct_undefined`, and
+      :func:`outlook_levels` gives the reason.  The direction, the
+      probability and the phase are still decided on the levels.
       Intermittent demand whose current window is less than half zeros (it
       has ``>= 30 %`` zeros overall and recently) keeps a percentage: the two
-      levels are then average demand rates over a season each.  A negative
-      current level far enough from 0 keeps a percentage, signed by the
-      direction of the move (``|current|`` in the denominator: −25.9 → −34.2
-      is −32 %); note that the analysis' own growth numbers refuse a negative
-      base (``analysis.pct_change_undefined`` -> ``'negative'``).
+      levels are then average demand rates (demand per period, zeros
+      included) over a season each.
     * ``prob_increase`` = P(future level > current level) =
       ``Φ((future − current) / σ_H)``, σ_H recovered from the 80 % interval
       at the horizon end (the wider side when a bound was clipped at 0).

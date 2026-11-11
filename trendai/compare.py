@@ -29,11 +29,15 @@ file of the same process get about the same score:
   zero), and when :func:`trendai.analysis.pct_change_undefined` refuses the
   year-over-year change itself (a P&L that fell through zero is no "−100 %"),
 * ``momentum_pm`` – the analysis' momentum converted from % per period to
-  % per month,
+  % per month; 0 (no contribution) where a %p of the level means nothing
+  (:func:`momentum_undefined`: a level near 0, a negative level, intermittent
+  demand, an all-zero history -- the table shows ``—`` there),
 * ``P(up)`` – the outlook's ``prob_increase``: the probability that the
   future level (mean of the last season of the horizon) exceeds the current
   level (mean of the last season), i.e. the same two levels as the expected
-  change (used as is).
+  change (used as is); 0.5 (no contribution) where
+  :func:`trendai.narrative.prob_undefined` gives no probability (a forecast of
+  exactly 0, a current level of 0 that cannot fall -- the table shows ``—``).
 
 For monthly data with the default 12-month horizon the annualised numbers equal
 the per-report ones, so the score is unchanged there.  The raw per-report
@@ -50,8 +54,9 @@ from typing import Iterable, Mapping, Optional, Union
 import numpy as np
 import pandas as pd
 
-from .analysis import _is_intermittent, pct_change_undefined
+from .analysis import _is_intermittent, level_rate_undefined, pct_change_undefined
 from .data import periods_per_year
+from .narrative import prob_undefined
 from .types import PHASE_KO, TrendReport
 
 RANK_COLUMNS = ["name", "phase", "phase_ko", "momentum", "recent_change_pct",
@@ -154,8 +159,23 @@ def recent_change_annualised(report: TrendReport) -> Optional[float]:
     return annualise_pct((last / base - 1.0) * 100.0, k, ppy)
 
 
+def _values(report: TrendReport) -> np.ndarray:
+    y = np.asarray(report.analysis.series, dtype=float)
+    return y[np.isfinite(y)]
+
+
+def momentum_undefined(report: TrendReport) -> Optional[str]:
+    """Why the momentum (%p of the trend level) means nothing for ``report``:
+    :func:`trendai.analysis.level_rate_undefined` (a level near 0, a negative level, intermittent
+    demand, an all-zero history) -- the rule every surface uses before printing it (``—``)."""
+    return level_rate_undefined(_values(report), int(report.analysis.season_length or 1))
+
+
 def momentum_per_month(report: TrendReport) -> float:
-    """Momentum (% per period, see analysis) expressed in % per month."""
+    """Momentum (% per period, see analysis) expressed in % per month; 0 where it means nothing
+    (:func:`momentum_undefined`: the score then leaves it out, as the table shows ``—``)."""
+    if momentum_undefined(report) is not None:
+        return 0.0
     return _f(report.analysis.metrics.momentum) * _ppy(report) / 12.0
 
 
@@ -173,8 +193,10 @@ def rising_score(report: TrendReport) -> float:
     left out (the outlook alone decides).
     """
     o = report.outlook
+    # no probability where the table shows "—" (prob_undefined): neutral, like a missing change
+    p_up = 0.5 if prob_undefined(report.analysis) is not None else _f(o.prob_increase)
     z = (0.35 * math.tanh(_f(expected_change_annualised(report)) / 50.0)
-         + 0.25 * (2.0 * min(1.0, max(0.0, _f(o.prob_increase))) - 1.0))
+         + 0.25 * (2.0 * min(1.0, max(0.0, p_up)) - 1.0))
     if report.analysis.phase.label not in NOISE_PHASES:
         z += (0.20 * math.tanh(_f(recent_change_annualised(report)) / 50.0)
               + 0.20 * math.tanh(momentum_per_month(report) / 2.0))
@@ -187,24 +209,29 @@ def rank_trends(reports: Union[Mapping[str, TrendReport], Iterable[TrendReport]]
     ``momentum`` / ``recent_change_pct`` / ``expected_change_pct`` are the
     per-report values (each in its own frequency's units); the ``*_ann_pct``
     and ``momentum_per_month`` columns are the frequency-neutral values the
-    score is computed from.  Ties keep the input order.
+    score is computed from.  ``momentum`` / ``momentum_per_month`` are ``None``
+    where a %p of the level means nothing (:func:`momentum_undefined`) and
+    ``prob_increase`` where :func:`trendai.narrative.prob_undefined` gives a reason (a
+    forecast of exactly 0, a current level of 0 that cannot fall).  Ties keep the input order.
     """
     items = list(reports.values()) if isinstance(reports, Mapping) else list(reports)
     rows = []
     for r in items:
         m, o = r.analysis.metrics, r.outlook
+        mom_ok = momentum_undefined(r) is None
         rows.append({
             "name": r.name,
             "phase": r.analysis.phase.label,
             "phase_ko": PHASE_KO.get(r.analysis.phase.label, r.analysis.phase.label),
-            "momentum": m.momentum,
+            "momentum": m.momentum if mom_ok else None,
             "recent_change_pct": m.recent_change_pct,
             "expected_change_pct": o.expected_change_pct,
-            "prob_increase": o.prob_increase,
+            # a forecast of exactly 0, or a level of 0 that cannot fall: no probability (narrative.prob_undefined)
+            "prob_increase": None if prob_undefined(r.analysis) is not None else o.prob_increase,
             "confidence": o.confidence,
             "score": rising_score(r),
             "freq": r.analysis.freq,
-            "momentum_per_month": momentum_per_month(r),
+            "momentum_per_month": momentum_per_month(r) if mom_ok else None,
             "recent_change_ann_pct": recent_change_annualised(r),
             "expected_change_ann_pct": expected_change_annualised(r),
         })

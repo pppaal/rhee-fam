@@ -439,3 +439,76 @@ def test_rising_score_follows_the_analysis_percentage_rules():
             z += 0.20 * np.tanh(compare.momentum_per_month(r) / 2.0)
         assert compare.rising_score(r) == pytest.approx(50 + 50 * z), nm
     assert df.loc["near", "score"] < 95.0          # was 98.7-99.7 (tanh saturated by +1,000 %/yr)
+
+
+# --------------------------------------------------------------------------- round 5
+
+_HANGUL = __import__("re").compile(r"[가-힣]")
+
+
+def test_negative_current_level_in_json_and_ranking():
+    """G1: the JSON export and the rising score follow the one percentage rule: a negative current
+    level gives expected_change_pct None ('negative'), and the expected-change term drops out."""
+    rng = np.random.default_rng(1)
+    t = np.arange(120)
+    s = pd.Series(50 - 80 * t / 119 + rng.normal(0, 4, 120),
+                  index=pd.date_range("2016-01-01", periods=120, freq="MS"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        rep = pipeline.run(s, name="P&L")
+    o = pipeline.report_to_dict(rep)["outlook"]
+    assert o["expected_change_pct"] is None and o["expected_change_undefined"] == "negative"
+    assert o["direction_label"] == {"ko": "하락", "en": "downward"}
+    assert o["compared_levels"]["current"] < 0
+    assert compare.expected_change_annualised(rep) is None
+    df = compare.rank_trends({"P&L": rep})
+    assert df["expected_change_pct"].isna().all()
+
+
+def test_series_failed_and_horizon_warnings_carry_catalog_codes():
+    """G5: the pipeline's warnings / errors are catalog messages: Korean str(), English .text('en')."""
+    from trendai.data import DataError, DataWarning
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        out = pipeline.run_many({"a": pd.Series([1.0], index=idx[:1]), "b": pd.Series([1.0, 2.0, 3.0], index=idx)})
+    assert list(out) == ["b"]
+    failed = next(x.message for x in w if isinstance(x.message, pipeline.SeriesFailedWarning))
+    assert failed.code == "series_failed" and failed.params["series"] == "a"
+    assert str(failed) == "'a' 분석 실패 — 관측치가 2개 이상 필요합니다 (유효한 값 1개)."
+    assert failed.text("en") == "'a' could not be analysed — at least 2 observations are needed (1 valid value(s))."
+    long = next(x.message for x in w if isinstance(x.message, DataWarning))
+    assert long.code == "horizon_long" and long.params == {"horizon": 30, "n": 3, "ratio": 5}
+    assert str(long).startswith("예측 기간(30기간)이 데이터 길이(3개)의 5배를 넘습니다.")
+    assert not _HANGUL.search(long.text("en"))
+    for bad, code in ((0, "horizon_not_positive"), (2.5, "horizon_not_positive"), ("x", "horizon_not_int"),
+                      (20_000, "horizon_too_long"), (float("inf"), "horizon_not_int")):
+        with pytest.raises(DataError) as ei:
+            pipeline.run(pd.Series([1.0, 2.0, 3.0], index=idx), horizon=bad)
+        assert ei.value.code == code and not _HANGUL.search(ei.value.text("en")), bad
+
+
+def test_json_prob_increase_follows_the_shared_rule():
+    """V2-3: report_to_json gave prob_increase 0.5 with no reason for an all-zero history while the
+    payload, the ranking, the narrative and the KPI all said there is none."""
+    from trendai import narrative
+
+    idx = pd.date_range("2023-01-01", periods=36, freq="MS")
+    dead = np.zeros(36)
+    dead[3] = 4.0
+    for values, why in ((np.zeros(36), "all_zero"), (dead, "zero_current")):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rep = pipeline.run(pd.Series(values, index=idx, name="returns"), freq="M")
+        out = json.loads(pipeline.report_to_json(rep))["outlook"]
+        assert narrative.prob_undefined(rep.analysis) == why
+        assert out["prob_increase"] is None and out["prob_increase_undefined"] == why
+        assert narrative.build_llm_payload(rep.analysis, rep.forecast, rep.outlook)["outlook"]["prob_increase"] is None
+        assert compare.rank_trends([rep])["prob_increase"].tolist() == [None]
+    # a series with a probability keeps it, with no reason
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        rep = pipeline.run(pd.Series(np.arange(36.0) + 10, index=idx), freq="M")
+    out = json.loads(pipeline.report_to_json(rep))["outlook"]
+    assert out["prob_increase"] == pytest.approx(rep.outlook.prob_increase) and out["prob_increase_undefined"] is None

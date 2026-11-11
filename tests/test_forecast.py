@@ -940,7 +940,11 @@ def test_outlook_peak_requires_a_rise_and_handles_negative_values():
     fc_neg = _hand_forecast(neg, "M", neg_hump, np.full(12, 2.0))
     o_neg = F.compute_outlook(_make_analysis(neg, "M", "stable"), fc_neg)
     assert o_neg.forecast_peak_date == fc_neg.mean.index[5]
-    assert o_neg.expected_change_pct is not None and math.isfinite(o_neg.expected_change_pct)
+    # round 5 (G1): a negative current level has no percentage ('negative', the analysis rule); the
+    # outlook is still decided on the two levels (was: a finite % with |current| in the denominator)
+    lv_neg = F.outlook_levels(_make_analysis(neg, "M", "stable"), fc_neg)
+    assert o_neg.expected_change_pct is None and lv_neg.undefined == "negative"
+    assert o_neg.direction == "up" and o_neg.prob_increase > 0.9 and lv_neg.future > lv_neg.current
 
 
 def test_outlook_weekly_peak_detection_with_noisy_seasonal_estimate():
@@ -1422,7 +1426,9 @@ def test_expected_change_pct_needs_a_level_away_from_zero():
     assert o.expected_change_pct is None
     assert o.direction == "down" and o.prob_increase < 0.2       # the rest of the outlook stands
     lv = F.outlook_levels(an, fc)
-    assert lv.undefined in ("near_zero", "sign_change") and lv.future < lv.current
+    # round 5 (G1): the outlook uses the analysis' rule, which calls a level within 1 % of the mean
+    # |value| 'zero' (here 0.003 against values of about ±10; the old outlook-only rule said 'near_zero')
+    assert lv.undefined == "zero" and abs(lv.current) < 0.01 * np.mean(np.abs(pnl)) and lv.future < lv.current
     t = np.arange(120)
     temp = from_values(0.3 + 15 * np.sin(2 * np.pi * (t - 3) / 12)
                        + np.random.default_rng(17).normal(0, 1.5, 120), freq="M")
@@ -1434,12 +1440,17 @@ def test_expected_change_pct_needs_a_level_away_from_zero():
     lv_c = F.outlook_levels(_make_analysis(s, "M", "declining"), cross)
     assert lv_c.undefined == "sign_change"
     assert F.compute_outlook(_make_analysis(s, "M", "declining"), cross).expected_change_pct is None
-    # unchanged where a percentage is meaningful: positive series, and negative series far from 0
+    # round 5 (G1): a negative series far from 0 no longer gets a % either -- the outlook follows the
+    # analysis' rule (pct_change_undefined -> 'negative'; was: (−110 − cur)/|cur|·100), while the
+    # direction and the probability are still decided on the levels
     neg = from_values(-100.0 + np.sin(np.arange(36.0)), freq="M")
-    o_neg = F.compute_outlook(_make_analysis(neg, "M", "stable"),
-                              _hand_forecast(neg, "M", np.full(12, -110.0), np.full(12, 1.0)))
-    assert o_neg.expected_change_pct == pytest.approx((-110 - neg.iloc[-12:].mean())
-                                                      / abs(neg.iloc[-12:].mean()) * 100)
+    an_neg = _make_analysis(neg, "M", "stable")
+    fc_neg = _hand_forecast(neg, "M", np.full(12, -110.0), np.full(12, 1.0))
+    o_neg = F.compute_outlook(an_neg, fc_neg)
+    lv_neg = F.outlook_levels(an_neg, fc_neg)
+    assert o_neg.expected_change_pct is None and lv_neg.undefined == "negative"
+    assert lv_neg.current == pytest.approx(neg.iloc[-12:].mean()) and lv_neg.future == pytest.approx(-110.0)
+    assert o_neg.direction == "down" and o_neg.prob_increase < 0.1
 
 
 def test_outlook_levels_reproduce_compute_outlook():
@@ -1636,3 +1647,181 @@ def test_intermittent_demand_percentage_compares_average_demand_rates():
             assert lv.current == pytest.approx(np.mean(y[-12:]))          # average demand rate
             assert lv.future == pytest.approx(np.mean(fc.mean.to_numpy()[-12:]))
             assert o.expected_change_pct == pytest.approx((lv.future - lv.current) / lv.current * 100)
+
+
+# --------------------------------------------------------------------------- round 5: one percentage rule
+
+
+def _pnl_down_series(n: int = 120, freq: str = "MS") -> pd.Series:
+    """The sweep's pnl_down case: a P&L from +50 down through 0 to about -30."""
+    rng = np.random.default_rng(1)
+    t = np.arange(n)
+    return pd.Series(50 - 80 * t / (n - 1) + rng.normal(0, 4, n),
+                     index=pd.date_range("2016-01-01", periods=n, freq=freq), name="P&L")
+
+
+def test_negative_current_level_has_no_outlook_percentage():
+    """G1 (round-4 F4): compute_outlook printed −32.0 % from a negative current level (−25.9 → −34.2)
+    while analysis.pct_change_undefined calls a negative base 'negative'.  One rule now: no %, the
+    reason 'negative', and the direction / probability still decided on the levels."""
+    from trendai.analysis import analyze
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        an = analyze(_pnl_down_series(), freq="M")
+        fc = F.auto_forecast(an.series, freq="M")
+    lv, o = F.outlook_levels(an, fc), F.compute_outlook(an, fc)
+    assert lv.current < 0 and lv.future < lv.current
+    assert lv.undefined == "negative" and o.expected_change_pct is None
+    assert o.direction == "down" and o.prob_increase < 0.1
+    # a negative level expected to cross zero upwards is named for the crossing, like a downward one
+    neg = from_values(-100.0 + np.sin(np.arange(36.0)), freq="M")
+    up = F.outlook_levels(_make_analysis(neg, "M", "stable"),
+                          _hand_forecast(neg, "M", np.linspace(20, 80, 12), np.full(12, 2.0)))
+    assert up.future > 0 > up.current and up.undefined == "sign_change"
+
+
+def test_outlook_percentage_rule_is_the_analysis_rule():
+    """G1: forecast._pct_undefined delegates to analysis.pct_change_undefined (plus 'mostly_zero' and
+    an upward zero crossing): the outlook gives a % exactly when the analysis' rule does."""
+    from trendai.analysis import pct_change_undefined
+
+    rng = np.random.default_rng(5)
+    series = [from_values(100 + rng.normal(0, 5, 48), freq="M"),            # positive
+              from_values(-100 + rng.normal(0, 5, 48), freq="M"),           # negative, far from 0
+              from_values(rng.normal(0, 10, 48), freq="M"),                 # around 0
+              from_values(np.linspace(50, -30, 48), freq="M")]              # crossing zero
+    for s in series:
+        an = _make_analysis(s, "M", "stable")
+        y = s.to_numpy(dtype=float)
+        for fut in (-150.0, -60.0, -5.0, 0.5, 5.0, 60.0, 150.0):
+            lv = F.outlook_levels(an, _hand_forecast(s, "M", np.full(12, fut), np.full(12, 1.0)))
+            want = pct_change_undefined(lv.current, lv.future, y)
+            if want in ("negative", "near_zero") and lv.current < 0 < lv.future:
+                want = "sign_change"
+            assert lv.undefined == want, (float(y[-1]), fut, lv.undefined, want)
+            o = F.compute_outlook(an, _hand_forecast(s, "M", np.full(12, fut), np.full(12, 1.0)))
+            assert (o.expected_change_pct is None) == (want is not None)
+
+
+def test_forecast_intermittent_rule_is_the_analysis_rule():
+    """G4: forecast._is_intermittent is analysis._is_intermittent (one implementation, no mirror)."""
+    from trendai.analysis import _is_intermittent as a_rule
+
+    rng = np.random.default_rng(2)
+    for _ in range(200):
+        n = int(rng.integers(5, 120))
+        y = (rng.random(n) < rng.uniform(0.2, 0.9)) * rng.integers(0, 6, n).astype(float)
+        if rng.random() < 0.1:
+            y = y - 1.0
+        assert F._is_intermittent(y, 12) == a_rule(y, 12)
+    assert not hasattr(F, "_INTERMITTENT_ZEROS") and not hasattr(F, "_PCT_MIN_LEVEL_SD")
+
+
+def test_interval_level_names_the_band_behind_the_scenarios():
+    """G4: the narrative labelled the scenarios '50% 예측구간' for levels (50, 95) while compute_outlook
+    took them from the 95 % band (its own rule: the level closest to 80).  One public rule now."""
+    from trendai import narrative as N
+
+    s = sample("growing")
+    fc = F.auto_forecast(s, freq="M", levels=(50, 95))
+    assert F.interval_level(fc) == 95 and N._interval_level(fc) == 95
+    o = F.compute_outlook(_make_analysis(s, "M", "growing"), fc)
+    assert o.scenarios["pessimistic"] == pytest.approx(float(fc.lower[95].iloc[-1]))
+    assert F.interval_level(F.auto_forecast(s, freq="M")) == 80
+
+
+def test_ensemble_of_exact_backtest_members_has_finite_weights():
+    """Round-4 review fuzz (decline_to_zero, Y60): an intermittent history ending in a long run of
+    zeros gave every top candidate an RMSE of exactly 0, so the inverse-RMSE weights were inf / inf
+    (method 'ensemble(ses nan, holt_damped nan, theta nan)', backtest MASE NaN, skill None)."""
+    rng = np.random.default_rng(1692021327)          # the fuzz case (decline_to_zero, n=60, yearly)
+    y = np.maximum(0.0, 100 - 3.0 * np.arange(60.0) + rng.normal(0, 2, 60))
+    assert np.all(y[-25:] == 0)
+    s = from_values(y, start="2001-01-01", freq="Y")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fc = F.auto_forecast(s, freq="Y")
+    assert F._is_intermittent(y, 1)
+    weights = [ms.weight for ms in fc.model_scores]
+    assert all(math.isfinite(w) for w in weights) and math.isclose(sum(weights), 1.0)
+    assert "nan" not in fc.method
+    assert fc.backtest_mase is not None and math.isfinite(fc.backtest_mase)
+    assert fc.skill is not None and math.isfinite(fc.skill)
+    assert np.all(np.isfinite(fc.mean)) and np.all(fc.mean == 0)
+
+
+def test_outlook_levels_carry_the_history_scale():
+    """V1-4: a move of a level at or near 0 (no %) is judged against the history's typical level."""
+    from trendai.analysis import analyze
+    from trendai.forecast import auto_forecast, outlook_levels
+
+    y = np.r_[np.arange(1.0, 49.0), np.zeros(12)]
+    s = pd.Series(y, index=pd.date_range("2018-01-01", periods=60, freq="MS"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        a = analyze(s)
+        lv = outlook_levels(a, auto_forecast(s, horizon=12))
+    assert lv.undefined == "zero" and lv.current == 0.0
+    assert lv.scale == pytest.approx(float(np.mean(np.abs(y))), rel=1e-9)
+
+
+# --------------------------------------------------------------------------- round 5, verify 2
+
+
+def _stopped_weekly() -> pd.Series:
+    """V2-7: weekly demand (P(sale) 0.35, 1-6 units), no sale in the last 34 of 104 weeks
+    (the last sale 41 weeks before the end)."""
+    r = np.random.default_rng(57)
+    n = 104
+    z = (r.poisson(2, n) + 1) * (r.random(n) < 0.35)
+    z[-(n // 3):] = 0
+    return pd.Series(z.astype(float), index=pd.date_range("2024-01-07", periods=n, freq="W-SUN"))
+
+
+def test_stopped_intermittent_demand_is_not_forecast_at_last_years_rate():
+    """V2-7: ensemble(ses, theta, sba) forecast 0.235 a week after 41 weeks without a sale
+    (52-week mean 0.15).  TSB joins the intermittent candidates and the backtest picks it."""
+    s = _stopped_weekly()
+    fc = F.auto_forecast(s, freq="W")
+    assert "tsb" in [ms.name for ms in fc.model_scores]
+    assert float(fc.mean.max()) < 0.05, (fc.method, fc.mean.iloc[0])
+    # regular series never get it
+    assert "tsb" not in [ms.name for ms in F.auto_forecast(sample("growing", n=60, freq="M"), freq="M").model_scores]
+
+
+def test_fit_history_is_the_forecasts_history():
+    """R5-REV2-2: one definition of the history the forecast uses (last max(400, 8 m))."""
+    y = np.arange(1000.0)
+    assert len(F.fit_history(y, 7)) == 400 and F.fit_history(y, 7)[0] == 600.0
+    assert len(F.fit_history(y, 52)) == 416
+    tail0 = pd.Series(np.r_[np.linspace(5, 50, 100), np.zeros(450)],
+                      index=pd.date_range("2020-01-01", periods=550, freq="D"))
+    fc = F.auto_forecast(tail0, freq="D")
+    assert not np.any(fc.mean.to_numpy()) and not np.any((fc.upper[80] - fc.lower[80]).to_numpy())
+
+
+def test_outlook_at_the_zero_floor_has_no_percentage():
+    """V2-1: 'sample fad -H 24' printed '예측 변화 −100.0%' next to 'P(up) 45%': the forecast means of
+    the last season were clipped at 0 (the band above them stays wide), so (0 − 7.74) / 7.74 says
+    only that the forecast hit the floor.  Same at −99.4 % (H = 18: 10 of 12 months at 0)."""
+    from trendai.analysis import analyze
+
+    s = sample("fad", n=120, freq="M")
+    a = analyze(s, freq="M")
+    for h, at_floor in ((24, 12), (18, 10)):
+        fc = F.auto_forecast(s, horizon=h, freq="M")
+        lv = F.outlook_levels(a, fc)
+        assert int(np.sum(fc.mean.to_numpy()[-lv.k_fut:] <= 0)) == at_floor
+        assert lv.undefined == "floor" and F.compute_outlook(a, fc).expected_change_pct is None
+    # a window with no point at the floor keeps its percentage (H = 12: −63 %)
+    fc12 = F.auto_forecast(s, horizon=12, freq="M")
+    assert F.outlook_levels(a, fc12).undefined is None
+    assert F.compute_outlook(a, fc12).expected_change_pct == pytest.approx(-63.3, abs=0.5)
+    # positive quarterly profit falling to the floor (40 -> 2)
+    r = np.random.default_rng(41)
+    t = np.arange(24)
+    q = pd.Series(40 - 38 * t / 23 + r.normal(0, 1, 24), index=pd.date_range("2020-01-01", periods=24, freq="QS"))
+    aq, fq = analyze(q, freq="Q"), F.auto_forecast(q, horizon=8, freq="Q")
+    assert F.outlook_levels(aq, fq).undefined == "floor"
+    assert F.compute_outlook(aq, fq).expected_change_pct is None

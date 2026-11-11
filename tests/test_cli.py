@@ -490,3 +490,136 @@ def test_lang_en_output_has_no_hangul(tmp_path, capsys):
     # Korean stays the default
     assert main(["sample", "emerging", "-q", "-H", "6"]) == 0
     assert "[태동기(신흥)] 신뢰도" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- round 5: --lang en end to end
+
+import re as _re
+
+_HANGUL = _re.compile(r"[가-힣]")
+
+_DATA_CASES = {
+    # name: (csv text, extra args, expected English fragment on stderr)
+    "short3": ("date,value\n2024-01-01,10\n2024-01-02,11\n2024-01-03,12\n", [],
+               "Warning: The forecast horizon (30 periods) is more than 5 times the length of the data"),
+    "dup_dates": ("date,value\n" + "".join(f"2024-{m:02d}-01,{10 + m}\n2024-{m:02d}-01,{11 + m}\n" for m in range(1, 13))
+                  + "2025-01-01,30\n", [], "several values fell in the same month period and were averaged"),
+    "gaps": ("date,value\n" + "".join(f"20{y:02d}-{m:02d}-01,{100 + y * 12 + m}\n" for y in range(20, 24)
+                                      for m in range(1, 13) if (y * 12 + m) % 3 != 0), [],
+             "on a month grid, 15 empty periods"),
+    "weekday": ("date,value\n" + "".join(f"{d.date()},{100 + i * 1.5}\n" for i, d in enumerate(
+        pd.bdate_range("2024-01-01", periods=60))), [], "values exist on weekdays (business days) only"),
+    "unreadable": ("date,value\n" + "".join(f"2024-{m:02d}-01,{'abc' if m == 5 else 10 + m}\n" for m in range(1, 13))
+                   + "2025-01-01,30\n", [], "Column 'value': 1 value(s) that are not numbers (e.g. 'abc')"),
+    "ambiguous": ("date,value\n" + "".join(f"{2 * k - 1:02d}/{2 * k:02d}/2024,{10 + k}\n" for k in range(1, 7)), [],
+                  "Note: The day/month order of the dates is ambiguous"),
+    "rownum": ("id,date,value\n" + "".join(f"{i},2024-{i:02d}-01,{10 + i * 1.5}\n" for i in range(1, 13)), [],
+               "Note: The column(s) ['id'] look like row numbers"),
+    "wide": ("name," + ",".join(f"2024-{m:02d}" for m in range(1, 13)) + "\nA,"
+             + ",".join(str(10 + m * 1.5) for m in range(12)) + "\nB," + ",".join(str(20 - m * 0.5) for m in range(12))
+             + "\n", [], "date column '(column headers)' (format: YYYY-MM)"),
+    "long_horizon": ("date,value\n" + "".join(f"2024-{m:02d}-01,{10 + m * 1.5}\n" for m in range(1, 13)), ["-H", "200"],
+                     "The forecast horizon (200 periods) is more than 5 times"),
+    "huge_horizon": ("date,value\n" + "".join(f"2024-{m:02d}-01,{10 + m * 1.5}\n" for m in range(1, 13)),
+                     ["-H", "20000"], "could not be analysed — The forecast horizon is too long"),
+    "no_numeric": ("date,label\n2024-01-01,a\n2024-02-01,b\n2024-03-01,c\n", [],
+                   "Data error: No numeric value column found."),
+    "too_few": ("date,value\n2024-01-01,10\n", [], "at least 2 observations are needed"),
+    "missing": (None, [], "Data error: File not found: "),
+    "date_format": ("when,v\n2024년 1월,1.5\n2024년 2월,2.5\n2024년 3월,2.0\n2024년 4월,3.5\n", [],
+                    "(format: Korean year-month text)"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_DATA_CASES))
+def test_analyze_lang_en_prints_no_hangul(case, tmp_path, capsys):
+    """G5: under --lang en the data layer's notes / warnings / errors printed as '경고: <Korean>'; now the
+    prefixes and the messages are English (no Hangul outside the user's own data)."""
+    body, extra, want = _DATA_CASES[case]
+    path = tmp_path / f"{case}.csv"
+    if body is not None:
+        path.write_text(body, encoding="utf-8")
+    code = main(["analyze", str(path), "--lang", "en", "-q", *extra])
+    cap = capsys.readouterr()
+    assert want in cap.err, cap.err
+    for ln in (cap.out + cap.err).split("\n"):
+        assert not _HANGUL.search(ln), ln
+    assert code == (2 if case in ("no_numeric", "missing", "too_few", "huge_horizon") else 0)
+    # Korean stays the default, with the Korean prefixes
+    if body is not None and case in ("short3", "rownum"):
+        main(["analyze", str(path), "-q", *extra])
+        err = capsys.readouterr().err
+        assert ("경고: 예측 기간(30기간)이 데이터 길이(3개)의 5배를 넘습니다." in err if case == "short3"
+                else "안내: 행 번호/일련번호로 보이는 열 ['id']은(는) 분석에서 제외했습니다" in err)
+
+
+def test_sample_lang_en_prints_no_hangul(capsys):
+    """G5: 'sample' with --lang en (narrative shown) and 'sample all' print no Hangul at all."""
+    for argv in (["sample", "emerging", "--lang", "en"], ["sample", "seasonal", "--n", "8", "--freq", "Y", "--lang", "en"],
+                 ["sample", "all", "--lang", "en", "-q", "--freq", "Q", "--n", "24"]):
+        assert main(argv) == 0
+        cap = capsys.readouterr()
+        bad = [ln for ln in (cap.out + cap.err).split("\n") if _HANGUL.search(ln)]
+        assert not bad, (argv, bad[:3])
+
+
+def test_argument_errors_follow_lang(capsys):
+    """G5: argparse type errors of --horizon / --n are English under --lang en (read before parsing)."""
+    with pytest.raises(SystemExit):
+        main(["sample", "emerging", "--lang", "en", "-H", "x"])
+    err = capsys.readouterr().err
+    assert "the forecast horizon must be an integer: 'x'" in err and not _HANGUL.search(err.split("usage:")[-1]
+                                                                                         .split("error:")[-1])
+    with pytest.raises(SystemExit):
+        main(["sample", "emerging", "-H", "0"])
+    assert "예측 기간은(는) 1 이상이어야 합니다: 0" in capsys.readouterr().err
+
+
+def test_ranking_marks_tentative_phases(tmp_path, capsys):
+    """G6 (round-4 F3): the CLI ranking showed a bare '안정기' for a 5-point series."""
+    path = tmp_path / "two.csv"
+    pd.DataFrame({"date": pd.date_range("2024-01-01", periods=5, freq="MS").strftime("%Y-%m-%d"),
+                  "a": [1, 2.5, 3, 4.2, 5.0], "b": [5, 4, 3.5, 3, 2.0]}).to_csv(path, index=False)
+    assert main(["analyze", str(path), "-q"]) == 0
+    out = capsys.readouterr().out
+    rows = [ln for ln in out.split("\n") if _re.match(r"\s+\d\.\s", ln)]
+    assert len(rows) == 2 and all("안정기·잠정" in r for r in rows)
+    assert main(["analyze", str(path), "-q", "--lang", "en"]) == 0
+    rows = [ln for ln in capsys.readouterr().out.split("\n") if _re.match(r"\s+\d\.\s", ln)]
+    assert all("(tentative)" in r for r in rows)
+
+
+@pytest.mark.parametrize("argv", [
+    ["wiki", "Foo", "--start", "2024-13-01"],
+    ["wiki", "Foo", "--start", "2024-05-01", "--end", "2024-01-01"],
+])
+def test_connector_errors_follow_lang(argv, capsys):
+    """R5-REV-5: 'Error: start 날짜가 유효하지 않습니다' under --lang en."""
+    assert main([*argv, "--lang", "en", "-q"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("Error: ") and not _re.search("[가-힣]", err)
+    assert main([*argv, "-q"]) == 1
+    assert capsys.readouterr().err.startswith("오류: ")          # Korean stays the default
+
+
+def test_compare_ranking_explains_every_dash(tmp_path, capsys):
+    """V1-12: every row read 'Exp. change —' with no note on why (a negative level, mostly-zero
+    demand, an all-zero history); the terminal summary of each series said why."""
+    import numpy as np
+
+    t = np.arange(60)
+    idx = pd.date_range("2021-01-01", periods=60, freq="MS")
+    files = {"loss": -20 - 60 * t / 59 + np.random.default_rng(11).normal(0, 2, 60),
+             "zeros": np.zeros(60)}
+    paths = []
+    for nm, v in files.items():
+        p = tmp_path / f"{nm}.csv"
+        pd.DataFrame({"date": idx, nm: v}).to_csv(p, index=False)
+        paths.append(str(p))
+    for lang, neg, zero in (("en", "※ Exp. change — (current level is negative): loss",
+                             "※ Exp. change, P(up) — (every observation is 0): zeros"),
+                            ("ko", "※ 예측 변화 — (현재 수준이 음수): loss",
+                             "※ 예측 변화·상승확률 — (관측값이 모두 0): zeros")):
+        assert main(["compare", *paths, "--lang", lang, "-q"]) == 0
+        out = capsys.readouterr().out
+        assert neg in out and zero in out, out[out.index("■"):]

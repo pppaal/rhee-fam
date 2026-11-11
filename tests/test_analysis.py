@@ -1474,3 +1474,161 @@ def test_weekly_multiplicative_seasonality_is_decomposed_in_log_space():
         y = 100 * 1.004 ** np.arange(208) + 40 * np.sin(2 * np.pi * t / 52) + rng.normal(0, 2, 208)
         s = pd.Series(y, index=pd.date_range("2018-01-07", periods=208, freq="W-SUN"))
         assert not A._is_multiplicative(_quiet_analyze(s, freq="W").decomposition)
+
+
+def test_negative_base_near_zero_is_near_zero_not_negative():
+    """Round 5 (G1): the outlook now follows pct_change_undefined, so its reasons must also describe a
+    negative level close to 0 (−1.5 among values with an SD of ~10) as near zero, not as a 'negative'
+    level whose relative move (−1.5 → −0.1, "93 %") would decide the direction word."""
+    rng = np.random.default_rng(1)
+    s = pd.Series(rng.normal(0, 10, 40), index=pd.date_range("2016-01-01", periods=40, freq="QS"))
+    sd = float(np.std(s))
+    assert A.pct_change_undefined(-0.15 * sd, -0.01 * sd, s) == "near_zero"
+    assert A.pct_change_undefined(-0.15 * sd, 0.3 * sd, s) == "near_zero"
+    assert A.pct_change_undefined(-2.0 * sd, -1.0 * sd, s) == "negative"
+    assert A.pct_change_undefined(0.15 * sd, 0.3 * sd, s) == "near_zero"
+    assert A.pct_change_undefined(0.15 * sd, -0.3 * sd, s) == "sign_change"
+
+
+# --------------------------------------------------------------------------- round 5, verify 1
+
+
+def _sweep_intermittent(kind: str, n: int, freq: str) -> pd.Series:
+    """The verifiers' mostly-zero cases (sweep ext.extra_cases, seed 21)."""
+    r = np.random.default_rng(21)
+    t = np.arange(n)
+    size = r.poisson(2, n) + 1
+    r.random(n)                                          # intsparse
+    rising = size * (r.random(n) < 0.15 + 0.6 * t / (n - 1))
+    falling = size * (r.random(n) < 0.75 - 0.6 * t / (n - 1))
+    lump = r.choice([1, 1, 2, 60], n)
+    lumpy = lump * (r.random(n) < 0.3)
+    z = np.zeros(n)
+    if kind == "dying":
+        z[0], z[n // 3] = 5, 2
+    elif kind == "launch":
+        z[-6:] = size[-6:]
+    vals = {"rising": rising, "falling": falling, "lumpy": lumpy}.get(kind, z)
+    pf = {"W": "W-SUN", "M": "MS"}[freq]
+    return pd.Series(np.asarray(vals, float), index=pd.date_range(end="2025-12-01", periods=n, freq=pf))
+
+
+def test_pct_reference_ignores_a_viral_spike():
+    """R5-REV-1: one value of 1,000,000 among levels of ~100 made every level 'close to zero'
+    (mean|y| = 16,788): the outlook lost its % change and the past section said '0에 가까워'."""
+    rng = np.random.default_rng(0)
+    y = 100 + 0.8 * np.arange(60) + rng.normal(0, 5, 60)
+    y[20] = 1_000_000.0
+    s = pd.Series(y, index=pd.date_range("2020-01-01", periods=60, freq="MS"))
+    assert A.pct_change_undefined(143.3, 149.0, y) is None
+    assert A.pct_change_undefined(0.5, 149.0, y) == "zero"          # a real ~0 base still is one
+    res = _quiet_analyze(s)
+    assert res.metrics.total_change_pct is not None and res.metrics.recent_change_pct is not None
+    # the "mean level" of slope_pct / volatility is not the spike's either ("+0.01%/월", CV 510 %)
+    assert 0.3 < res.metrics.slope_pct < 1.0 and res.metrics.volatility < 0.1
+
+
+@pytest.mark.parametrize("kind,n,freq", [("falling", 156, "W"), ("lumpy", 156, "W"), ("dying", 36, "M"),
+                                         ("launch", 36, "M"), ("rising", 36, "M")])
+def test_intermittent_phase_reasons_state_no_percent_of_the_level(kind, n, freq):
+    """V1-2: '현재 추세는 고점보다 100.0% 낮은 수준', '최근 23주 동안 추세가 −100.0% 변했습니다' for
+    mostly-zero demand whose metrics leave every % out: the moves are stated in units."""
+    s = _sweep_intermittent(kind, n, freq)
+    res = _quiet_analyze(s)
+    assert A.level_pct_blocked(s.to_numpy(), season_length(freq)) == "intermittent"
+    level_pct = re.compile(r"\d% (?:낮은|변했)|%만큼|최고 수준 대비|고점의 \d+% 수준")
+    assert not [r for r in res.phase.reasons if level_pct.search(r)], res.phase.reasons
+    from trendai.narrative import translate_reason
+    assert all(translate_reason(r) for r in res.phase.reasons), res.phase.reasons
+
+
+def test_all_zero_phase_reasons_name_the_zeros():
+    """V1-2 / R5-REV-4: '추세의 변동 폭(최고-최저)이 최고 수준 대비 0.0%에 그칩니다' of a history of zeros."""
+    for n in (36, 5):
+        res = _quiet_analyze(pd.Series(np.zeros(n), index=pd.date_range("2020-01-01", periods=n, freq="MS")))
+        assert "관측값이 모두 0입니다." in res.phase.reasons
+        assert not [r for r in res.phase.reasons if "%" in r], res.phase.reasons
+
+
+def test_intermittent_launch_is_not_declining():
+    """V1-5: 30 zero months, then demand: 'declining' (0.78) next to '추세 기울기는 +0.34/월'."""
+    z = np.zeros(36)
+    z[-6:] = [3, 5, 4, 2, 3, 2]
+    res = _quiet_analyze(pd.Series(z, index=pd.date_range("2023-01-01", periods=36, freq="MS")))
+    assert res.phase.label != "declining"
+    assert res.phase.label == "growing"           # the recent move and the Mann-Kendall test agree
+
+
+@pytest.mark.parametrize("kind,n,freq", [("dying", 36, "M"), ("lumpy", 156, "W")])
+def test_intermittent_seasonality_must_recur(kind, n, freq):
+    """V1-8: two orders, both in January, read as 'very strong seasonality (1.00)'; random 60-unit lumps
+    over three weekly years as 0.99."""
+    res = _quiet_analyze(_sweep_intermittent(kind, n, freq))
+    assert res.metrics.seasonal_strength < 0.2
+
+
+def test_recurring_intermittent_season_is_kept():
+    """V1-8 (the other side): demand only around Nov-Dec every year stays seasonal."""
+    rng = np.random.default_rng(4)
+    t = np.arange(60)
+    y = (rng.poisson(3, 60) + 1) * (rng.random(60) < np.where(t % 12 >= 10, 0.95, 0.05))
+    res = _quiet_analyze(pd.Series(y.astype(float), index=pd.date_range("2020-01-01", periods=60, freq="MS")))
+    assert A.level_pct_blocked(y, 12) == "intermittent"
+    assert res.metrics.seasonal_strength >= 0.5
+
+
+def test_level_rate_undefined_rule():
+    """V1-3: the rule behind '평균 수준 대비 …%/월', momentum %p and the CV on every surface."""
+    t = np.arange(60)
+    assert A.level_rate_undefined(100 + t, 12) is None
+    assert A.level_rate_undefined(-20 - t, 12) == "negative"
+    assert A.level_rate_undefined(50 - 80 * t / 59, 12) == "near_zero"   # a P&L crossing zero
+    assert A.level_rate_undefined(np.zeros(36), 12) == "zero"
+    assert A.level_rate_undefined(np.where(t % 3 == 0, 4.0, 0.0), 12) == "intermittent"
+
+
+# --------------------------------------------------------------------------- round 5, verify 2
+
+
+def test_single_final_order_is_no_emerging_phase():
+    """V2-6: lumpy demand (0-2 a month, orders of 60 in months 4 and 36) read '태동기(신흥) (신뢰도 95%)',
+    '현재 추세 수준이 과거 기반 수준의 91.9배' -- the last order pulled the trend's end.  The phase
+    follows the demand rate without its single largest order (first-year 5.50, last-year 5.33,
+    Mann-Kendall p = 0.28)."""
+    v = [2, 0, 1, 60, 1, 0, 1, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+         1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 60]
+    s = pd.Series(np.array(v, float), index=pd.date_range("2023-01-01", periods=36, freq="MS"))
+    res = _quiet_analyze(s)
+    assert res.phase.label not in ("emerging", "growing") and res.phase.confidence <= 0.6, res.phase
+    assert "최근의 높은 추세는 2025-12의 큰 수요 한 건(60.0) 때문이며, 이를 빼면 수요가 늘었다고 보기 어렵습니다." \
+        in res.phase.reasons
+    from trendai.narrative import translate_reason
+    assert all(translate_reason(r) for r in res.phase.reasons), res.phase.reasons
+    # the mirror: one early order of 60 is no 'declining'
+    m = pd.Series(np.array(v[::-1], float), index=s.index)
+    assert _quiet_analyze(m).phase.label != "declining"
+
+
+@pytest.mark.parametrize("freq,n,seed", [("M", 48, 13), ("W", 156, 16)])
+def test_intermittent_declining_never_sits_next_to_a_rise(freq, n, seed):
+    """R5-REV2-1: 'declining' with the reason '최근 7개월 동안 추세가 0.15에서 0.34까지 높아졌습니다': the guard
+    measured the rise against 5 % of the trend's whole range (8.8), not against the level.  One rule
+    (_rate_move) decides both the reason's verb and whether the phase contradicts it."""
+    rng = np.random.default_rng(seed)
+    y = (rng.poisson(np.linspace(0.8, 0.2, n)) * rng.integers(1, 10, n)).astype(float)
+    s = pd.Series(y, index=pd.date_range("2020-01-05", periods=n, freq={"M": "MS", "W": "W-SUN"}[freq]))
+    res = _quiet_analyze(s)
+    # a rise in units ('0.15에서 0.34까지 높아졌습니다') or, as HEAD worded it, in % ('+117.2% 변했습니다')
+    rose = any("높아졌습니다" in r or re.search(r"추세가 \+[\d.,]+% 변했습니다", r) for r in res.phase.reasons)
+    fell = any("낮아졌습니다" in r or re.search(r"추세가 −[\d.,]+% 변했습니다", r) for r in res.phase.reasons)
+    assert not (res.phase.label == "declining" and rose), (res.phase.label, res.phase.reasons)
+    assert not (res.phase.label in ("growing", "emerging", "reviving") and fell), res.phase.reasons
+
+
+def test_a_small_move_of_the_demand_rate_is_no_move():
+    f = {"t_rec0": 0.150, "t_last": 0.152}
+    assert A._rate_move(f) == 0 and not A._against_recent_move("declining", f)
+    assert A._rate_move({"t_rec0": 0.15, "t_last": 0.34}) == 1
+    assert A._against_recent_move("declining", {"t_rec0": 0.15, "t_last": 0.34})
+    assert A._against_recent_move("growing", {"t_rec0": 0.34, "t_last": 0.15})
+    assert A.phase_window(48) == 7 and A.phase_window(156) == 23

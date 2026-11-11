@@ -492,3 +492,79 @@ def test_a_few_empty_periods_keep_the_values_own_frequency():
     with pytest.warns(DataWarning):
         _, f3 = prepare(v)
     assert f3 == "M"
+
+
+# --------------------------------------------------------------------------- round 5: message catalog
+
+import re as _re
+
+_HANGUL = _re.compile(r"[가-힣]")
+
+
+def test_message_catalog_renders_every_code_in_both_languages():
+    """G5: every data-layer message has a Korean and an English template; English has no Hangul."""
+    from trendai import messages as MS
+
+    sample_params = {
+        "freq": "X", "value": 0, "horizon": 20_000, "max": 10_000, "n": 3, "ratio": 5, "series": "s",
+        "detail": MS.msg("too_few_obs", name="", n=1), "label": MS.L("YYYY (연도)", "YYYY (year)"),
+        "examples": "'a'", "lo": "1", "hi": "36", "name": "'v': ", "n_obs": 60, "filled": 22, "n_out": 82,
+        "unit": MS.unit("M"), "total": 47, "share": 0.32, "observed": 32, "how": MS.L("평균", "averaged"),
+        "n_raw": 25, "col": "v", "columns": ["date", "v"], "cols": ["id"], "edge": "", "what": "f.csv",
+        "error": "boom", "hint": "", "line": 3, "pkg": "openpyxl", "path": "/x/f.csv",
+        # connectors.ConnectorError (R5-REV-5)
+        "lang": "'k o'", "choices": "('daily', 'monthly')", "start": "2024-05-01", "end": "2024-01-01",
+        "status": 503, "url": "https://example.org/x", "title": "Foo", "kind": "ImportError", "kw": "foo",
+    }
+    for code, (ko, en) in MS.MESSAGES.items():
+        names = {f for t in (ko, en) for _, f, _, _ in __import__("string").Formatter().parse(t) if f}
+        params = {k: sample_params[k] for k in names}
+        m = MS.msg(code, **params)
+        assert str(m) == MS.render(code, params, "ko") and _HANGUL.search(str(m)), code
+        assert m.text("en") == MS.render(code, params, "en") and not _HANGUL.search(m.text("en")), code
+        assert m.code == code and m.params == params
+    assert MS.format_label("YYYY년 M월", "en") == "Korean year-month text"
+    assert MS.format_label("(열 머리글)", "en") == "(column headers)"
+    assert not _HANGUL.search(" ".join(MS.format_label(k, "en") for k, _ in MS._LABEL_EN))
+
+
+def test_data_errors_and_warnings_carry_code_params_and_english_text(tmp_path):
+    """G5: DataError / DataWarning / DataNotice keep their Korean str() for library users and carry
+    the catalog code + params, so the CLI can render them in English."""
+    from trendai.data import DataError, DataNotice, DataWarning, load_table, prepare
+
+    with pytest.raises(DataError) as ei:
+        prepare(pd.Series([1.0], index=pd.date_range("2024-01-01", periods=1), name="v"))
+    e = ei.value
+    assert str(e) == "'v': 관측치가 2개 이상 필요합니다 (유효한 값 1개)."      # unchanged Korean text
+    assert e.code == "too_few_obs" and e.params == {"name": "'v': ", "n": 1}
+    assert e.text("en") == "'v': at least 2 observations are needed (1 valid value(s))."
+    with pytest.raises(DataError) as ei:
+        load_table(tmp_path / "nope.csv")
+    assert ei.value.code == "file_not_found" and ei.value.text("en").startswith("File not found: ")
+    # warnings: the instance warnings.warn creates carries the message
+    idx = pd.bdate_range("2024-01-01", periods=60)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        prepare(pd.Series(np.arange(60.0) + 100, index=idx, name="v"))
+        prepare(pd.Series([1.0, 2.0, 3.0, 4.0], index=pd.to_datetime(
+            ["2024-01-01", "2024-01-01", "2024-02-01", "2024-03-01"]), name="d"))
+    codes = {x.message.code: x.message for x in w if isinstance(x.message, DataWarning)}
+    assert {"weekday_only", "duplicates_merged"} <= set(codes)
+    assert str(codes["weekday_only"]).startswith("'v': 평일(영업일)에만 값이 있는 데이터입니다.")
+    assert codes["duplicates_merged"].text("en").startswith("'d': several values fell in the same month period "
+                                                           "and were averaged")
+    p = tmp_path / "rows.csv"
+    p.write_text("id,date,value\n" + "".join(f"{i},2024-{i:02d}-01,{10 + i * 1.5}\n" for i in range(1, 13)))
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        load_table(p)
+    notice = next(x.message for x in w if isinstance(x.message, DataNotice))
+    assert notice.code == "rownum_cols_skipped" and notice.params == {"cols": ["id"]}
+    assert notice.text("en") == ("The column(s) ['id'] look like row numbers and were left out (name them with "
+                                 "--value-col to include them).")
+    # parse_dates' note is a catalog message too (ambiguous day/month order + unreadable rows)
+    _, label, note = parse_dates(pd.Series(["01/02/2024", "03/04/2024", "05/06/2024", "07/08/2024", "foo"],
+                                           dtype=object))
+    assert [c for c, _ in note.parts] == ["date_order_ambiguous", "dates_unreadable_rows"]
+    assert str(note).startswith("날짜의 일/월 순서가 모호해") and not _HANGUL.search(note.text("en"))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
+import re
 import types
 
 import numpy as np
@@ -340,3 +341,20 @@ def test_google_trends_keeps_keyword_column_and_drops_nan(monkeypatch):
     s = fetch_google_trends(" python ")
     assert s.name == "python"
     assert s.tolist() == [5.0, 7.0]
+
+
+def test_connector_errors_are_catalog_messages():
+    """R5-REV-5: ConnectorError texts were free Korean text, printed as such under --lang en."""
+    with pytest.raises(ConnectorError) as ei:
+        wikipedia_pageviews_url("Foo", start="2024-13-01")
+    assert ei.value.code == "conn_date_invalid"
+    assert str(ei.value) == "start 날짜가 유효하지 않습니다: '2024-13-01'"          # Korean unchanged
+    assert ei.value.text("en") == "The start date is not a valid date: '2024-13-01'"
+    with pytest.raises(ConnectorError) as ei:
+        wikipedia_pageviews_url("Foo", start="2024-05-01", end="2024-01-01", granularity="daily")
+    assert ei.value.code == "conn_start_after_end"
+    assert ei.value.text("en") == "The start date (2024-05-01) is after the end date (2024-01-01)."
+    with pytest.raises(ConnectorError) as ei:
+        fetch_wikipedia_pageviews("Foo", session=types.SimpleNamespace(
+            get=lambda url, **kw: FakeResponse(status_code=404)))
+    assert "article not found" in ei.value.text("en") and not re.search("[가-힣]", ei.value.text("en"))

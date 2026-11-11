@@ -1461,7 +1461,10 @@ def test_intermittent_models_are_labelled():
     assert "간헐 수요 Croston(SBA 보정)" in html_text
     assert "제곱 오차(RMSE)" in html_text
     text = R.render_text(rep, width=100)
-    assert "상위 모델(RMSE):  ses 2.20  sba 2.28  theta 2.30" in text
+    # V1-13: readable names with the id merged into the name's own parenthesis (no raw ids alone)
+    flat = re.sub(r"\s+", " ", text[text.index("상위 모델(RMSE)"):])
+    assert flat.startswith("상위 모델(RMSE): 단순 지수평활(ses) 2.20 간헐 수요 Croston(SBA 보정; sba) 2.28 "
+                           "Theta 방법(theta) 2.30")
     # ordinary series: unchanged
     plain = build_report(np.linspace(10, 20, 36))
     assert "RMSE" not in R.render_html(plain) + R.render_text(plain, width=100)
@@ -1541,7 +1544,7 @@ def test_flat_outlook_crossing_zero_is_direction_uncertain_with_its_levels():
 @pytest.mark.parametrize("case,short", [
     ("mostly_zero", "최근 12개월 중 절반 이상이 0"),
     ("near_zero", "현재 수준이 0에 가까움"),
-    ("zero", "현재 수준이 0에 가까움"),
+    ("zero", "현재 수준이 0"),   # R5-REV-2: the current level is exactly 0 (the narrative's "현재 수준이 0이라")
 ])
 def test_missing_expected_change_is_explained(case, short):
     """D4: KPI '예측 변화' shows '—' with the reason of forecast.outlook_levels (never a bare dash)."""
@@ -1559,7 +1562,7 @@ def test_missing_expected_change_is_explained(case, short):
 
     assert outlook_levels(rep.analysis, rep.forecast).undefined == case
     _, sub = _kpi_tile(R.render_html(rep), "예측 변화")
-    assert sub.startswith(short)
+    assert sub.split(" · ")[0] == short
     assert f"예측 변화 — ({short})" in R.render_text(rep, width=120)
 
 
@@ -1749,8 +1752,11 @@ def test_zero_crossing_history_shows_no_meaningless_percentages():
     assert "※ 전체 변화·CAGR: 0을 지나 음수로 바뀌어 변화율 없음" in text
     own = page.replace(_card(page, "AI 트렌드 해석"), "")                 # the page's own tiles and cards
     assert not re.search(r"−1\d\d\.\d%", own + text)
-    tdd = R._trend_drawdown(rep, R._ChartData(rep))
-    assert tdd is None                                                   # the trend crossed zero too
+    # the trend crossed zero too (round 5: the report's mirrored _trend_drawdown was replaced by the
+    # narrative's one rule, narrative.seasonal_trend_drawdown / _trend_drawdown)
+    from trendai import narrative as N
+    assert N._trend_drawdown(rep.analysis) is None
+    assert R._seasonal_trend_drawdown(rep, R._ChartData(rep)) is None
 
 
 def test_zero_crossing_outlook_names_its_levels_like_the_narrative():
@@ -2006,3 +2012,159 @@ def test_terminal_summary_in_english_has_no_hangul():
         assert "…" not in text and f"— · {why}" in text
         joined = " ".join(ln.strip() for ln in text.splitlines())
         assert describe_method(rep.forecast, lang) in joined
+
+
+# --------------------------------------------------------------------------- round 5
+
+
+def sample(*a, **kw):
+    from trendai.samples import sample as _sample
+
+    return _sample(*a, **kw)
+
+
+def _run_quiet(series, **kw) -> TrendReport:
+    import warnings
+
+    from trendai.pipeline import run
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return run(series, **kw)
+
+
+def test_negative_current_level_reads_as_levels_on_every_surface():
+    """G1: the page and the terminal printed the outlook's −32.0 % from a negative current level;
+    now '—' with the reason (현재 수준이 음수) and the two levels, like the narrative."""
+    from trendai.forecast import outlook_levels
+
+    rng = np.random.default_rng(1)
+    t = np.arange(120)
+    s = pd.Series(50 - 80 * t / 119 + rng.normal(0, 4, 120),
+                  index=pd.date_range("2016-01-01", periods=120, freq="MS"), name="P&L")
+    rep = _run_quiet(s, name="P&L")
+    lv = outlook_levels(rep.analysis, rep.forecast)
+    assert lv.undefined == "negative"
+    cur, fut = R._fmt_num(lv.current, signed=True), R._fmt_num(lv.future, signed=True)
+    page, text = R.render_html(rep), R.render_text(rep, width=100)
+    val, sub = _kpi_tile(page, "예측 변화")
+    assert re.sub("<[^>]+>", "", val).strip("▼ ") == "—"
+    assert sub == f"현재 수준이 음수 · 최근 12개월 평균 {cur} → 향후 12개월 평균 {fut}"
+    assert "예측 변화 — (현재 수준이 음수)" in text and f"최근 12개월 평균 {cur} → 향후 12개월 평균 {fut}" in text
+    card = _card(page, "미래 전망")
+    assert "현재 수준이 음수여서 변화율(%) 대신 수준으로 비교합니다." in card
+    own = page.replace(_card(page, "AI 트렌드 해석"), "")
+    assert not re.search(r"[+−]\d[\d,.]*% 예상", own) and "−32.0%" not in own + text
+    en = R.render_text(rep, width=100, lang="en")
+    assert "Exp. change — (current level is negative)" in en
+
+
+def test_intermittent_outlook_levels_are_named_average_demand():
+    """G2: the terminal, the KPI tile and the outlook card name intermittent demand's outlook levels
+    as average demand (the % compares them), as the narrative does."""
+    rng = np.random.default_rng(3)
+    y = (rng.random(60) < 0.6) * rng.integers(1, 20, 60).astype(float)
+    rep = _run_quiet(pd.Series(y, index=pd.date_range("2020-01-01", periods=60, freq="MS")), name="parts")
+    assert rep.outlook.expected_change_pct is not None
+    page, text = R.render_html(rep), R.render_text(rep, width=100)
+    assert "(향후 12개월 평균 수요량, 최근 12개월 평균 수요량 대비)" in text
+    _, sub = _kpi_tile(page, "예측 변화")
+    assert sub.startswith('향후 12개월 평균 수요량 · <span class="nw">최근 12개월 평균 수요량 대비</span>')
+    assert "변화율과 상승 확률은 모두 향후 12개월 평균 수요량을 최근 12개월 평균 수요량과 비교한 값입니다." in page
+    assert "(next 12-month avg demand vs last 12-month avg demand)" in R.render_text(rep, width=100, lang="en")
+    # ordinary series: unchanged
+    plain = R.render_text(_run_quiet(from_values(np.linspace(10, 20, 36), freq="M"), name="p"), width=100)
+    assert "수요량" not in plain and "(향후 12개월 평균, 최근 12개월 평균 대비)" in plain
+
+
+def test_all_zero_history_has_no_floor_or_peak_wording():
+    """G3: an all-zero history showed '0(하한)' scenarios, the narrative's floor note, '현재 최고 수준'
+    and '추세 0 → 0 · 시작 수준이 0에 가까워 …' -- nothing has been observed yet."""
+    rep = _run_quiet(from_values(np.zeros(36), start="2023-01-01", freq="M"), name="zero")
+    page, text = R.render_html(rep), R.render_text(rep, width=100)
+    assert "비관 0  기준 0  낙관 0" in text and "하한" not in text
+    assert "하한" not in page.replace(_card(page, "AI 트렌드 해석"), "")
+    assert _kpi_tile(page, "현재 값")[1].endswith("관측 기간 내내 0")
+    assert _kpi_tile(page, "전체 변화")[1] == "관측 기간 내내 0"
+    assert "※ 전체 변화·CAGR·최근 변화: 관측값이 모두 0이라 변화율 없음" in text
+    assert "예측 변화 — (관측값이 모두 0)" in text
+    assert "현재 최고 수준" not in page
+
+
+def test_english_top_models_line_names_the_models():
+    """G6: 'Top models (MASE): logistic_growth 0.16 …' printed raw ids in the English summary."""
+    rep = _run_quiet(sample("emerging"), name="emerging", lang="en")
+    en = R.render_text(rep, lang="en")
+    top = en[en.index("Top models"):]
+    best = rep.forecast.model_scores[0].name
+    assert f"{R._model_label(best, 'en')} ({best})" in top
+    ko = R.render_text(rep)
+    # V1-13: Korean has the same shape (readable name + id), not the raw id list
+    assert f"상위 모델(MASE):  {R._model_label(best, 'ko')}({best}) " in ko
+
+
+def test_compare_page_marks_a_tentative_phase():
+    """G6 (round-4 F3): the compare table showed a bare '안정기' for a 5-point series."""
+    short = _run_quiet(pd.Series([10.0, 10.6, 11.1, 12.4, 12.9],
+                                 index=pd.date_range("2021-01-01", periods=5, freq="YS")), name="short")
+    long = _run_quiet(sample("growing"), name="growing")
+    page = R.render_compare_html([short, long], _ranking([short, long]))
+    table = page[page.index("<table"):page.index("</table>")]
+    row = next(r for r in table.split("<tr>") if ">short<" in r)
+    assert "잠정" in row
+    assert "잠정" not in next(r for r in table.split("<tr>") if ">growing<" in r)
+
+
+# --------------------------------------------------------------------------- round 5, verify 1
+
+
+def _intermittent_parts() -> pd.Series:
+    r = np.random.default_rng(3)
+    y = np.where(r.random(48) < 0.5, 0, r.poisson(4, 48)).astype(float)
+    return pd.Series(y, pd.date_range("2020-01-01", periods=48, freq="MS"))
+
+
+def test_top_models_line_wraps_with_an_indent_and_no_nested_parentheses():
+    """R5-REV-7 / V1-13: the English 'Top models' line wrapped with no indent and read
+    'past analogues (kNN) (analog_knn)' / 'naive (last value) (naive)'; Korean printed raw ids."""
+    rep = _run_quiet(_intermittent_parts(), name="parts")
+    for lang in ("en", "ko"):
+        lines = R.render_text(rep, lang=lang).splitlines()
+        i = next(k for k, ln in enumerate(lines) if ln.startswith(("Top models", "상위 모델")))
+        block = [lines[i]] + [ln for ln in lines[i + 1:] if ln.startswith("  ")]
+        assert i + 1 < len(lines) and not lines[i + 1].startswith("═") and lines[i + 1].startswith("  ")
+        text = " ".join(block)
+        assert ") (" not in text and ")(" not in text, text
+    assert R._model_seg("analog_knn", 2.149, "en") == "past analogues (kNN; analog_knn) 2.15"
+    assert R._model_seg("analog_knn", 2.149, "ko") == "과거 유사 패턴(kNN; analog_knn) 2.15"
+    assert R._model_seg("naive", 0.0, "en") == "naive (last value; naive) 0.00"
+    assert R._model_seg("logistic_growth", 1.34, "ko") == "로지스틱 S-커브(logistic_growth) 1.34"
+
+
+def test_terminal_and_page_leave_out_rates_of_an_undefined_level():
+    """V1-3 / V1-7: momentum '+20.01%p/월' and volatility '0.0%' of intermittent / all-zero / negative
+    levels in render_text and the diagnosis card; each '—' gets its reason."""
+    t = np.arange(60)
+    loss = pd.Series(-20 - 60 * t / 59 + np.random.default_rng(1).normal(0, 2, 60),
+                     index=pd.date_range("2021-01-01", periods=60, freq="MS"))
+    rep = _run_quiet(loss, name="loss")
+    text = R.render_text(rep, width=120)
+    assert "모멘텀 —" in text and "변동성 —" in text and "%p/" not in text
+    assert "※ 모멘텀·변동성: 평균 수준이 음수여서 %로 나타내지 않음" in text
+    en = R.render_text(rep, width=120, lang="en")
+    assert "※ Momentum, Volatility: the mean level is negative, so not given in %" in en
+    card = _card(R.render_html(rep), "현재 진단")
+    assert "모멘텀</abbr></dt><dd>—<span" in card and "변동성</dt><dd>—<span" in card
+    assert "평균 수준이 음수여서 %로 나타내지 않음" in card
+    # an ordinary series keeps both numbers
+    plain = R.render_text(_run_quiet(loss * -1 + 200, name="up"), width=120)
+    assert "%p/월" in plain and "변동성 —" not in plain
+
+
+def test_current_value_tile_of_a_count_at_zero_names_the_peak():
+    """V1-9: '최고점 대비 −100.0%' on the current-value tile of a count whose latest value is 0."""
+    y = (np.random.default_rng(2).poisson(3, 60) + 1).astype(float)
+    y[-1] = 0.0
+    rep = _run_quiet(pd.Series(y, index=pd.date_range("2021-01-01", periods=60, freq="MS")), name="count")
+    _, sub = _kpi_tile(R.render_html(rep), "현재 값")
+    assert "−100" not in sub and re.search(r"최고 [\d.,]+ \(\d{4}-\d{2}", sub), sub

@@ -13,9 +13,11 @@ Examples::
 
 Exit codes: 0 success, 1 runtime failure (network, Claude, unexpected error),
 2 input error (bad file / data / arguments).  Data notes and warnings are
-printed to stderr as single ``안내:`` / ``경고:`` lines (the CLI's own notes and
-errors follow ``--lang``: ``Note:`` / ``Error:``).  ``--json`` is written before
-``--html``, so a rendering problem never loses the JSON result.
+printed to stderr as single ``안내:`` / ``경고:`` lines -- ``Note:`` / ``Warning:``
+with ``--lang en``, where the data layer's messages (``DataError`` /
+``DataWarning`` / ``DataNotice``, the catalog of :mod:`trendai.messages`) are
+rendered in English too, like the CLI's own notes and errors.  ``--json`` is
+written before ``--html``, so a rendering problem never loses the JSON result.
 """
 
 from __future__ import annotations
@@ -33,12 +35,13 @@ import pandas as pd
 
 from . import __version__
 from .data import DataError, DataNotice, load_table
+from .messages import format_label, localise, msg
 from .types import TrendReport
 
 FREQ_CHOICES = ["D", "W", "M", "Q", "Y"]
 
-# CLI chrome per language (the terminal summary follows --lang too; the HTML reports are Korean).  Messages
-# that quote the data module (DataError / DataWarning texts) keep its Korean wording.
+# CLI chrome per language (the terminal summary follows --lang too; the HTML reports are Korean).  The data
+# module's messages (DataError / DataWarning / DataNotice) are rendered in the same language (messages.localise).
 _MSG: dict[str, dict[str, str]] = {
     "ko": {
         "synthetic": "※ 합성(가상) 샘플 데이터입니다 — 실제 데이터가 아닙니다.",
@@ -59,6 +62,9 @@ _MSG: dict[str, dict[str, str]] = {
         "rank_basis_partial": "(예측 기간이 한 주기보다 짧으면 예측 기간 전체를 계절 보정한 평균)",
         "rank_basis_yearly": " 연 단위 데이터는 마지막 예측값을 최근 값과 비교합니다.",
         "rank_basis_only_yearly": "※ 예측 변화와 상승확률은 마지막 예측값을 최근 값과 비교한 값입니다.",
+        # why a row shows "—" (report._change_undefined: the terminal summary's own reason text)
+        "rank_undefined": "※ {cols} — ({why}): {names}",
+        "rank_undefined_prob": "예측 변화·상승확률",
         "narr_hidden": ("※ 시계열이 여러 개라 개별 해석문은 생략했습니다 — HTML(--html)·JSON(--json) "
                         "리포트 또는 --value-col 로 하나씩 실행해 확인하세요."),
         "html_one": "HTML 리포트 저장: {path}",
@@ -77,6 +83,13 @@ _MSG: dict[str, dict[str, str]] = {
         "interrupted": "중단되었습니다.",
         "unexpected": ("오류: 예기치 못한 문제가 발생했습니다 ({kind}: {exc}). "
                        "자세한 내용은 TRENDAI_DEBUG=1 로 다시 실행해 확인하세요."),
+        "warn_notice": "안내",
+        "warn_warning": "경고",
+        "wiki_series": "{article} (위키백과 조회수)",
+        "arg_int": "{what}은(는) 정수여야 합니다: {text!r}",
+        "arg_min": "{what}은(는) {lo} 이상이어야 합니다: {v}",
+        "what_horizon": "예측 기간",
+        "what_n": "관측치 수(--n)",
     },
     "en": {
         "synthetic": "※ Synthetic sample data — not real data.",
@@ -94,13 +107,15 @@ _MSG: dict[str, dict[str, str]] = {
         "rank_basis_yearly": " For yearly data they compare the last forecast value with the latest observation.",
         "rank_basis_only_yearly": ("※ Exp. change and P(up) compare the last forecast value with the latest "
                                    "observation."),
+        "rank_undefined": "※ {cols} — ({why}): {names}",
+        "rank_undefined_prob": "Exp. change, P(up)",
         "narr_hidden": ("※ Several series: individual narratives are not printed — see the HTML (--html) / "
                         "JSON (--json) output or run one column at a time with --value-col."),
         "html_one": "HTML report saved: {path}",
         "html_many": "HTML comparison saved: {path} (+ {n} individual reports)",
         "json": "JSON saved: {path}",
         "none_ok": "Error: no series could be analysed.",
-        "columns": "Note: {file} — date column '{date_col}' (format: {date_format}), {n} value columns: {names}",
+        "columns": "Note: {file} — date column '{date_col}' (format: {date_format}), {n} value column{s}: {names}",
         "first_col": "Note: using only the first column '{name}' of several (choose one with --value-col).",
         "ask_failed": "Error: cannot ask Claude — {exc}",
         "error": "Error: {exc}",
@@ -112,6 +127,13 @@ _MSG: dict[str, dict[str, str]] = {
         "interrupted": "Interrupted.",
         "unexpected": ("Error: unexpected problem ({kind}: {exc}). "
                        "Run again with TRENDAI_DEBUG=1 for details."),
+        "warn_notice": "Note",
+        "warn_warning": "Warning",
+        "wiki_series": "{article} (Wikipedia page views)",
+        "arg_int": "{what} must be an integer: {text!r}",
+        "arg_min": "{what} must be at least {lo}: {v}",
+        "what_horizon": "the forecast horizon",
+        "what_n": "the number of observations (--n)",
     },
 }
 
@@ -170,13 +192,18 @@ def _setup_stdout() -> None:
 
 
 _SEEN_WARNINGS: set[str] = set()
+#: language of the warning lines (set from --lang by main(); the warnings hook has no args)
+_LANG = "ko"
 
 
 def _show_warning(message: Any, category: type, filename: str, lineno: int, file: Any = None,
                   line: Optional[str] = None) -> None:
-    """Print warnings as one clean line (no file path / source line), each text once per run."""
-    prefix = "안내" if issubclass(category, DataNotice) else "경고"
-    text = f"{prefix}: {message}"
+    """Print warnings as one clean line (no file path / source line), each text once per run.
+
+    ``안내:`` / ``경고:`` (``Note:`` / ``Warning:`` with ``--lang en``); a catalog message of the
+    data layer is rendered in that language (:func:`trendai.messages.localise`)."""
+    prefix = _t(_LANG, "warn_notice" if issubclass(category, DataNotice) else "warn_warning")
+    text = f"{prefix}: {localise(message, _LANG)}"
     if text in _SEEN_WARNINGS:
         return
     _SEEN_WARNINGS.add(text)
@@ -199,19 +226,21 @@ def _install_warning_filters() -> None:
 
 
 def _int_at_least(lo: int, what: str) -> Callable[[str], int]:
+    """argparse type: an integer >= ``lo``; ``what`` is a ``_MSG`` key naming the option (the
+    message follows --lang, read from the command line before parsing, see :func:`main`)."""
     def conv(text: str) -> int:
         try:
             v = int(text)
         except (TypeError, ValueError):
-            raise argparse.ArgumentTypeError(f"{what}은(는) 정수여야 합니다: {text!r}") from None
+            raise argparse.ArgumentTypeError(_t(_LANG, "arg_int", what=_t(_LANG, what), text=text)) from None
         if v < lo:
-            raise argparse.ArgumentTypeError(f"{what}은(는) {lo} 이상이어야 합니다: {v}")
+            raise argparse.ArgumentTypeError(_t(_LANG, "arg_min", what=_t(_LANG, what), lo=lo, v=v))
         return v
     return conv
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--horizon", "-H", type=_int_at_least(1, "예측 기간"), default=None,
+    p.add_argument("--horizon", "-H", type=_int_at_least(1, "what_horizon"), default=None,
                    help="예측 기간(주기 수, 1 이상). 기본: 약 1년/1주기")
     p.add_argument("--freq", choices=FREQ_CHOICES, default=None,
                    help="데이터 주기 강제 지정 (D/W/M/Q/Y). 기본: 자동 감지")
@@ -233,7 +262,7 @@ def _run_kwargs(args: argparse.Namespace) -> dict:
 def _ensure_parent(path: str) -> Path:
     p = Path(path)
     if p.is_dir():
-        raise DataError(f"저장 경로가 폴더입니다. 파일 이름까지 지정하세요: {p}")
+        raise DataError(msg("save_path_is_dir", path=str(p)))
     if p.parent and not p.parent.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
     return p
@@ -269,17 +298,10 @@ def _pad(s: Any, width: int, align: str = "<") -> str:
 
 
 def _fmt_pct(x: Any) -> str:
-    """``+12.3%`` / ``−4.0%`` (typographic minus, like the reports); ``—`` when missing."""
-    try:
-        v = float(x)
-    except (TypeError, ValueError):
-        return "—"
-    if v != v or v in (float("inf"), float("-inf")):
-        return "—"
-    body = f"{abs(v):,.0f}" if abs(v) >= 1000 else f"{abs(v):.1f}"
-    if body.strip("0.,") == "":
-        return body + "%"
-    return ("−" if v < 0 else "+") + body + "%"
+    """``+12.3%`` / ``−4.0%`` exactly as the reports print it (``report._fmt_pct``); ``—`` when missing."""
+    from .report import _fmt_pct as fmt
+
+    return fmt(x)
 
 
 def _fmt_prob(p: Any) -> str:
@@ -310,14 +332,17 @@ def _span(h: Any, freq: Any, lang: str) -> str:
 
 
 def _format_ranking(df: pd.DataFrame, lang: str = "ko",
-                    horizons: Optional[dict[str, int]] = None) -> str:
+                    horizons: Optional[dict[str, int]] = None,
+                    tentative: Optional[Sequence[str]] = None) -> str:
     """Ranking table aligned by display width (Korean names/phases count double).
 
     The expected change is shown as reported (``expected_change_pct``), always
     with its forecast horizon: in the header when every series shares it
     (``예측 변화(12개월)``), otherwise in a ``기간`` column next to the value, so a
     30-day change of a daily series is never read as a 12-month one.
-    ``horizons`` maps a series name to its number of forecast steps.
+    ``horizons`` maps a series name to its number of forecast steps; the phases
+    of the series named in ``tentative`` (too few observations for a lifecycle
+    verdict, :func:`narrative.phase_is_tentative`) are marked ``·잠정`` / ``(tentative)``.
     """
     msg = _MSG.get(lang, _MSG["ko"])
     horizons = horizons or {}
@@ -326,7 +351,9 @@ def _format_ranking(df: pd.DataFrame, lang: str = "ko",
     spans = [_span(horizons.get(nm), fq, lang) for nm, fq in zip(names, freqs)]
     shared = spans[0] if spans and len(set(spans)) == 1 else None
     name_w = min(28, max([_dw(n) for n in names] + [4]))
-    phases = [str(p) for p in (df["phase_ko"] if lang == "ko" else df["phase"])]
+    marked = {str(n) for n in (tentative or ())}
+    phases = [str(p) + ((" (tentative)" if lang == "en" else "·잠정") if nm in marked else "")
+              for p, nm in zip(df["phase_ko"] if lang == "ko" else df["phase"], names)]
     phase_w = max([_dw(p) for p in phases] + [4])
     exp_head = msg["rank_cols_span"].format(cols=msg["rank_cols"], span=shared) if shared else msg["rank_cols"]
     exps = [_fmt_pct(v) for v in df["expected_change_pct"]]
@@ -373,6 +400,26 @@ def _rank_basis(reports: Any, lang: str = "ko") -> str:
         return _t(lang, "rank_basis_only_yearly")
     text = _t(lang, "rank_basis", partial=_t(lang, "rank_basis_partial") if partial else "")
     return text + (_t(lang, "rank_basis_yearly") if yearly else "")
+
+
+def _rank_undefined_notes(reports: Any, lang: str = "ko") -> list[str]:
+    """One note per reason a ranked series shows ``—`` as its expected change (``※ 예측 변화 —
+    (현재 수준이 음수): loss``), worded as the series' own terminal summary words it
+    (``report._change_undefined``); an all-zero history also has no ``상승확률``."""
+    from .narrative import prob_undefined
+    from .report import _change_undefined_short
+
+    groups: dict[tuple[str, bool], list[str]] = {}
+    for rep in reports:
+        why = _change_undefined_short(rep, lang)
+        if why:
+            no_prob = prob_undefined(rep.analysis) is not None
+            groups.setdefault((why, no_prob), []).append(str(rep.name))
+    out = []
+    for (why, no_prob), names in groups.items():
+        cols = _t(lang, "rank_undefined_prob") if no_prob else _t(lang, "rank_cols")
+        out.append(_t(lang, "rank_undefined", cols=cols, why=why, names=", ".join(names)))
+    return out
 
 
 def _unique_slugs(names: Sequence[str]) -> dict[str, str]:
@@ -438,9 +485,14 @@ def _emit(reports: dict[str, TrendReport], args: argparse.Namespace, fail_code: 
     ranking = None
     if many:
         ranking = rank_trends(reports)
+        from .narrative import phase_is_tentative
+
         horizons = {str(rep.name): len(rep.forecast.mean) for rep in reports.values()}
-        _say(_format_ranking(ranking, getattr(args, "lang", "ko"), horizons))
+        tentative = [str(rep.name) for rep in reports.values() if phase_is_tentative(rep.analysis)]
+        _say(_format_ranking(ranking, getattr(args, "lang", "ko"), horizons, tentative))
         _say(_rank_basis(reports.values(), getattr(args, "lang", "ko")))
+        for note in _rank_undefined_notes(reports.values(), getattr(args, "lang", "ko")):
+            _say(note)
         if ranking["freq"].nunique() > 1:
             _say(_t(args, "mixed_freq"))
         if not args.quiet:
@@ -481,8 +533,13 @@ def _load(path: str, date_col: Optional[str], value_cols: Optional[list[str]],
     info = next(iter(series.values())).attrs.get("trendai", {}) if series else {}
     if info:
         names = ", ".join(list(series)[:6]) + (" …" if len(series) > 6 else "")
-        _err(_t(lang, "columns", file=Path(path).name, date_col=info.get("date_col"),
-                date_format=info.get("date_format"), n=len(series), names=names))
+        # the format label and the wide-table placeholder are the data module's words: in --lang
+        date_col = info.get("date_col")
+        if date_col == "(열 머리글)":
+            date_col = format_label(date_col, lang)
+        _err(_t(lang, "columns", file=Path(path).name, date_col=date_col,
+                date_format=format_label(info.get("date_format"), lang), n=len(series), names=names,
+                s="" if len(series) == 1 else "s"))
     return series
 
 
@@ -536,10 +593,10 @@ def cmd_wiki(args: argparse.Namespace) -> int:
         try:
             s = fetch_wikipedia_pageviews(article, lang=args.wiki_lang, start=args.start, end=args.end,
                                           granularity=args.granularity)
-        except ConnectorError as exc:
-            _err(_t(args, "error", exc=exc))
+        except ConnectorError as exc:   # a catalog message: rendered in --lang
+            _err(_t(args, "error", exc=localise(exc, args.lang)))
             return 1
-        series[f"{article} (위키백과 조회수)"] = s
+        series[_t(args, "wiki_series", article=article)] = s
     reports, code = _analyse(series, args)
     return _emit(reports, args, fail_code=code)
 
@@ -551,8 +608,8 @@ def cmd_trends(args: argparse.Namespace) -> int:
     for kw in args.keyword:
         try:
             series[f"{kw} (Google Trends)"] = fetch_google_trends(kw, timeframe=args.timeframe, geo=args.geo)
-        except ConnectorError as exc:
-            _err(_t(args, "error", exc=exc))
+        except ConnectorError as exc:   # a catalog message: rendered in --lang
+            _err(_t(args, "error", exc=localise(exc, args.lang)))
             return 1
     reports, code = _analyse(series, args)
     return _emit(reports, args, fail_code=code)
@@ -623,7 +680,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("sample", help="내장 합성 샘플로 데모 실행 (all = 전체 비교)")
     s.add_argument("name", nargs="?", default="emerging")
-    s.add_argument("--n", type=_int_at_least(8, "관측치 수(--n)"), default=120, help="관측치 수 (8 이상)")
+    s.add_argument("--n", type=_int_at_least(8, "what_n"), default=120, help="관측치 수 (8 이상)")
     s.add_argument("--seed", type=int, default=0)
     _add_common(s)
     s.set_defaults(func=cmd_sample)
@@ -660,7 +717,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("question")
     q.add_argument("--date-col", default=None)
     q.add_argument("--value-col", action="append", default=None)
-    q.add_argument("--horizon", "-H", type=_int_at_least(1, "예측 기간"), default=None)
+    q.add_argument("--horizon", "-H", type=_int_at_least(1, "what_horizon"), default=None)
     q.add_argument("--freq", choices=FREQ_CHOICES, default=None)
     q.add_argument("--model", default="claude-opus-5-5")
     q.add_argument("--lang", choices=["ko", "en"], default="ko")
@@ -670,11 +727,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Entry point of ``python -m trendai`` / ``trendai``. Returns the exit code."""
+    global _LANG
     _setup_stdout()
     _Out.broken = False
     _SEEN_WARNINGS.clear()
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    # --lang decides the language of argparse type errors too, so read it before parsing
+    _LANG = "ko"
+    for i, a in enumerate(argv_list):
+        if a == "--lang" and i + 1 < len(argv_list) and argv_list[i + 1] in ("ko", "en"):
+            _LANG = argv_list[i + 1]
+        elif a in ("--lang=en", "--lang=ko"):
+            _LANG = a.split("=", 1)[1]
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv_list)
+    _LANG = getattr(args, "lang", _LANG) or "ko"
     if not getattr(args, "command", None):
         parser.print_help()
         return 0
@@ -683,7 +750,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _install_warning_filters()
             return int(args.func(args) or 0)
     except DataError as exc:
-        _err(_t(args, "data_error", exc=exc))
+        _err(_t(args, "data_error", exc=localise(exc, getattr(args, "lang", "ko"))))
         return 2
     except FileNotFoundError as exc:
         _err(_t(args, "not_found", exc=exc))

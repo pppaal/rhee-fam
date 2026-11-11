@@ -20,7 +20,8 @@ from pandas.errors import OutOfBoundsDatetime
 from .analysis import analyze
 from .data import DataError, DataWarning, default_horizon, future_index, prepare
 from .forecast import auto_forecast, compute_outlook, is_random_walk, outlook_levels
-from .narrative import direction_label, generate_narrative
+from .messages import Localised, Msg, msg
+from .narrative import direction_label, generate_narrative, prob_undefined
 from .types import PHASE_KO, TrendReport
 
 DEFAULT_LLM_MODEL = "claude-opus-5-5"
@@ -50,7 +51,7 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
     (:func:`trendai.forecast.is_random_walk`), so trend-extrapolating models
     are not offered there.
 
-    Raises :class:`trendai.data.DataError` (Korean message) when the input
+    Raises :class:`trendai.data.DataError` (Korean message; ``.text('en')`` in English) when the input
     cannot be used (no date index, fewer than 2 observations, a horizon that
     is not a whole number >= 1 (``inf`` and ``nan`` included), ``horizon >
     MAX_HORIZON`` or forecast dates beyond pandas' datetime range).
@@ -62,12 +63,11 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
         try:
             h_int = int(horizon)
         except (TypeError, ValueError, OverflowError):
-            raise DataError(f"예측 기간(horizon)은 정수여야 합니다: {horizon!r}") from None
+            raise DataError(msg("horizon_not_int", value=horizon)) from None
         if h_int != horizon or h_int < 1:
-            raise DataError(f"예측 기간(horizon)은 1 이상의 정수여야 합니다: {horizon!r}")
+            raise DataError(msg("horizon_not_positive", value=horizon))
         if h_int > MAX_HORIZON:
-            raise DataError(f"예측 기간(horizon)이 너무 깁니다: {h_int:,}기간 "
-                            f"(최대 {MAX_HORIZON:,}기간까지 지원합니다).")
+            raise DataError(msg("horizon_too_long", horizon=h_int, max=MAX_HORIZON))
         horizon = h_int
     s, f = prepare(series, freq=freq, name=name)
     if horizon is None:
@@ -100,17 +100,19 @@ def _check_horizon(s: pd.Series, freq: str, horizon: int) -> None:
     except (OutOfBoundsDatetime, OverflowError, ValueError):
         end = None
     if end is None or pd.isna(end):
-        raise DataError(f"예측 기간(horizon) {horizon:,}기간은 날짜로 표현할 수 있는 범위를 넘습니다. "
-                        f"예측 기간을 줄여 주세요.")
+        raise DataError(msg("horizon_out_of_range", horizon=horizon))
     n = len(s)
     if horizon > _LONG_HORIZON_RATIO * n:
-        warnings.warn(f"예측 기간({horizon:,}기간)이 데이터 길이({n:,}개)의 {_LONG_HORIZON_RATIO}배를 "
-                      f"넘습니다. 이렇게 먼 미래는 과거 패턴만으로 추정하기 어려워 불확실성이 매우 큽니다.",
+        warnings.warn(msg("horizon_long", horizon=horizon, n=n, ratio=_LONG_HORIZON_RATIO),
                       DataWarning, stacklevel=3)
 
 
-class SeriesFailedWarning(UserWarning):
-    """A series in :func:`run_many` could not be analysed and was skipped."""
+class SeriesFailedWarning(Localised, UserWarning):
+    """A series in :func:`run_many` could not be analysed and was skipped.
+
+    Its message is a catalog message (``code`` ``'series_failed'``; the reason of a
+    :class:`~trendai.data.DataError` is nested in ``params['detail']``), so
+    ``text('en')`` renders it in English; ``str()`` is Korean."""
 
 
 def run_many(series_map: Mapping[str, pd.Series], errors: Optional[dict[str, Exception]] = None,
@@ -129,12 +131,25 @@ def run_many(series_map: Mapping[str, pd.Series], errors: Optional[dict[str, Exc
         except Exception as exc:  # noqa: BLE001 - batch mode must keep going
             if errors is not None:
                 errors[str(nm)] = exc
-            detail = str(exc) if isinstance(exc, DataError) else f"{type(exc).__name__}: {exc}"
-            prefix = f"'{nm}': "
-            if detail.startswith(prefix):
-                detail = detail[len(prefix):]
-            warnings.warn(f"'{nm}' 분석 실패 — {detail}", SeriesFailedWarning, stacklevel=2)
+            warnings.warn(msg("series_failed", series=str(nm), detail=_failure_detail(exc, nm)),
+                          SeriesFailedWarning, stacklevel=2)
     return out
+
+
+def _failure_detail(exc: BaseException, name: Any) -> Any:
+    """The reason a series failed, without its own ``'name': `` prefix (the warning names it):
+    the :class:`~trendai.messages.Msg` of a catalog :class:`DataError` (so it renders in the
+    warning's language), else ``'<ExceptionType>: <text>'``."""
+    prefix = f"'{name}': "
+    if isinstance(exc, DataError):
+        m = exc.args[0] if len(exc.args) == 1 else None
+        if isinstance(m, Msg):
+            parts = [(c, {**p, "name": ""} if p.get("name") == prefix else p) for c, p in m.parts]
+            return Msg(parts)
+        detail = str(exc)
+    else:
+        detail = f"{type(exc).__name__}: {exc}"
+    return detail[len(prefix):] if detail.startswith(prefix) else detail
 
 
 # --------------------------------------------------------------------------- JSON export
@@ -190,7 +205,12 @@ def _outlook_extras(report: TrendReport) -> dict[str, Any]:
     * ``expected_change_undefined``: why ``expected_change_pct`` is ``None``
       (``forecast.outlook_levels(...).undefined``), ``None`` when it is a number;
     * ``compared_levels``: ``{'current', 'future'}``, the two levels the expected
-      change and ``prob_increase`` compare.
+      change and ``prob_increase`` compare;
+    * ``prob_increase_undefined``: why there is no probability of a rise
+      (:func:`narrative.prob_undefined`: ``'all_zero'``, ``'zero_forecast'``,
+      ``'zero_current'``), ``None`` when there is one -- ``prob_increase`` is then
+      ``null`` here, as on every other surface (the ``Outlook`` object keeps its raw
+      0.5 or so, which states no finding).
 
     The same fields and rules as ``narrative.build_llm_payload``'s outlook.
     """
@@ -200,13 +220,21 @@ def _outlook_extras(report: TrendReport) -> dict[str, Any]:
     except (AttributeError, TypeError, ValueError):   # hand-made or partial report
         lv = None
     undefined = lv.undefined if lv is not None else None
-    return {
-        "direction_label": {lg: direction_label(o.direction, o.expected_change_pct, lg, undefined)
+    try:
+        p_why = prob_undefined(report.analysis)
+    except (AttributeError, TypeError, ValueError):   # hand-made or partial report
+        p_why = None
+    extras: dict[str, Any] = {
+        "direction_label": {lg: direction_label(o.direction, o.expected_change_pct, lg, undefined, levels=lv)
                             for lg in ("ko", "en")},
         "expected_change_undefined": undefined,
         "compared_levels": {"current": lv.current if lv is not None else None,
                             "future": lv.future if lv is not None else None},
+        "prob_increase_undefined": p_why,
     }
+    if p_why is not None:
+        extras["prob_increase"] = None
+    return extras
 
 
 def report_to_dict(report: TrendReport) -> dict[str, Any]:
@@ -216,8 +244,9 @@ def report_to_dict(report: TrendReport) -> dict[str, Any]:
     ``direction_label`` (``{'ko', 'en'}``: the word every human surface shows,
     e.g. ``방향 불확실`` for a ``'flat'`` outlook with a large but uncertain
     change), ``expected_change_undefined`` (why ``expected_change_pct`` is
-    ``None``) and ``compared_levels`` (``{'current', 'future'}``, see
-    :func:`trendai.forecast.outlook_levels`).
+    ``None``), ``compared_levels`` (``{'current', 'future'}``, see
+    :func:`trendai.forecast.outlook_levels`) and ``prob_increase_undefined`` (why
+    ``prob_increase`` is ``null``: :func:`trendai.narrative.prob_undefined`).
     """
     a, fc, o = report.analysis, report.forecast, report.outlook
     m = a.metrics

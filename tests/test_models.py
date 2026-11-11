@@ -656,7 +656,7 @@ def test_fit_predict_speed(freq, m):
 # --------------------------------------------------------------------------- drift@log and sba
 
 
-NEW_NAMES = ["drift@log", "sba"]
+NEW_NAMES = ["drift@log", "sba", "tsb"]
 _GENERIC_CHECKS = [
     test_all_samples_monthly, test_min_obs_and_short_series, test_constant_series,
     test_series_with_zeros, test_huge_and_tiny_magnitudes_are_scale_equivariant, test_deterministic,
@@ -794,3 +794,43 @@ def test_log_wrapper_shift_is_scale_free():
         for scale in (1e-300, 1e-12, 1e9):
             f = _fit_predict(nm, y * scale, 12, 6)
             assert np.allclose(f / scale, base, rtol=1e-6, atol=1e-9), (nm, scale)
+
+
+# --------------------------------------------------------------------------- tsb (round 5, V2-7)
+
+
+def _tsb_reference(y, alpha=0.1, beta=0.1, k=5):
+    """Scalar TSB: SES of the demand sizes (on demand only) times SES of the 0/1 occurrence
+    (every period), each starting from the mean of its first values."""
+    sizes = [float(v) for v in y if v != 0]
+    occ = [1.0 if v != 0 else 0.0 for v in y]
+
+    def ses(x, a, k0):
+        lvl = sum(x[:k0]) / len(x[:k0])
+        for v in x:
+            lvl += a * (v - lvl)
+        return lvl
+
+    return ses(sizes, alpha, k) * ses(occ, beta, max(k, len(y) // 4)) if sizes else 0.0
+
+
+def test_tsb_matches_the_recursion_and_decays_through_zeros():
+    """V2-7: a product without a sale for 41 weeks was forecast at last year's rate (0.235 a week,
+    52-week mean 0.15): Croston / SBA only update on a sale.  TSB lowers the demand probability
+    every period, so a run of zeros lowers the rate."""
+    y = np.array([0, 0, 3, 0, 0, 0, 5, 0, 2, 0, 0, 4, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 3, 0], float)
+    f = _fit_predict("tsb", y, 1, 5)
+    assert np.allclose(f, _tsb_reference(y), rtol=1e-12) and np.ptp(f) == 0.0
+    stopped = np.r_[y, np.zeros(40)]
+    assert _fit_predict("tsb", stopped, 1, 1)[0] < 0.05 * f[0]        # 0.9 ** 40 = 1.5 %
+    assert _fit_predict("sba", stopped, 1, 1)[0] > 0.5 * _fit_predict("sba", y, 1, 1)[0]   # SBA does not
+    assert np.array_equal(_fit_predict("tsb", np.zeros(10), 12, 4), np.zeros(4))
+    v = np.array([2.0, 4.0, 3.0, 5.0, 4.0, 6.0, 5.0])                    # no zeros: SES of the values
+    assert _fit_predict("tsb", v, 1, 2) == pytest.approx(np.full(2, _tsb_reference(v)), rel=1e-12)
+
+
+def test_tsb_is_offered_for_intermittent_demand_only():
+    assert M.make_model("tsb").offered_for == "intermittent"
+    for pos in (False, True):
+        assert "tsb" not in M.default_candidates(150, 52, positive=pos)
+    assert "tsb" in M.default_candidates(150, 52, positive=False, intermittent=True)

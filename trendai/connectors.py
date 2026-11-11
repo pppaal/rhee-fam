@@ -8,7 +8,9 @@
 Both return a raw float ``pd.Series`` with a sorted ``DatetimeIndex``; pass it
 through :func:`trendai.data.prepare` (or straight into ``analyze``/``run``).
 Every failure (missing package, HTTP error, network error, empty result) is
-raised as :class:`ConnectorError` with a message that says what to do.
+raised as :class:`ConnectorError` with a message that says what to do: a
+catalog message (:mod:`trendai.messages`), Korean as ``str(exc)`` and English
+as ``exc.text('en')`` (the CLI follows ``--lang``).
 Requests carry a generic User-Agent and no personal data.
 """
 
@@ -23,6 +25,8 @@ from urllib.parse import quote
 import numpy as np
 import pandas as pd
 
+from .messages import Localised, msg
+
 __all__ = [
     "ConnectorError", "USER_AGENT", "wikipedia_pageviews_url", "fetch_wikipedia_pageviews",
     "fetch_google_trends",
@@ -35,8 +39,11 @@ TIMEOUT = 20
 _GRANULARITIES = ("daily", "monthly")
 
 
-class ConnectorError(RuntimeError):
-    """Fetching data from an online source failed."""
+class ConnectorError(Localised, RuntimeError):
+    """Fetching data from an online source failed.
+
+    Raised with a catalog message (:func:`trendai.messages.msg`, codes ``conn_*``): ``.code`` /
+    ``.params`` name it, ``.text('en')`` renders it in English; ``str(exc)`` is the Korean text."""
 
 
 def _today() -> pd.Timestamp:
@@ -49,7 +56,7 @@ def _to_timestamp(value: Any, what: str) -> pd.Timestamp:
     if isinstance(value, (pd.Timestamp, _dt.datetime, _dt.date, np.datetime64)):
         ts = pd.Timestamp(value)
         if pd.isna(ts):  # NaT is a datetime subclass but has no usable date
-            raise ConnectorError(f"{what} 날짜가 비어 있습니다 (NaT).")
+            raise ConnectorError(msg("conn_date_nat", what=what))
         if ts.tzinfo is not None:
             ts = ts.tz_convert("UTC").tz_localize(None)
         return ts.normalize()
@@ -60,12 +67,12 @@ def _to_timestamp(value: Any, what: str) -> pd.Timestamp:
         elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
             fmt = "%Y-%m-%d"
         else:
-            raise ConnectorError(f"{what} 날짜 형식이 올바르지 않습니다: {value!r} ('YYYY-MM-DD' 또는 'YYYYMMDD')")
+            raise ConnectorError(msg("conn_date_format", what=what, value=repr(value)))
         try:
             return pd.to_datetime(v, format=fmt)
         except (ValueError, TypeError) as exc:
-            raise ConnectorError(f"{what} 날짜가 유효하지 않습니다: {value!r}") from exc
-    raise ConnectorError(f"{what} 날짜 형식이 올바르지 않습니다: {value!r} ('YYYY-MM-DD' 또는 'YYYYMMDD')")
+            raise ConnectorError(msg("conn_date_invalid", what=what, value=repr(value))) from exc
+    raise ConnectorError(msg("conn_date_format", what=what, value=repr(value)))
 
 
 def _default_end(granularity: str) -> pd.Timestamp:
@@ -78,13 +85,13 @@ def _default_end(granularity: str) -> pd.Timestamp:
 
 def _check_args(article: str, lang: str, granularity: str) -> tuple[str, str, str]:
     if not isinstance(article, str) or not article.strip():
-        raise ConnectorError("위키백과 문서 제목(article)이 비어 있습니다.")
+        raise ConnectorError(msg("conn_no_article"))
     lang_ = str(lang or "").strip().lower()
     if not re.fullmatch(r"[a-z][a-z0-9-]{1,20}", lang_):
-        raise ConnectorError(f"언어 코드가 올바르지 않습니다: {lang!r} (예: 'ko', 'en')")
+        raise ConnectorError(msg("conn_bad_lang", lang=repr(lang)))
     gran = str(granularity or "").strip().lower()
     if gran not in _GRANULARITIES:
-        raise ConnectorError(f"granularity는 {_GRANULARITIES} 중 하나여야 합니다: {granularity!r}")
+        raise ConnectorError(msg("conn_bad_granularity", choices=str(_GRANULARITIES), value=repr(granularity)))
     return article.strip(), lang_, gran
 
 
@@ -103,7 +110,7 @@ def wikipedia_pageviews_url(article: str, lang: str = "ko", start: Optional[str]
     if gran == "monthly":
         s = s.replace(day=1)
     if s > e:
-        raise ConnectorError(f"시작일({s:%Y-%m-%d})이 종료일({e:%Y-%m-%d})보다 늦습니다.")
+        raise ConnectorError(msg("conn_start_after_end", start=f"{s:%Y-%m-%d}", end=f"{e:%Y-%m-%d}"))
     encoded = quote(title.replace(" ", "_"), safe="")
     return (f"{WIKIMEDIA_PAGEVIEWS}/{lang_}.wikipedia/all-access/user/{encoded}/{gran}/"
             f"{s:%Y%m%d}00/{e:%Y%m%d}00")
@@ -138,37 +145,34 @@ def fetch_wikipedia_pageviews(article: str, lang: str = "ko", start: Optional[st
         try:
             import requests
         except ImportError as exc:
-            raise ConnectorError("위키백과 조회에는 requests 패키지가 필요합니다: pip install requests") from exc
+            raise ConnectorError(msg("conn_need_requests")) from exc
         session = requests
     try:
         resp = session.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
     except Exception as exc:  # requests.RequestException, socket errors, timeouts, ...
-        raise ConnectorError(f"Wikimedia API에 연결하지 못했습니다 (network error): {exc}") from exc
+        raise ConnectorError(msg("conn_network", error=str(exc))) from exc
 
     status = getattr(resp, "status_code", None)
     if status == 404:
-        raise ConnectorError(
-            f"위키백과 문서를 찾을 수 없습니다 (article not found): '{title}' ({lang_}.wikipedia). "
-            "정확한 문서 제목(대소문자·띄어쓰기)을 확인하거나, 조회 기간에 데이터가 있는지 확인하세요."
-        )
+        raise ConnectorError(msg("conn_wiki_404", title=title, lang=lang_))
     if status == 429:
-        raise ConnectorError("Wikimedia API 요청 한도를 초과했습니다 (HTTP 429). 잠시 후 다시 시도하세요.")
+        raise ConnectorError(msg("conn_wiki_429"))
     if isinstance(status, int) and status >= 400:
-        raise ConnectorError(f"Wikimedia API 오류 (HTTP {status}): {url}")
+        raise ConnectorError(msg("conn_wiki_http", status=status, url=url))
     raise_for_status = getattr(resp, "raise_for_status", None)
     if callable(raise_for_status):
         try:
             raise_for_status()
         except Exception as exc:
-            raise ConnectorError(f"Wikimedia API 오류: {exc}") from exc
+            raise ConnectorError(msg("conn_wiki_error", error=str(exc))) from exc
     try:
         data = resp.json()
     except Exception as exc:
-        raise ConnectorError("Wikimedia API 응답을 JSON으로 해석할 수 없습니다.") from exc
+        raise ConnectorError(msg("conn_wiki_json")) from exc
 
     items = data.get("items") if isinstance(data, dict) else None
     if not items:
-        raise ConnectorError(f"조회 기간에 '{title}' 페이지뷰 데이터가 없습니다 (empty items).")
+        raise ConnectorError(msg("conn_wiki_empty", title=title))
     dates: list[pd.Timestamp] = []
     views: list[float] = []
     for item in items:
@@ -186,7 +190,7 @@ def fetch_wikipedia_pageviews(article: str, lang: str = "ko", start: Optional[st
             dates.append(date)
             views.append(value)
     if not dates:
-        raise ConnectorError("Wikimedia API 응답에 유효한 페이지뷰 항목이 없습니다.")
+        raise ConnectorError(msg("conn_wiki_no_valid"))
     s = pd.Series(views, index=pd.DatetimeIndex(dates, name="date"), name=title.replace("_", " "),
                   dtype=float)
     s = s[~s.index.duplicated(keep="last")].sort_index()
@@ -202,42 +206,34 @@ def fetch_google_trends(keyword: str, timeframe: str = "today 5-y", geo: str = "
     (often rate limiting) or no data comes back.
     """
     if not isinstance(keyword, str) or not keyword.strip():
-        raise ConnectorError("검색어(keyword)가 비어 있습니다.")
+        raise ConnectorError(msg("conn_no_keyword"))
     kw = keyword.strip()
     try:
         from pytrends.request import TrendReq
     except ImportError as exc:
-        raise ConnectorError("Google Trends 조회에는 pytrends 패키지가 필요합니다: pip install pytrends") from exc
+        raise ConnectorError(msg("conn_need_pytrends")) from exc
     except Exception as exc:  # installed but broken (e.g. incompatible with the installed pandas)
-        raise ConnectorError(
-            f"pytrends 패키지를 불러오지 못했습니다 ({type(exc).__name__}: {exc}). "
-            "pip install -U pytrends 로 업데이트하세요."
-        ) from exc
+        raise ConnectorError(msg("conn_pytrends_broken", kind=type(exc).__name__, error=str(exc))) from exc
     try:
         trends = TrendReq(hl="ko-KR", tz=540)
         trends.build_payload([kw], timeframe=timeframe, geo=geo)
         df = trends.interest_over_time()
     except Exception as exc:  # pytrends raises a variety of request/response errors
-        raise ConnectorError(
-            f"Google Trends 요청에 실패했습니다: {exc}. 요청이 너무 잦으면 차단(429 rate limit)될 수 있으니 "
-            "잠시 후 다시 시도하세요."
-        ) from exc
+        raise ConnectorError(msg("conn_trends_failed", error=str(exc))) from exc
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        raise ConnectorError(
-            f"Google Trends에서 '{kw}'에 대한 데이터가 없습니다. 검색량이 너무 적거나 기간·지역 설정을 확인하세요."
-        )
+        raise ConnectorError(msg("conn_trends_empty", kw=kw))
     df = df.drop(columns=["isPartial"], errors="ignore")
     if df.shape[1] == 0:
-        raise ConnectorError(f"Google Trends 응답에 '{kw}' 열이 없습니다.")
+        raise ConnectorError(msg("conn_trends_no_col", kw=kw))
     col = kw if kw in df.columns else df.columns[0]
     s = pd.to_numeric(df[col], errors="coerce").astype(float)
     try:
         s.index = pd.DatetimeIndex(pd.to_datetime(s.index))
     except (TypeError, ValueError) as exc:
-        raise ConnectorError("Google Trends 응답의 날짜를 해석할 수 없습니다.") from exc
+        raise ConnectorError(msg("conn_trends_dates")) from exc
     s.index.name = "date"
     s = s[s.notna()].sort_index()
     if s.empty:
-        raise ConnectorError(f"Google Trends에서 '{kw}'에 대한 유효한 값이 없습니다.")
+        raise ConnectorError(msg("conn_trends_no_valid", kw=kw))
     s.name = kw
     return s

@@ -24,7 +24,10 @@ File loading (:func:`load_table`) is built for the files people actually have:
 Problems are never silent: unreadable values, dropped rows, interpolated gaps
 and ambiguous date orders are reported with a Korean :class:`DataWarning` /
 :class:`DataNotice`; input that cannot be used raises :class:`DataError`
-(Korean message that names the CLI flag / argument to use).
+(Korean message that names the CLI flag / argument to use).  Every such text comes
+from the message catalog (:mod:`trendai.messages`): the exception / warning carries
+its ``code`` and ``params`` and renders itself in English with ``.text('en')`` (the
+command line does under ``--lang en``); ``str()`` stays Korean.
 """
 
 from __future__ import annotations
@@ -42,6 +45,9 @@ from typing import Any, Iterable, Iterator, Optional, Union
 
 import numpy as np
 import pandas as pd
+
+from . import numfmt as _numfmt
+from .messages import L, Localised, Msg, format_label, join, msg, unit
 
 # canonical frequency code -> pandas offset alias used for resampling / future dates
 PANDAS_FREQ: dict[str, str] = {
@@ -61,20 +67,27 @@ _STEP_DAYS = {"D": 1.0, "W": 7.0, "M": 30.436875, "Q": 91.310625, "Y": 365.2425}
 _WEEKDAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 
 
-class DataError(ValueError):
-    """Raised when input data cannot be turned into a usable series (Korean message)."""
+class DataError(Localised, ValueError):
+    """Raised when input data cannot be turned into a usable series (Korean message).
+
+    Raised with a catalog message (:func:`trendai.messages.msg`): ``.code`` / ``.params``
+    name it and ``.text('en')`` renders it in English; ``str(exc)`` is the Korean text."""
 
 
-class DataWarning(UserWarning):
-    """The data was changed in a way the user should know about (values dropped, gaps filled...)."""
+class DataWarning(Localised, UserWarning):
+    """The data was changed in a way the user should know about (values dropped, gaps filled...).
+
+    Like :class:`DataError`: ``code``, ``params`` and ``text(lang)``; ``str()`` is Korean."""
 
 
-class DataNotice(UserWarning):
-    """Informational note about how the input was interpreted (ignored columns, date order...)."""
+class DataNotice(Localised, UserWarning):
+    """Informational note about how the input was interpreted (ignored columns, date order...).
+
+    Like :class:`DataError`: ``code``, ``params`` and ``text(lang)``; ``str()`` is Korean."""
 
 
-def _warn(msg: str, category: type = DataWarning) -> None:
-    warnings.warn(msg, category, stacklevel=3)
+def _warn(message: str, category: type = DataWarning) -> None:
+    warnings.warn(message, category, stacklevel=3)
 
 
 def season_length(freq: str) -> int:
@@ -94,7 +107,7 @@ def default_horizon(freq: str) -> int:
 
 def _check_freq(freq: str) -> str:
     if freq not in PANDAS_FREQ:
-        raise DataError(f"알 수 없는 주기 {freq!r}입니다. D/W/M/Q/Y 중 하나를 지정하세요.")
+        raise DataError(msg("bad_freq", freq=freq))
     return freq
 
 
@@ -106,12 +119,12 @@ def _days(index: pd.DatetimeIndex) -> np.ndarray:
 def infer_freq(index: pd.DatetimeIndex) -> str:
     """Infer the canonical frequency code from the spacing of ``index``."""
     if len(index) < 2:
-        raise DataError("주기를 추정하려면 날짜가 2개 이상 필요합니다.")
+        raise DataError(msg("freq_needs_two_dates"))
     idx = pd.DatetimeIndex(index).sort_values()
     diffs = np.diff(_days(idx))
     diffs = diffs[diffs > 0]
     if len(diffs) == 0:
-        raise DataError("모든 날짜가 같습니다. 날짜 열이 올바른지 확인하세요 (--date-col).")
+        raise DataError(msg("all_dates_equal"))
     # a low quantile (not the median) so that gappy data still maps to its native spacing
     d = float(np.quantile(diffs, 0.25))
     if d <= 1.5:
@@ -151,7 +164,7 @@ def future_index(last_date: pd.Timestamp, freq: str, horizon: int) -> pd.Datetim
     history gets Monday forecast dates).
     """
     if int(horizon) < 1:
-        raise DataError("예측 기간(horizon)은 1 이상이어야 합니다.")
+        raise DataError(msg("horizon_min"))
     last = pd.Timestamp(last_date)
     alias = PANDAS_FREQ[_check_freq(freq)]
     if freq == "W":
@@ -178,7 +191,7 @@ def regularize(series: pd.Series, freq: Optional[str] = None, how: str = "mean")
         freq = _infer_freq_with_gaps(s.index, dates)
     alias = _alias_for(freq, s.index)
     if how not in ("mean", "sum"):
-        raise DataError("how 는 'mean' 또는 'sum' 이어야 합니다.")
+        raise DataError(msg("bad_how"))
     r = s.resample(alias)
     out = r.mean() if how == "mean" else r.sum(min_count=1)
     out = out.astype(float)
@@ -375,11 +388,11 @@ class _Candidate:
     """One whole-column interpretation of a date column."""
 
     def __init__(self, label: str, values: pd.Series, kind: str = "normal",
-                 ambiguous: Optional[str] = None) -> None:
+                 ambiguous: Optional[Msg] = None) -> None:
         self.label = label
         self.values = values
         self.kind = kind            # 'normal' or 'weak' (needs a date-like name / monotone order)
-        self.ambiguous = ambiguous  # Korean note when another order was equally plausible
+        self.ambiguous = ambiguous  # catalog note (Msg) when another order was equally plausible
 
 
 def _pick_order(options: list[tuple[str, pd.Series]], tie_index: int) -> tuple[str, pd.Series, bool]:
@@ -504,8 +517,7 @@ def _string_candidates(s: pd.Series) -> Iterator[_Candidate]:
         label, vals, tied = _pick_order([(lab_d, dmy), (lab_m, mdy)], tie_index=tie)
         note = None
         if tied and first.nunique() > 1 and second.nunique() > 1:
-            note = (f"날짜의 일/월 순서가 모호해(모든 값이 12 이하) '{label}' 순서로 읽었습니다. "
-                    "다르다면 날짜를 YYYY-MM-DD 형식으로 바꿔 주세요.")
+            note = msg("date_order_ambiguous", label=label)
         yield (_Candidate(label, vals, ambiguous=note))
     # month/year: 01/2024, 1.2024
     m = ext(r"^(\d{1,2})\s*[-/.]\s*(\d{4})$")
@@ -519,7 +531,7 @@ def _string_candidates(s: pd.Series) -> Iterator[_Candidate]:
         label, vals, tied = _pick_order([("YY-MM", ym), ("MM-YY", my)], tie_index=0)
         note = None
         if tied:
-            note = f"날짜 '{s.iloc[0]}'의 연/월 순서가 모호해 '{label}'로 읽었습니다."
+            note = msg("date_ym_ambiguous", value=str(s.iloc[0]), label=label)
         yield (_Candidate(label, vals, kind="weak", ambiguous=note))
 
 
@@ -577,7 +589,8 @@ def parse_dates(col: pd.Series, name_hint: bool = True,
     format.  ``name_hint=False`` (the column name does not look like a date)
     makes the weak interpretations (plain years, ``YYYYMM``, ``YYYY.MM``) also
     require a sorted column; epoch seconds need ``allow_epoch``.  ``note`` is
-    a Korean remark (ambiguous order, unreadable cells) or ``None``.
+    a Korean remark (ambiguous order, unreadable cells) or ``None`` -- a
+    :class:`trendai.messages.Msg`, so it also renders in English (``note.text('en')``).
     """
     if isinstance(col.dtype, pd.DatetimeTZDtype):
         return pd.Series(col.dt.tz_localize(None), index=col.index), "날짜/시간", None
@@ -630,8 +643,7 @@ def parse_dates(col: pd.Series, name_hint: bool = True,
     n_bad = n - int(best.values.notna().sum())
     if n_bad:
         bad_ex = ", ".join(repr(str(x)) for x in sp[best.values.isna()].head(3))
-        extra = f"날짜로 읽을 수 없는 값 {n_bad}개(예: {bad_ex})가 있는 행은 제외했습니다."
-        note = f"{note} {extra}" if note else extra
+        note = join(note, msg("dates_unreadable_rows", n=n_bad, examples=bad_ex))
     return full, best.label, note
 
 
@@ -651,17 +663,22 @@ def _coerce_index(index: pd.Index) -> pd.DatetimeIndex:
             years = v.where(np.isfinite(v))
             return pd.DatetimeIndex(_from_parts(years, 1, 1, index=pd.RangeIndex(len(v))).to_numpy())
         lo, hi = (float(finite.min()), float(finite.max())) if len(finite) else (0.0, 0.0)
-        raise DataError(
-            f"인덱스가 날짜가 아니라 숫자({lo:g}~{hi:g})입니다. 날짜(DatetimeIndex)를 붙이거나 "
-            "trendai.from_values(values, start='2020-01-01', freq='M')로 만드세요. "
-            "연도라면 1000~2200 사이 정수여야 합니다.")
+        raise DataError(msg("index_numeric", lo=_index_number(lo), hi=_index_number(hi)))
     parsed, _, note = parse_dates(pd.Series(list(index), dtype=object), name_hint=True)
     if parsed is None:
         ex = ", ".join(repr(str(x)) for x in list(index[:3]))
-        raise DataError(f"인덱스를 날짜로 읽을 수 없습니다 (예: {ex}). 날짜 형식의 인덱스가 필요합니다.")
+        raise DataError(msg("index_unreadable", examples=ex))
     if note:
         _warn(note, DataNotice)
     return pd.DatetimeIndex(parsed.to_numpy())
+
+
+def _index_number(x: float) -> str:
+    """A number of a numeric index for a message: integers as such (``36``), others in the shared
+    notation (:func:`trendai.numfmt.number_text`; never Python's ``1e+07``)."""
+    if float(x).is_integer() and abs(x) < _numfmt.SCI_LARGE:
+        return f"{int(x):,}".replace("-", _numfmt.MINUS)
+    return _numfmt.number_text(x) or str(x)
 
 
 def _clean(series: pd.Series) -> pd.Series:
@@ -675,27 +692,25 @@ def _clean_with_dates(series: pd.Series) -> tuple[pd.Series, pd.DatetimeIndex]:
     monthly date column with many empty cells still says the data is monthly.
     """
     if not isinstance(series, pd.Series):
-        raise DataError("pandas Series(날짜 인덱스 + 숫자 값)가 필요합니다. "
-                        "숫자 목록이라면 trendai.from_values(...)를 쓰세요.")
+        raise DataError(msg("series_required"))
     if series.empty:
-        raise DataError("시계열이 비어 있습니다.")
+        raise DataError(msg("series_empty"))
     s = series.copy()
     s.index = _coerce_index(s.index)
     vals, n_bad, ex = parse_numbers(s)
     if n_bad:
-        _warn(f"{_label(series)}숫자로 읽을 수 없는 값 {n_bad}개(예: {', '.join(map(repr, ex))})를 "
-              "결측으로 처리했습니다.")
+        _warn(msg("values_unreadable", name=_label(series), n=n_bad, examples=", ".join(map(repr, ex))))
     s = pd.Series(vals.to_numpy(dtype=float), index=s.index, name=series.name)
     arr = s.to_numpy()
     n_inf = int(np.isinf(arr).sum())
     if n_inf:
-        _warn(f"{_label(series)}무한대(inf) 값 {n_inf}개를 제외했습니다.")
+        _warn(msg("values_infinite", name=_label(series), n=n_inf))
     dates = pd.DatetimeIndex(s.index[~s.index.isna()]).sort_values()
     s = s[np.isfinite(arr)]
     s = s[~s.index.isna()]
     s = s.sort_index(kind="mergesort")
     if s.empty:
-        raise DataError(f"{_label(series)}유효한 숫자 값이 하나도 없습니다.")
+        raise DataError(msg("no_valid_values", name=_label(series)))
     return s, dates
 
 
@@ -755,18 +770,15 @@ def _report_regularisation(raw: pd.Series, out: pd.Series, freq: str, how: str) 
     filled = len(out) - observed
     merged = int(len(raw) - observed)
     name = _label(raw)
-    unit = FREQ_KO[freq]
     if freq == "D" and _weekday_only(raw.index):
-        _warn(f"{name}평일(영업일)에만 값이 있는 데이터입니다. 실제 관측 {len(raw)}개 사이의 주말 "
-              f"{filled}개를 선형 보간해 달력일 기준({len(out)}개)으로 분석하며, 예측 날짜에도 주말이 "
-              "포함됩니다. 주 단위로 보려면 --freq W (파이썬: freq='W')를 지정하세요.")
+        _warn(msg("weekday_only", name=name, n_obs=len(raw), filled=filled, n_out=len(out)))
     elif filled >= 3 and filled / max(len(out), 1) >= 0.2:
-        _warn(f"{name}{unit} 단위 격자에 맞추면서 빈 기간 {filled}개(전체 {len(out)}개 중 "
-              f"{filled / len(out):.0%})를 선형 보간했습니다. 실제 관측은 {observed}개입니다.")
+        _warn(msg("gaps_interpolated", name=name, unit=unit(freq), filled=filled, total=len(out),
+                  share=filled / len(out), observed=observed))
     if merged > 0 and merged / max(len(raw), 1) >= 0.05:
-        verb = "평균" if how == "mean" else "합계"
-        _warn(f"{name}같은 {unit} 단위 기간에 값이 여러 개 있어 {verb}으로 합쳤습니다 "
-              f"(관측 {len(raw)}개 → {observed}개 기간). 다른 주기로 보려면 --freq 를 지정하세요.")
+        verb = L("평균", "averaged") if how == "mean" else L("합계", "summed")
+        _warn(msg("duplicates_merged", name=name, unit=unit(freq), how=verb, n_raw=len(raw),
+                  observed=observed))
 
 
 def prepare(series: pd.Series, freq: Optional[str] = None, name: Optional[str] = None,
@@ -782,7 +794,7 @@ def prepare(series: pd.Series, freq: Optional[str] = None, name: Optional[str] =
     """
     s, dates = _clean_with_dates(series)
     if len(s) < 2:
-        raise DataError(f"{_label(series)}관측치가 2개 이상 필요합니다 (유효한 값 {len(s)}개).")
+        raise DataError(msg("too_few_obs", name=_label(series), n=len(s)))
     inferred = freq is None
     if freq is None:
         freq = _infer_freq_with_gaps(s.index, dates)
@@ -794,8 +806,7 @@ def prepare(series: pd.Series, freq: Optional[str] = None, name: Optional[str] =
     elif out.name is None:
         out.name = "series"
     if len(out) < 2:
-        raise DataError(f"{_label(series)}{FREQ_KO[freq]} 단위로 정리하면 관측치가 {len(out)}개뿐입니다 "
-                        "(2개 이상 필요). 더 짧은 주기(--freq)를 지정하거나 데이터를 늘리세요.")
+        raise DataError(msg("too_few_after_regularise", name=_label(series), unit=unit(freq), n=len(out)))
     return out, freq
 
 
@@ -872,8 +883,7 @@ def _wide_to_series(df: pd.DataFrame, prefer_decimal_comma: bool) -> Optional[di
         out[nm] = s
     if not out:
         return None
-    _warn(f"날짜가 열 방향으로 놓인 가로형 표로 보고 행마다 시계열 {len(out)}개로 읽었습니다 "
-          f"(날짜 형식: {label}).", DataNotice)
+    _warn(msg("wide_table", n=len(out), label=L(label, format_label(label, "en"))), DataNotice)
     return out
 
 
@@ -921,31 +931,26 @@ def frame_to_series(df: pd.DataFrame, date_col: Optional[str] = None,
     ``series.attrs['trendai']`` = ``{'date_col', 'date_format', 'n_rows'}``.
     """
     if df is None or df.empty:
-        raise DataError("표가 비어 있습니다 (읽을 행이 없습니다).")
+        raise DataError(msg("table_empty_rows"))
     df = _clean_frame(df)
     if df.empty:
-        raise DataError("표가 비어 있습니다 (값이 있는 행이 없습니다).")
-    note: Optional[str] = None
+        raise DataError(msg("table_empty_values"))
+    note: Optional[Msg] = None
     if date_col is not None:
         date_col = str(date_col).strip()
         if date_col not in df.columns:
-            raise DataError(f"날짜 열 {date_col!r}을(를) 찾지 못했습니다. 열 목록: {list(df.columns)}")
+            raise DataError(msg("date_col_missing", col=date_col, columns=list(df.columns)))
         parsed, label, note = parse_dates(df[date_col], name_hint=True, allow_epoch=True)
         if parsed is None:
             ex = ", ".join(repr(str(x)) for x in df[date_col].dropna().head(3))
-            raise DataError(
-                f"{date_col!r} 열을 날짜로 읽을 수 없습니다 (예: {ex}). 지원 형식: 2024-01-05, 2024-01, "
-                "2024.01, 202401, 20240105, 2024년 1월, 2024 Q1, 2024년 1분기, 2024-W01, 05.01.2024, "
-                "연도(2024), Unix 시간.")
+            raise DataError(msg("date_col_unreadable", col=date_col, examples=ex))
     else:
         found = _find_date_column(df)
         if found is None:
             wide = _wide_to_series(df, prefer_decimal_comma)
             if wide is not None:
                 return wide
-            raise DataError(
-                "날짜 열을 찾지 못했습니다. --date-col 로 날짜 열을 지정하세요 (파이썬: date_col=...). "
-                f"열 목록: {list(df.columns)}")
+            raise DataError(msg("no_date_col", columns=list(df.columns)))
         date_col, parsed, label, note = found
     period_col: Optional[str] = None
     combo = _combine_year_and_period(df, str(date_col), parsed, label)
@@ -958,7 +963,7 @@ def frame_to_series(df: pd.DataFrame, date_col: Optional[str] = None,
         value_cols = [str(c).strip() for c in value_cols]
         for c in value_cols:
             if c not in df.columns:
-                raise DataError(f"값 열 {c!r}을(를) 찾지 못했습니다. 열 목록: {list(df.columns)}")
+                raise DataError(msg("value_col_missing", col=c, columns=list(df.columns)))
         explicit = True
     else:
         explicit = False
@@ -970,7 +975,7 @@ def frame_to_series(df: pd.DataFrame, date_col: Optional[str] = None,
         if explicit:
             if n_ok < 1:
                 ex_raw = ", ".join(repr(str(x)) for x in df[c].dropna().head(3))
-                raise DataError(f"값 열 {c!r}을(를) 숫자로 읽을 수 없습니다 (예: {ex_raw}).")
+                raise DataError(msg("value_col_unreadable", col=c, examples=ex_raw))
             parsed_vals[c] = (vals, n_bad, ex)
         elif n_ok >= 1 and n_ok / max(n_ok + n_bad, 1) >= 0.8:
             parsed_vals[c] = (vals, n_bad, ex)
@@ -988,13 +993,10 @@ def frame_to_series(df: pd.DataFrame, date_col: Optional[str] = None,
         skipped = [c for c in parsed_vals if c not in keep]
         if not keep:
             if skipped:
-                raise DataError(f"분석할 숫자 값 열이 없습니다 (행 번호 열 {skipped}만 있음). "
-                                "--value-col 로 값 열을 지정하세요.")
-            raise DataError("숫자 값 열을 찾지 못했습니다. --value-col 로 값 열을 지정하세요 "
-                            f"(파이썬: value_cols=[...]). 열 목록: {list(df.columns)}")
+                raise DataError(msg("only_rownum_cols", cols=skipped))
+            raise DataError(msg("no_numeric_col", columns=list(df.columns)))
         if skipped:
-            _warn(f"행 번호/일련번호로 보이는 열 {skipped}은(는) 분석에서 제외했습니다 "
-                  "(포함하려면 --value-col 로 지정).", DataNotice)
+            _warn(msg("rownum_cols_skipped", cols=skipped), DataNotice)
         parsed_vals = {c: parsed_vals[c] for c in keep}
     valid_date = ~dates.isna()
     out: dict[str, pd.Series] = {}
@@ -1002,12 +1004,11 @@ def frame_to_series(df: pd.DataFrame, date_col: Optional[str] = None,
         s = pd.Series(vals.to_numpy(dtype=float), index=dates, name=str(c))
         if n_bad:
             pos = np.flatnonzero(vals.isna().to_numpy() & valid_date)
-            edge = ""
+            edge: Any = ""
             ok_pos = np.flatnonzero(vals.notna().to_numpy())
             if len(ok_pos) and len(pos) and (pos.max() > ok_pos.max() or pos.min() < ok_pos.min()):
-                edge = " 시계열의 처음/끝 부분이 잘렸을 수 있습니다."
-            _warn(f"'{c}' 열: 숫자로 읽을 수 없는 값 {n_bad}개(예: {', '.join(map(repr, ex))})를 결측으로 "
-                  f"처리했습니다.{edge}")
+                edge = L(" 시계열의 처음/끝 부분이 잘렸을 수 있습니다.", " The start or end of the series may be cut off.")
+            _warn(msg("col_values_unreadable", col=str(c), n=n_bad, examples=", ".join(map(repr, ex)), edge=edge))
         s = s[valid_date]
         shown = f"{date_col} + {period_col}" if period_col else str(date_col)
         s.attrs["trendai"] = {"date_col": shown, "date_format": label, "n_rows": int(len(df))}
@@ -1040,7 +1041,7 @@ def _decode(raw: bytes, what: str) -> tuple[str, str]:
     bad_utf8 = raw.decode("utf-8", errors="replace").count("\ufffd")
     multibyte = len(re.findall(rb"[\xc2-\xf4][\x80-\xbf]+", raw))
     if multibyte >= 20 * max(bad_utf8, 1):
-        _warn(f"{what}: UTF-8 파일에 깨진 바이트 {bad_utf8}개가 있어 '\ufffd'로 바꿔 읽었습니다.")
+        _warn(msg("utf8_broken", what=what, n=bad_utf8))
         return raw.decode("utf-8", errors="replace"), "utf-8"
     for enc in ("cp949", "cp1252"):
         try:
@@ -1090,7 +1091,7 @@ def _read_text_table(text: str, what: str) -> tuple[pd.DataFrame, bool]:
     text = text.lstrip("\ufeff")
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if not lines:
-        raise DataError(f"{what}: 파일이 비어 있습니다.")
+        raise DataError(msg("file_empty", what=what))
     sep = _sniff_sep(lines[:50]) or ","
     kw: dict[str, Any] = dict(sep=sep, dtype=str, keep_default_na=False, na_filter=False,
                               skipinitialspace=True, skip_blank_lines=True)
@@ -1102,15 +1103,17 @@ def _read_text_table(text: str, what: str) -> tuple[pd.DataFrame, bool]:
             ncol = df.shape[1]
             names = ["date"] + (["value"] if ncol == 2 else [f"value{i}" for i in range(1, ncol)])
             df = pd.read_csv(io.StringIO(text), header=None, names=names, **kw)
-            _warn(f"{what}: 머리글(열 이름) 행이 없는 파일로 보고 첫 행부터 데이터로 읽었습니다.", DataNotice)
+            _warn(msg("headerless", what=what), DataNotice)
     except pd.errors.EmptyDataError:
-        raise DataError(f"{what}: 파일이 비어 있습니다.") from None
+        raise DataError(msg("file_empty", what=what)) from None
     except (pd.errors.ParserError, csv.Error) as exc:
-        hint = ""
+        hint: Any = ""
         if sep == ",":
-            hint = (" 천 단위 쉼표(1,234)가 따옴표 없이 들어 있으면 열 개수가 달라집니다. "
-                    "값을 따옴표로 감싸거나 탭/세미콜론 구분자로 저장하세요.")
-        raise DataError(f"{what}: CSV 형식 오류 — 행마다 열 개수가 다릅니다 ({exc}).{hint}") from None
+            hint = L(" 천 단위 쉼표(1,234)가 따옴표 없이 들어 있으면 열 개수가 달라집니다. "
+                     "값을 따옴표로 감싸거나 탭/세미콜론 구분자로 저장하세요.",
+                     " Thousands separators (1,234) without quotes change the number of columns: quote the "
+                     "values or save the file with tabs or semicolons as separators.")
+        raise DataError(msg("csv_ragged", what=what, error=str(exc), hint=hint)) from None
     return df, sep == ";"
 
 
@@ -1129,7 +1132,7 @@ def _json_to_frame(obj: Any, what: str) -> pd.DataFrame:
             return pd.DataFrame(only)  # e.g. {"items": [...]} (Wikimedia API)
     if isinstance(obj, list):
         if not obj:
-            raise DataError(f"{what}: JSON 배열이 비어 있습니다.")
+            raise DataError(msg("json_empty_array", what=what))
         if all(isinstance(r, dict) for r in obj):
             return pd.DataFrame(obj)
         if all(isinstance(r, (list, tuple)) for r in obj):
@@ -1138,10 +1141,10 @@ def _json_to_frame(obj: Any, what: str) -> pd.DataFrame:
                 return pd.DataFrame(obj[1:], columns=head)
             return pd.DataFrame(obj, columns=["date"] + [f"value{i}" if len(head) > 2 else "value"
                                                          for i in range(1, len(head))])
-        raise DataError(f"{what}: JSON 배열 형식을 이해할 수 없습니다 (객체 또는 [날짜, 값] 목록이 필요).")
+        raise DataError(msg("json_array_shape", what=what))
     if isinstance(obj, dict):
         if not obj:
-            raise DataError(f"{what}: JSON 객체가 비어 있습니다.")
+            raise DataError(msg("json_empty_object", what=what))
         vals = list(obj.values())
         if all(not isinstance(v, (dict, list)) for v in vals):  # {date: value} (Series.to_json)
             return pd.DataFrame({"date": list(obj.keys()), "value": vals})
@@ -1156,7 +1159,7 @@ def _json_to_frame(obj: Any, what: str) -> pd.DataFrame:
                 df = pd.DataFrame(obj)
             df.index.name = None
             return df.rename_axis("date").reset_index()
-    raise DataError(f"{what}: JSON 구조를 이해할 수 없습니다 (레코드 목록, {{날짜: 값}} 또는 열 객체가 필요).")
+    raise DataError(msg("json_shape", what=what))
 
 
 _EXCEL_SIGNATURES = (b"PK\x03\x04", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
@@ -1166,20 +1169,18 @@ def _read_excel(p: Path, raw: bytes, what: str) -> pd.DataFrame:
     if not raw.startswith(_EXCEL_SIGNATURES):
         head = raw[:2000].lstrip().lower()
         if head.startswith((b"<!doctype html", b"<html", b"<table", b"<?xml")):
-            raise DataError(f"{what}: 확장자는 엑셀이지만 실제로는 HTML/XML 표입니다. 엑셀에서 열어 "
-                            "CSV(UTF-8) 또는 .xlsx로 다시 저장하세요.")
-        _warn(f"{what}: 확장자는 엑셀이지만 내용이 텍스트여서 CSV로 읽었습니다.", DataNotice)
+            raise DataError(msg("excel_is_html", what=what))
+        _warn(msg("excel_is_text", what=what), DataNotice)
         return pd.DataFrame()  # caller falls back to text parsing
     engine_pkg = "xlrd" if raw.startswith(_EXCEL_SIGNATURES[1]) else "openpyxl"
     try:
         df = pd.read_excel(p, sheet_name=0)
     except ImportError:
-        raise DataError(f"{what}: 이 엑셀 파일을 읽으려면 {engine_pkg} 패키지가 필요합니다 "
-                        f"(pip install {engine_pkg}). 또는 CSV로 저장해 사용하세요.") from None
+        raise DataError(msg("excel_needs_pkg", what=what, pkg=engine_pkg)) from None
     except (ValueError, zipfile.BadZipFile, KeyError, OSError, TypeError) as exc:
-        raise DataError(f"{what}: 엑셀 파일을 읽을 수 없습니다 (손상되었거나 형식이 다름: {exc}).") from None
+        raise DataError(msg("excel_unreadable", what=what, error=str(exc))) from None
     except Exception as exc:  # noqa: BLE001 - engine-specific parse errors (xlrd.XLRDError, ...)
-        raise DataError(f"{what}: 엑셀 파일을 읽을 수 없습니다 ({type(exc).__name__}: {exc}).") from None
+        raise DataError(msg("excel_unreadable_engine", what=what, error=f"{type(exc).__name__}: {exc}")) from None
     if _header_is_data([str(c) for c in df.columns]):
         try:
             df = pd.read_excel(p, sheet_name=0, header=None)
@@ -1206,15 +1207,15 @@ def load_table(path: Union[str, Path], date_col: Optional[str] = None,
     p = Path(path)
     what = p.name or str(p)
     if not p.exists():
-        raise DataError(f"파일을 찾을 수 없습니다: {p}")
+        raise DataError(msg("file_not_found", path=str(p)))
     if p.is_dir():
-        raise DataError(f"폴더가 아니라 파일 경로를 지정하세요: {p}")
+        raise DataError(msg("path_is_dir", path=str(p)))
     try:
         raw = p.read_bytes()
     except OSError as exc:
-        raise DataError(f"{what}: 파일을 읽을 수 없습니다 ({exc.strerror or exc}).") from None
+        raise DataError(msg("file_unreadable", what=what, error=str(exc.strerror or exc))) from None
     if not raw.strip():
-        raise DataError(f"{what}: 파일이 비어 있습니다.")
+        raise DataError(msg("file_empty", what=what))
     suffix = p.suffix.lower()
     decimal_comma = False
     df: Optional[pd.DataFrame] = None
@@ -1230,16 +1231,16 @@ def load_table(path: Union[str, Path], date_col: Optional[str] = None,
             try:  # JSON Lines
                 obj = [json.loads(ln) for ln in text.lstrip("\ufeff").splitlines() if ln.strip()]
             except json.JSONDecodeError:
-                raise DataError(f"{what}: 올바른 JSON이 아닙니다 ({exc.msg}, {exc.lineno}행).") from None
+                raise DataError(msg("json_invalid", what=what, error=exc.msg, line=exc.lineno)) from None
         try:
             df = _json_to_frame(obj, what)
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             if isinstance(exc, DataError):
                 raise
-            raise DataError(f"{what}: JSON 구조를 표로 바꿀 수 없습니다 ({exc}).") from None
+            raise DataError(msg("json_to_table", what=what, error=str(exc))) from None
     if df is None:
         if raw.startswith(_EXCEL_SIGNATURES):
-            raise DataError(f"{what}: 엑셀 파일로 보입니다. 확장자를 .xlsx/.xls로 바꾸거나 CSV로 저장하세요.")
+            raise DataError(msg("excel_wrong_ext", what=what))
         text, _ = _decode(raw, what)
         df, decimal_comma = _read_text_table(text, what)
     return frame_to_series(df, date_col=date_col, value_cols=value_cols,
