@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import importlib.resources
 import os
+import re
+import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tomllib
@@ -35,6 +38,9 @@ def test_pyproject_package_data_patterns() -> None:
     assert tool["exclude-package-data"]["trendai.web"] == ["static/dev/**"]
     # namespace discovery would turn static/dev/ into a package and ship make_fixtures.py as a module
     assert tool["packages"]["find"]["namespaces"] is False
+    # package data only from the patterns above: the manifest scan (the default) warns once per static sub-directory
+    # "Package 'trendai.web.static…' is absent from the `packages` configuration" (OPS-17)
+    assert tool["include-package-data"] is False
     pytest_cfg = _pyproject()["tool"]["pytest"]["ini_options"]
     assert any(m.startswith("e2e:") for m in pytest_cfg["markers"])
 
@@ -82,6 +88,8 @@ def test_build_ships_static_without_dev(tmp_path: Path) -> None:
     code = "import sys; from setuptools import setup; sys.argv = ['setup.py', '-q', 'build_py']; setup()"
     result = subprocess.run([sys.executable, "-c", code], cwd=src, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr[-2000:]
+    # no "Package would be ignored" block per static sub-directory (OPS-17): it reads like a failed build
+    assert "absent from the `packages` configuration" not in result.stdout + result.stderr, result.stderr[-2000:]
     built = src / "build" / "lib" / "trendai" / "web"
     shipped = {p.relative_to(built / "static").as_posix() for p in (built / "static").rglob("*") if p.is_file()}
     expected = {p.relative_to(STATIC).as_posix() for p in STATIC.rglob("*")
@@ -114,8 +122,65 @@ def test_dockerfile_contract() -> None:
     for needle in ("TRENDAI_HOST=0.0.0.0", "TRENDAI_PORT=8000", "TRENDAI_DATA_DIR=/data",
                    "pip install --no-cache-dir . openpyxl anthropic", "useradd --system --uid 10001",
                    "USER trendai", 'VOLUME ["/data"]', "EXPOSE 8000",
-                   "urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)",
+                   "HEALTHCHECK --interval=30s --timeout=5s --start-period=20s",
                    'CMD ["trendai", "serve"]'):
         assert needle in text, needle
+    # the health check follows TRENDAI_PORT (8000 when unset or empty) and bypasses any proxy (OPS-17)
+    code = _healthcheck_code()
+    assert "os.environ.get('TRENDAI_PORT') or '8000'" in code and "ProxyHandler({})" in code
+    assert "127.0.0.1:8000" not in code
     # the README is copied because pyproject's readme field needs it at build time
     assert "COPY pyproject.toml README.md ./" in text
+
+
+def _healthcheck_cmd() -> str:
+    """The shell-form command of the Dockerfile's ``HEALTHCHECK ... CMD python -c "..."`` (Docker runs it with
+    ``/bin/sh -c``)."""
+    text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    match = re.search(r'^HEALTHCHECK [^\n]*\\\n\s*CMD (python -c "[^"]+")\s*$', text, re.M)
+    assert match, "HEALTHCHECK CMD python -c \"...\" not found"
+    return match.group(1)
+
+
+def _healthcheck_code() -> str:
+    """The Python source inside the health-check command."""
+    return shlex.split(_healthcheck_cmd())[2]
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _run_healthcheck(port: int, proxy_port: int, cwd: Path) -> subprocess.CompletedProcess:
+    env = {k: v for k, v in os.environ.items()
+           if k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "no_proxy", "trendai_port")}
+    # an operator's proxy (without NO_PROXY) must not swallow the probe of 127.0.0.1: point it at a closed port
+    proxy = f"http://127.0.0.1:{proxy_port}"
+    env.update({"TRENDAI_PORT": str(port), "HTTP_PROXY": proxy, "http_proxy": proxy, "ALL_PROXY": proxy})
+    # through the shell exactly as Docker's shell form does, with this interpreter in place of the image's python
+    command = shlex.quote(sys.executable) + _healthcheck_cmd()[len("python"):]
+    return subprocess.run(["/bin/sh", "-c", command], env=env, cwd=cwd, capture_output=True, text=True, timeout=30)
+
+
+@pytest.mark.skipif(not os.path.exists("/bin/sh"), reason="needs a POSIX shell, like the image")
+def test_dockerfile_healthcheck_follows_trendai_port(tmp_path: Path) -> None:
+    """``docker run -e TRENDAI_PORT=9000`` must not give a permanently unhealthy container, and an ``HTTP_PROXY``
+    set for the app's outbound requests must not route the local probe through the proxy (OPS-17)."""
+    from trendai.web.server import start_background
+    from trendai.web.testing import make_test_app, write_static_fixture
+
+    app = make_test_app(tmp_path / "data", static_dir=write_static_fixture(tmp_path / "static"))
+    server, _thread, base = start_background(app)
+    try:
+        port = int(base.rsplit(":", 1)[1])
+        closed = _free_port()
+        ok = _run_healthcheck(port, closed, tmp_path)
+        assert ok.returncode == 0, ok.stderr[-2000:]
+        down = _run_healthcheck(closed, closed, tmp_path)       # nothing listens there: unhealthy
+        assert down.returncode != 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        app.close(timeout=5)

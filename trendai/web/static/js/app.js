@@ -3,8 +3,9 @@
 //
 // Page modules export `create(ctx)` returning `{el, update?(ctx) → boolean, destroy?()}`. A page that can absorb a
 // location change (view-only parameters, focus) returns true from update(); otherwise it is destroyed and the new
-// route's page is created. On every route change the app scrolls to the top, sets the title, moves focus to the
-// page <h1> and announces the title (F.2).
+// route's page is created. On every route change the app closes every open dialog, sheet, popover and menu (so
+// browser Back never leaves a modal over the next page, A11Y-10), scrolls to the top, sets the title, moves focus to
+// the page <h1> and announces the title (F.2).
 
 import * as api from './api.js';
 import { clear, h } from './dom.js';
@@ -15,7 +16,8 @@ import * as store from './store.js';
 import { announce } from './ui.js';
 import { renderFooter } from './components/footer.js';
 import { openSettings } from './components/settings.js';
-import { markActive, renderTopbar } from './components/topbar.js';
+import { closeAllOverlays } from './components/sheet.js';
+import { markActive, renderTopbar, syncThemeButton } from './components/topbar.js';
 import { errorCard } from './components/errorcard.js';
 import * as home from './pages/home.js';
 import * as explore from './pages/explore.js';
@@ -29,13 +31,31 @@ const PAGES = {
   home, explore, upload, result, shared: result, samples, method: info, sources: info, privacy: info, notfound,
 };
 
+/** A Map that keeps only its `limit` most recently set entries (A11Y-20: results are hundreds of KB each). */
+class BoundedMap extends Map {
+  constructor(limit) {
+    super();
+    this.limit = limit;
+  }
+
+  set(key, value) {
+    if (this.has(key)) this.delete(key);
+    super.set(key, value);
+    while (this.size > this.limit) this.delete(this.keys().next().value);
+    return this;
+  }
+}
+
+const RESULTS_KEPT = 20;
+
 const app = {
   config: null,
   router: null,
   state: null,
   page: null,              // {route, instance}
-  results: new Map(),      // `${queryKey}|${hl}` or `r:${id}|${hl}` → C.7 envelope (back/forward never re-polls)
-  resultIds: new Map(),    // queryKey → result_id (a language switch re-fetches instead of re-analysing)
+  results: new BoundedMap(RESULTS_KEPT),     // `${queryKey}|${hl}` or `r:${id}|${hl}` → C.7 envelope (back/forward never re-polls)
+  resultIds: new BoundedMap(RESULTS_KEPT * 2), // queryKey → result_id (a language switch re-fetches instead of re-analysing)
+  focusLang: null,         // after a language switch: focus this language's button once the chrome is re-rendered
 };
 
 const main = () => document.getElementById('main');
@@ -44,21 +64,30 @@ function applyUpdownDefault(lang) {
   if (!store.getUpdown()) document.documentElement.dataset.updown = lang === 'ko' ? 'kr' : 'intl';
 }
 
+/** The settings dialog; a theme change there ('trendai:theme', below) updates the theme button in place (A11Y-11). */
+function settings(opener) {
+  return openSettings({ opener });
+}
+
 function renderChrome(focusLang) {
   renderTopbar(document.getElementById('topbar'), {
     lang: getLang(),
     onLang: switchLang,
-    onSettings: (opener) => openSettings({ opener }),
+    onSettings: settings,
   });
   renderFooter(document.getElementById('footer'), {
     version: app.config ? app.config.version : '',
-    onSettings: (opener) => openSettings({ opener }),
+    onSettings: settings,
   });
   const skip = document.querySelector('.skip-link');
   if (skip) skip.textContent = t('a11y.skip');
+  const hint = document.getElementById('datelink-hint');
+  if (hint) hint.textContent = t('a11y.datelink');
   if (focusLang) {
+    // the language buttons live in the 메뉴 sheet below 640 px: focus the 메뉴 button there (A11Y-4)
     const btn = document.querySelector(`#topbar [data-lang="${focusLang}"]`);
-    if (btn && btn.offsetParent) btn.focus({ preventScroll: true });
+    const target = btn && btn.offsetParent ? btn : document.querySelector('#topbar .menu-btn');
+    if (target) target.focus({ preventScroll: true });
   }
 }
 
@@ -68,8 +97,12 @@ function switchLang(lang) {
   store.setHl(lang);
   applyUpdownDefault(lang);
   const state = withState(app.state || emptyState('home'), { hl: lang });
+  app.focusLang = lang;           // onChange renders the chrome once, then focuses this language's button
   app.router.navigate(serialize(state) + window.location.hash, { replace: true, state: window.history.state });
-  renderChrome(lang);
+  if (app.focusLang) {            // the navigation did not reach onChange (no config yet): render it here
+    app.focusLang = null;
+    renderChrome(lang);
+  }
 }
 
 function context(state, routeInfo) {
@@ -85,7 +118,7 @@ function context(state, routeInfo) {
     setTitle: (title) => {
       document.title = title;
     },
-    openSettings: (opener) => openSettings({ opener }),
+    openSettings: settings,
   };
 }
 
@@ -108,6 +141,7 @@ function scrollToHash(hash) {
 }
 
 function onChange(state, routeInfo) {
+  if (routeInfo.type !== 'initial') closeAllOverlays();
   if (state.route === 'explore' && !state.q.length) {
     const home = emptyState('home');
     home.hl = state.hl;
@@ -116,10 +150,12 @@ function onChange(state, routeInfo) {
   }
   const lang = state.hl || getLang();
   const langChanged = lang !== getLang();
+  const focusLang = app.focusLang;
+  app.focusLang = null;
   if (langChanged) {
     setLang(lang);
     applyUpdownDefault(lang);
-    renderChrome();
+    renderChrome(focusLang);
   }
   app.state = state;
   markActive(window.location.pathname);
@@ -162,6 +198,8 @@ async function loadConfig() {
     return false;
   }
 }
+
+document.addEventListener('trendai:theme', () => syncThemeButton());
 
 async function boot() {
   const initial = new URLSearchParams(window.location.search).get('hl');

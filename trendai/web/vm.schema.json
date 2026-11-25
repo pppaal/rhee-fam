@@ -1,7 +1,7 @@
 {
  "$schema": "https://json-schema.org/draft/2020-12/schema",
  "$id": "trendai/web/vm.schema.json",
- "title": "trendai web view-model contract (WEB_VM_SCHEMA 1)",
+ "title": "trendai web view-model contract (WEB_VM_SCHEMA 2)",
  "description": "Machine-readable twin of docs/WEB_SPEC.md section D (B.3.3). Entry points: #/$defs/seriesVM (D.2), #/$defs/compareVM (D.4), #/$defs/analyzeJob and #/$defs/narrativeJob (C.6 job snapshots, picked by 'kind'), #/$defs/resultEnvelope (C.7; also C.9 with 'shared'). The root validates a series VM. Keywords used (a subset): type (a name or an array of names; 'integer' and 'number' never match booleans), required, properties, additionalProperties (false only), items (one schema), enum, minItems, maxItems, $defs and $ref ('#/$defs/<name>'). Null rule: an instance that is null is valid when the schema's 'type' array contains 'null'; no other keyword of that schema is then checked (this is how nullable $ref objects are written). Any other keyword (title, description, $schema, $id) is documentation only.",
  "$ref": "#/$defs/seriesVM",
  "$defs": {
@@ -534,11 +534,19 @@
          "string",
          "null"
         ]
+       },
+       "kind": {
+        "type": "string",
+        "enum": [
+         "support",
+         "caveat"
+        ]
        }
       },
       "required": [
        "text",
-       "detail"
+       "detail",
+       "kind"
       ],
       "additionalProperties": false
      }

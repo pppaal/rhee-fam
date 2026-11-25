@@ -99,7 +99,9 @@ def test_close_cancels_queued(tmp_path):
     queued = c.post("/api/analyze", json={"source": "wiki", "series": [{"terms": ["나"]}]}).json()["job_id"]
     time.sleep(0.1)
     app.close(timeout=10)
-    assert c.get(f"/api/jobs/{queued}").json()["status"] == "cancelled"
+    snap = c.get(f"/api/jobs/{queued}").json()
+    # the server stopped it: failed with server_busy (a retry card), not "cancelled" ("you cancelled", OPS-1)
+    assert snap["status"] == "failed" and snap["error"]["code"] == "server_busy" and snap["error"]["retry_after"] == 30
     assert c.get(f"/api/jobs/{first}").json()["status"] == "done"
 
 

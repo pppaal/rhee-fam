@@ -340,12 +340,18 @@ def test_display_rule():
     assert build(make_input(r, meta))["chart"]["display"] == "normal"
     bands = build(make_input(with_forecast(r, skill=1.2), meta))
     assert bands["chart"]["display"] == "bands_only"
-    assert bands["hero"]["reference_note"] == "예측력이 낮아 범위만 참고용으로 보여 드려요."
+    # CON-5: the note says what is true ("not better than naive"), not "예측력이 낮아" next to a medium/high chip
+    assert bands["hero"]["reference_note"] == "단순 예측보다 낫지 않아 범위만 참고용으로 보여 드려요."
     assert bands["flags"]["reference_only"] is True
     weak = build(make_input(with_outlook(r, confidence="low"), meta))
     assert weak["chart"]["display"] == "weak"
     assert weak["hero"]["reference_note"] == "예측 신뢰도가 낮아 중앙선은 참고용이에요."
-    assert build(make_input(with_forecast(r, skill=None), meta))["chart"]["display"] == "weak"
+    unverified = build(make_input(with_forecast(r, skill=None), meta))
+    assert unverified["chart"]["display"] == "weak"
+    assert unverified["hero"]["reliability"]["level"] != "low"
+    assert unverified["hero"]["reference_note"] == "정확도를 검증하지 못해 중앙선은 참고용이에요."
+    assert build(make_input(with_forecast(r, skill=None), meta), "en")["hero"]["reference_note"] == \
+        "Accuracy could not be checked, so treat the centre line as a rough guide."
     assert build(make_input(with_forecast(r, skill=1.0), meta))["chart"]["display"] == "bands_only"
 
 
@@ -399,13 +405,15 @@ def test_outlook_line_rules():
     assert line("down", "하락", 0.02, None, "ko") == "▼ 하락 가능성 매우 높음 (상승 확률 5% 이하)"
     assert line("down", "downward", 0.02, None, "en") == "▼ Fall very likely (chance of rise 5% or less)"
     assert line("flat", "보합", 0.5, None, "ko") == "▶ 보합 · 상승·하락 엇비슷 (상승 확률 약 50%)"
-    assert line("flat", "flat", 0.5, None, "en") == "▶ flat · About even (chance of rise about 50%)"
+    assert line("flat", "flat", 0.5, None, "en") == "▶ Flat · About even (chance of rise about 50%)"   # CON-14
+    assert line("up", "upward", 0.35, None, "en") == \
+        "▲ Upward · Fall slightly more likely (chance of rise about 35%)"
     # the likelihood's side disagrees with the direction: the word stays in front
     assert line("up", "상승", 0.35, None, "ko") == "▲ 상승 · 하락 쪽이 약간 우세 (상승 확률 약 35%)"
     assert line("up", "상승", 0.3, None, "ko") == "▲ 상승 · 하락 쪽이 우세 (상승 확률 약 30%)"     # bin edge: > 0.30
     assert line("flat", "보합", None, "현재 수준이 0", "ko") == "▶ 보합 · 상승 확률은 계산하지 않음(현재 수준이 0)"
     assert line("flat", "flat", None, "current level is 0", "en") == \
-        "▶ flat · chance of rise not computed (current level is 0)"
+        "▶ Flat · chance of rise not computed (current level is 0)"
     growing = sample_vm("growing")["hero"]["outlook"]
     assert growing["line"] == f"▲ {growing['likelihood']} (상승 확률 {growing['prob_text']})"
     assert (growing["arrow"], growing["tone"], growing["word"]) == ("▲", "up", "상승")
@@ -461,14 +469,18 @@ def test_reasons_detail_and_dates():
     mk = [x for x in reasons if x["text"].startswith("Mann-Kendall")]
     assert mk and mk[0]["detail"] == "τ = 0.95, p < 0.001"
     assert mk[0]["text"] == "Mann-Kendall 검정에서 전체 기간의 상승 추세가 유의합니다."
-    assert {"text": "현재 추세는 고점(2025.12) 수준입니다.", "detail": None} in reasons
+    assert {"text": "현재 추세는 고점(2025.12) 수준입니다.", "detail": None, "kind": "support"} in reasons
     for x in reasons:
         assert not re.search(r"\d{4}-\d{2}", x["text"])
+    # FU-7 (d): the reason's window is the phase-judgement window, not the tiles' "최근" (one season)
+    assert any(re.match(r"최근 \d+개월\(국면 판단 구간\) 동안 추세가 ", x["text"]) for x in reasons), reasons
     en = sample_vm("growing", "en")["phase"]["reasons"]
-    assert {"text": "The trend is at its peak (Dec 2025).", "detail": None} in en
+    assert {"text": "The trend is at its peak (Dec 2025).", "detail": None, "kind": "support"} in en
     assert any(x["detail"] == "τ = 0.95, p < 0.001" for x in en)
+    assert any(re.match(r"Over the last \d+ months \(the phase-judgement window\) the trend ", x["text"])
+               for x in en), en
     item = vm._reason_item("2023-03-06에 구조 변화(성장 가속)가 감지되었습니다.", "W", "ko")
-    assert item == {"text": "2023.03.06에 구조 변화(성장 가속)가 감지되었습니다.", "detail": None}
+    assert item == {"text": "2023.03.06에 구조 변화(성장 가속)가 감지되었습니다.", "detail": None, "kind": "support"}
 
 
 def test_narrative_date_links():
@@ -501,16 +513,24 @@ def test_summary_line():
     assert v["source"]["short"] == "샘플·가상 데이터"
     assert v["summary_line"].startswith("[trendai] growing(샘플·가상 데이터, 월간): 성장기 · 향후 12개월 평균 +")
     assert "예상(상승 가능성 95% 이상)" in v["summary_line"]
-    assert v["summary_line"].endswith(" (데이터 기준 2026.11.25 09:12)")
+    # CON-8: a sample has no "as of" (synthetic data, the source line has none either)
+    assert "기준" not in v["summary_line"].split("예상(")[-1] and "2026.11.25" not in v["summary_line"]
     seasonal = sample_vm("seasonal")
-    assert f" · 보통 {seasonal['tiles'][5]['value']} 정점 (데이터 기준" in seasonal["summary_line"]
+    assert seasonal["summary_line"].endswith(f" · 보통 {seasonal['tiles'][5]['value']} 정점")
     en = sample_vm("growing", "en")
     assert en["summary_line"].startswith("[trendai] growing (sample · synthetic data, monthly): Growing · next ")
-    assert en["summary_line"].endswith(" (data as of Nov 25, 2026 09:12 KST)")
+    assert "Nov 25, 2026" not in en["summary_line"]
     neg = build(make_input(report_of("negative"), meta_of(report_of("negative"), "upload")))
     assert " · 보합 전망" in neg["summary_line"] or " 전망" in neg["summary_line"]
-    weak = build(make_input(with_outlook(report_of("growing"), confidence="low"), meta_of(report_of("growing"))))
-    assert "(참고용 예측) (데이터 기준" in weak["summary_line"]
+    # uploads: analysis time, worded like the source line ("분석 …"), never "데이터 기준"
+    assert neg["summary_line"].endswith(" (분석 2026.11.25 09:12)") and "데이터 기준" not in neg["summary_line"]
+    neg_en = build(make_input(report_of("negative"), meta_of(report_of("negative"), "upload")), "en")
+    assert neg_en["summary_line"].endswith(" (analysed Nov 25, 2026 09:12 KST)")
+    weak = build(make_input(with_outlook(report_of("growing"), confidence="low"),
+                            meta_of(report_of("growing"), "wiki")))
+    assert weak["summary_line"].endswith("(참고용 예측) (데이터 기준 2026.11.25 09:12)")
+    naver = build(make_input(report_of("naver_big"), meta_of(report_of("naver_big"), "naver")), "en")
+    assert naver["summary_line"].endswith(" (data as of Nov 25, 2026 09:12 KST)")
 
 
 def test_y_hint_relative_index():
@@ -584,9 +604,9 @@ def test_phase_reasons_en_translated():
     odd = dataclasses.replace(r, analysis=dataclasses.replace(
         r.analysis, phase=dataclasses.replace(r.analysis.phase, reasons=["번역 규칙이 없는 이유입니다."])))
     out = build(make_input(odd, meta_of(odd)), "en")["phase"]["reasons"]
-    assert out == [{"text": "See the method page for the rules.", "detail": None}]
+    assert out == [{"text": "See the method page for the rules.", "detail": None, "kind": "support"}]
     ko = build(make_input(odd, meta_of(odd)), "ko")["phase"]["reasons"]
-    assert ko == [{"text": "번역 규칙이 없는 이유입니다.", "detail": None}]
+    assert ko == [{"text": "번역 규칙이 없는 이유입니다.", "detail": None, "kind": "support"}]
 
 
 def _shifted(key: str, months: int, name: str, scale: float = 1.0):
@@ -717,7 +737,8 @@ def test_narrative_caveats_split():
     r = report_of("fad")
     v = sample_vm("fad")
     assert "## 주의할 점" not in v["narrative"]["markdown"]
-    body, caveats = vm.split_caveats(r.narrative, "ko")
+    fx = vm._Facts(r, meta_of(r, "sample"), "ko")
+    body, caveats = vm.split_caveats(vm._tidy_rule_narrative(r.narrative, fx), "ko")
     assert caveats and caveats.startswith("- ")
     assert v["caveats"]["markdown"] == vm.localize_dates(caveats, "M", "ko", [])[0]
     assert v["narrative"]["markdown"] == vm.localize_dates(body, "M", "ko", v["chart"]["dates"])[0]
@@ -953,3 +974,245 @@ def test_compare_with_failed_series_and_envelope_schema():
            "series": [{"index": 0, "status": "done", "vm": vms[0]}], "failed": [], "notices": [], "compare": None,
            "view": "compare", "error": None, "result_url": None, "elapsed_ms": 1840, "poll_after_ms": 500}
     assert_valid(job, "analyzeJob")
+
+
+# ------------------------------------------------------------------------------------- round-7 regression tests
+
+def _seasonal_weekly(shift: int, growth: float, name: str):
+    """A weekly series like the fake Naver one: strong yearly season (peak month set by ``shift``), steady growth or
+    decline, last week 2026-11-16, analysed with the Naver default horizon of 26 weeks (< one season)."""
+    import math
+
+    idx = pd.date_range("2021-11-29", "2026-11-16", freq="W-MON")
+    vals = [max(0.5, (50 + 30 * math.sin(2 * math.pi * (d.month - shift) / 12)) * (1 + growth * t))
+            for t, d in enumerate(idx)]
+    s = pd.Series(vals, index=idx)
+    return pipeline.run(s / s.max() * 100.0, name=name, horizon=26)
+
+
+@functools.lru_cache(maxsize=None)
+def _uv_report():
+    return _seasonal_weekly(6, 0.008, "자외선 차단제")      # up call (adjusted) while the forecast falls to the off-season
+
+
+@functools.lru_cache(maxsize=None)
+def _pad_report():
+    return _seasonal_weekly(0, -0.0015, "패딩")            # down call (adjusted) while the forecast climbs into the season
+
+
+def test_seasonal_adjustment_context():
+    """FU-3: '▲ 상승 가능성 매우 높음' beside a forecast line that halves. When the outlook compares seasonally adjusted
+    averages and the drawn forecast moves the other way, the hero, the summary line and the rank card say so, and the
+    expected-change / chance-of-rise tooltips explain the adjustment."""
+    r = _uv_report()
+    assert r.outlook.direction == "up" and r.outlook.expected_change_pct > 0
+    fut = float(np.mean(np.asarray(r.forecast.mean, dtype=float)))
+    assert fut < float(np.mean(np.asarray(r.analysis.series, dtype=float)[-52:]))      # the line falls
+    v = build(make_input(r, meta_of(r, "naver")))
+    hero = v["hero"]
+    assert hero["basis"].startswith("계절 보정한 향후 26주 평균")
+    assert hero["sentence"].endswith("다만 앞으로 26주는 계절적으로 낮은 시기라 예측선은 내려가요 (보통 9월 정점). "
+                                     "계절 높낮이를 빼고 보면 오르는 흐름이에요.")
+    tiles = {t["key"]: t for t in v["tiles"]}
+    note = "26주 구간은 계절 주기(52주)를 다 채우지 못해, 그 구간의 평균적인 계절 높낮이를 빼고 비교했어요."
+    assert tiles["expected_change"]["tooltip"] == T.TILE_HELP["expected_change"][0] + " " + note
+    assert "계절 높낮이를 뺀 평균끼리" in tiles["prob_increase"]["tooltip"]
+    assert " · 보통 9월 정점 · 앞으로 계절적 비수기 (데이터 기준" in v["summary_line"]
+    en = build(make_input(r, meta_of(r, "naver")), "en")
+    assert en["hero"]["sentence"].endswith(
+        "That said, the next 26 weeks are a seasonal low, so the forecast line falls (usually peaks in Sep); with "
+        "the seasonal swing removed, the trend is rising.")
+    assert "The 26-week window covers only part of the seasonal cycle (52 weeks)" in en["tiles"][3]["tooltip"]
+    assert " · seasonal low ahead (data as of" in en["summary_line"]
+
+    pad = _pad_report()
+    assert pad.outlook.direction == "down"
+    pv = build(make_input(pad, meta_of(pad, "naver")))
+    assert "계절적으로 높은 시기라 예측선은 올라가요" in pv["hero"]["sentence"]
+    assert pv["hero"]["sentence"].endswith("계절 높낮이를 빼고 보면 내리는 흐름이에요.")
+    assert "앞으로 계절적 성수기" in pv["summary_line"]
+
+    # the rank card carries the short context next to the basis
+    inputs = [make_input(r, meta_of(r, "naver"), index=0, request_size=2),
+              make_input(pad, meta_of(pad, "naver"), index=1, request_size=2)]
+    cmp, _ = compare_of(inputs)
+    rows = {row["index"]: row for row in cmp["ranking"]}
+    assert rows[0]["expected_change"]["basis"] == hero["basis"] + " · 앞으로 계절적 비수기"
+    assert rows[1]["expected_change"]["basis"].endswith(" · 앞으로 계절적 성수기")
+
+    # a full-season horizon (monthly, h = 12) is not adjusted: no note, no context
+    g = sample_vm("growing")
+    assert g["tiles"][3]["tooltip"] == T.TILE_HELP["expected_change"][0]
+    assert "계절적으로" not in g["hero"]["sentence"] and "계절적" not in g["summary_line"]
+    assert [vm._topic_particle(w) for w in ("26주", "6개월", "30일", "8분기", "5년", "3")] == \
+        ["는", "은", "은", "는", "은", "는"]
+
+
+def _with_metrics(report, **changes):
+    a = report.analysis
+    return dataclasses.replace(report, analysis=dataclasses.replace(
+        a, metrics=dataclasses.replace(a.metrics, **changes)))
+
+
+def test_momentum_float_noise_prints_zero():
+    """UX-5 / CON-6 / FU-7(c): momentum float noise printed '−1.5×10⁻¹⁵%p/월' on the tile and the ranking."""
+    base = report_of("growing", "잡음")
+    for noise, text in ((-1.5e-15, "0%p/월"), (2.9e-16, "0%p/월"), (6.7e-17, "0%p/월"), (-0.0014, "0%p/월"),
+                        (0.042, "+0.042%p/월"), (-3.91, "−3.9%p/월")):
+        r = _with_metrics(base, momentum=noise)
+        v = build(make_input(r, meta_of(r, "upload", filename="f.csv")))
+        tile = {t["key"]: t for t in v["tiles"]}["momentum"]
+        assert tile["sub"] == text, (noise, tile)
+        assert "×10" not in json.dumps(v["tiles"], ensure_ascii=False)
+    r = _with_metrics(base, momentum=6.7e-17)
+    assert {t["key"]: t for t in build(make_input(r, meta_of(r, "upload")), "en")["tiles"]}["momentum"]["sub"] == \
+        "0 pp/mo"
+    other = report_of("fad", "다른")
+    inputs = [make_input(_with_metrics(base, momentum=-1.5e-15), meta_of(base, "upload"), index=0, request_size=2),
+              make_input(other, meta_of(other, "upload"), index=1, request_size=2)]
+    cmp, _ = compare_of(inputs)
+    row = next(x for x in cmp["ranking"] if x["index"] == 0)
+    assert row["momentum"]["text"] == "0%p/월"
+
+
+def test_phase_reason_kinds_caveat_last():
+    """UX-7: the random-walk caveat was drawn with the same ✓ as the supporting reasons."""
+    r = report_of("growing", "행보")
+    walk = "변화가 누적되는 무작위 행보에 가까운 움직임이라, 추세처럼 보이는 등락도 우연일 수 있습니다."
+    reasons = [walk] + list(r.analysis.phase.reasons)[:2]
+    odd = dataclasses.replace(r, analysis=dataclasses.replace(
+        r.analysis, phase=dataclasses.replace(r.analysis.phase, reasons=reasons)))
+    for lang in vm.LANGS:
+        items = build(make_input(odd, meta_of(odd)), lang)["phase"]["reasons"]
+        assert [x["kind"] for x in items] == ["support", "support", "caveat"], items
+        assert ("무작위 행보" if lang == "ko" else "random walk") in items[-1]["text"]
+    assert all(x["kind"] == "support" for x in sample_vm("growing")["phase"]["reasons"])
+
+
+def test_rule_narrative_terms_match_cards():
+    """UX-13 / CON-9: the narrative said '(신뢰도 95%)' / '(판단 신뢰도 95%)' next to '상승 확률' and '예측 신뢰도'
+    (the R4 collision), printed MASE notes, model ids and test statistics, and used other English terms."""
+    v = sample_vm("growing")
+    text = v["narrative"]["markdown"] + "\n" + v["caveats"]["markdown"]
+    assert "(판단 확신도 높음)" in text
+    for bad in ("신뢰도 95%", "판단 신뢰도", "MASE", "모델 ID", "τ =", "p < 0.001", "잔차의 변동계수"):
+        assert bad not in text, bad
+    assert "예측 신뢰도 높음" in text                      # the reliability keeps the card's name
+    en = sample_vm("growing", "en")
+    etext = en["narrative"]["markdown"] + "\n" + en["caveats"]["markdown"]
+    assert "(phase certainty: high)" in etext and "Chance of rise" in etext and "forecast reliability" in etext
+    for bad in ("confidence 95%", "Probability of increase", "forecast confidence", "Forecast confidence",
+                "MASE", "model ids", "τ =", "coefficient of variation"):
+        assert bad not in etext, bad
+    # the details still carry what was removed from the body
+    assert "MASE" in v["future"]["accuracy"]["details"] and v["future"]["models"]
+    # tentative calls drop the number; the rest of the sentence stays
+    fx = vm._Facts(report_of("growing"), meta_of(report_of("growing")), "ko")
+    assert vm._tidy_rule_narrative("단계(관측치가 적어 잠정 판단, 신뢰도 30%)이며, 국면(**성장기**)도 잠정 판단입니다"
+                                   "(신뢰도 30%).", fx) == "단계(관측치가 적어 잠정 판단)이며, 국면(**성장기**)도 잠정 판단입니다."
+    fx_en = vm._Facts(report_of("growing"), meta_of(report_of("growing")), "en")
+    assert vm._tidy_rule_narrative("currently **Growing** (tentative: too few observations; confidence 30%); the "
+                                   "phase is only a tentative call (confidence 30%).", fx_en) == \
+        "currently **Growing** (tentative: too few observations); the phase is only a tentative call."
+    # AI texts are the model's own: never rewritten
+    rec = vm.build_ai_record("## 과거: 어떻게 여기까지 왔나\n- 신뢰도 95%", v, model="m", created_at=AS_OF)
+    assert "신뢰도 95%" in rec["markdown"]
+
+
+def test_weekly_narrative_span_ends_on_sunday():
+    """CON-7: the source line ends a weekly range on the last week's Sunday, the narrative ended it on the Monday."""
+    r = report_of("naver_big")
+    assert vm._iso(r.analysis.series.index[-1]) == "2026-11-16"
+    v = build(make_input(r, meta_of(r, "naver")))
+    assert v["source"]["range_label"] == "2023.11.27 ~ 2026.11.22"
+    assert "2023.11.27부터 2026.11.22까지" in v["narrative"]["markdown"]
+    en = build(make_input(r, meta_of(r, "naver")), "en")
+    assert "from Nov 27, 2023 to Nov 22, 2026" in en["narrative"]["markdown"]
+    assert "2026.11.16" in json.dumps(v["chart"]["dates"]) or "2026-11-16" in v["chart"]["dates"]
+
+
+def test_small_anomaly_wording():
+    """UX-23: '평소보다 크게 낮음 · 실제 31.3 / 예상 31.3'."""
+    from trendai.types import Anomaly
+
+    r = report_of("naver_big", "작은 이상치")
+    d0, d1 = r.analysis.series.index[10], r.analysis.series.index[20]
+    anomalies = [Anomaly(date=d0, index=10, value=40.46, expected=40.64, zscore=-6.0),
+                 Anomaly(date=d1, index=20, value=23.7, expected=16.3, zscore=8.0)]
+    odd = dataclasses.replace(r, analysis=dataclasses.replace(r.analysis, anomalies=anomalies))
+    texts = [a["text"] for a in build(make_input(odd, meta_of(odd, "naver")))["chart"]["anomalies"]]
+    assert texts == ["평소보다 약간 낮음 · 실제 40.5 / 예상 40.6", "평소보다 크게 높음 · 실제 23.7 / 예상 16.3"]
+    en = [a["text"] for a in build(make_input(odd, meta_of(odd, "naver")), "en")["chart"]["anomalies"]]
+    assert en[0] == "Slightly below the usual range · actual 40.5 / expected 40.6"
+    assert en[1].startswith("Far above the usual range")
+
+
+def test_bands_only_withholds_the_centre_value():
+    """CON-4: the 예측표 printed the mean that the chart and its table view withhold for bands_only."""
+    r = report_of("growing")
+    bands = build(make_input(with_forecast(r, skill=1.2), meta_of(r)))
+    rows = bands["future"]["table"]["rows"]
+    assert rows and all(row["mean"] == "—" for row in rows)
+    assert all(row["range80"] != "—" for row in rows)
+    assert bands["future"]["scenarios"]["note"].endswith("단순 예측보다 낫지 않아 가운데 값(기준)은 참고용이에요.")
+    normal = sample_vm("growing")
+    assert all(row["mean"] != "—" for row in normal["future"]["table"]["rows"])
+    assert "참고용" not in normal["future"]["scenarios"]["note"]
+
+
+def test_forecast_table_large_values_compact():
+    """CON-13 / FU-12: the table printed '4.22×10¹²' (and won to the unit) beside scenario boxes in 조/만."""
+    r = pipeline.run(samples.sample("growing") * 4e10, name="매출")
+    v = build(make_input(r, meta_of(r, "upload", filename="f.csv", unit_label="원")))
+    row = v["future"]["table"]["rows"][0]
+    assert row["mean"].endswith("조") and "×10" not in row["mean"] and "×10" not in row["range80"]
+    assert all(x["value_text"].endswith("조") for x in v["future"]["scenarios"]["rows"])
+    r2 = pipeline.run(samples.sample("growing") * 30000, name="매출")
+    row2 = build(make_input(r2, meta_of(r2, "upload")))["future"]["table"]["rows"][0]
+    assert row2["mean"].endswith("만") and "," not in row2["mean"]
+    small = sample_vm("growing")["future"]["table"]["rows"][0]
+    assert not small["mean"].endswith(("만", "억", "조"))
+
+
+def test_hero_sentences_are_haeyo():
+    """CON-14 (1): undefined-change hero sentences were the engine's 합니다체."""
+    for key in ("negative", "allzero"):
+        r = report_of(key)
+        hero = build(make_input(r, meta_of(r, "upload")))["hero"]
+        assert hero["change_undefined"] is not None
+        assert "습니다" not in hero["sentence"] and "합니다" not in hero["sentence"], hero["sentence"]
+    neg = build(make_input(report_of("negative"), meta_of(report_of("negative"), "upload")))["hero"]["sentence"]
+    assert neg.startswith("현재 수준이 음수여서 변화율(%) 대신 수준으로 비교해요.")
+    assert vm._haeyo("…변화율은 계산하지 않았습니다.") == "…변화율은 계산하지 않았어요."
+    assert vm._haeyo("…변화율(%)은 의미가 없습니다.") == "…변화율(%)은 의미가 없어요."
+
+
+def test_ai_privacy_note_matches_payload():
+    """SEC-4: the note promised 'raw data is never sent' while the payload carries up to 60 values (all of a short
+    series) and the series name. The note now says what is sent; this pins it to the payload."""
+    r = report_of("allzero", "월매출_비밀")
+    payload = N.build_llm_payload(r.analysis, r.forecast, r.outlook)
+    assert len(payload["history"]) == len(r.analysis.series) <= 60              # a short series goes out whole
+    assert payload["series"]["name"] == "월매출_비밀"
+    long = N.build_llm_payload(report_of("growing").analysis, report_of("growing").forecast,
+                               report_of("growing").outlook)
+    assert len(long["history"]) <= 60
+    v = sample_vm("growing")
+    note = v["narrative"]["ai_privacy_note"]
+    assert "최대 60개" in note and "이름" in note and "보내지 않아요" in note
+    assert "원본 데이터는 보내지 않아요" not in note
+    en = sample_vm("growing", "en")["narrative"]["ai_privacy_note"]
+    assert "up to 60 values" in en and "name" in en and "never the original data" not in en
+
+
+def test_horizon_long_notice_uses_span_words():
+    """CON-14 (2): '예측 기간(36기간)이 …' on a page that says '36개월' everywhere else (analyze.py passes ``freq``)."""
+    ko = vm.make_notice("horizon_long", "ko", params={"horizon": 36, "n": 6, "ratio": 5, "freq": "M"},
+                        series_index=0)
+    assert ko["text"].startswith("예측 기간(36개월)이 데이터 길이(6개)의 5배를 넘어요.")
+    en = vm.make_notice("horizon_long", "en", params={"horizon": 104, "n": 12, "ratio": 5, "freq": "W"},
+                        series_index=0)
+    assert en["text"].startswith("The forecast horizon (104 weeks) is more than 5 times")
+    plain = vm.make_notice("horizon_long", "ko", params={"horizon": 36, "n": 6, "ratio": 5}, series_index=0)
+    assert "(36기간)" in plain["text"]                    # without freq: the catalog text unchanged
+    assert_valid(ko, "notice") if "notice" in SCHEMA["$defs"] else None

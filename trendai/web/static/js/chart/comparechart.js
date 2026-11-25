@@ -11,7 +11,9 @@
 // index scale), 'chart.forecast' (forecast region label), 'chart.readout_range' (bands_only values in the
 // read-out, with 'chart.readout_forecast' as the fallback), 'common.reference_only' (legend chip of bands_only
 // series), 'a11y.chart_keys', 'compare.title' (<title>), 'compare.grey_hint' (shown when grey series exist), plus
-// describe.js's keys for <desc>.
+// describe.js's keys for <desc>; through common.uiText (fallback text while the catalog lacks them):
+// 'compare.bands_hint' (whose band 예측 범위 보기 shows), 'chart.window_note' / 'chart.window_full' (the narrow-width
+// history window).
 //
 // DOM (classes styled by css/chart.css):
 //   .chart.chart-compare
@@ -19,18 +21,21 @@
 //     p.chart-hint                                              compare.grey_hint, only with grey series
 //     .chart-readout                                            every visible series at the crosshair date
 //     .chart-wrap[tabindex=0][role=group] > svg.chart-svg[role=img]
+//     p.chart-hint.chart-band-hint                              while 예측 범위 보기 is on: whose band is shown
+//     .chart-range                                              below 640 px when the history is windowed (UX-4)
 
 import { h, svg, clear } from '../dom.js';
 import * as fmt from '../fmt.js';
 import {
-  compareYDomain, isoToMs, linearScale, logScale, tickCount, tickLabels, timeTicks, dodge,
+  compareYDomain, dodge, groupAnchors, isoToMs, linearScale, logScale, narrowWindow, tickCount, tickLabels, timeTicks,
 } from './scale.js';
 import { drawXAxis, drawYAxis, measureLabels, textWidths, X_CAPTION_SPACE, X_TICK_SPACE } from './axes.js';
-import { createCrosshair, nearestIndex, throttle } from './crosshair.js';
+import { createCrosshair, nearestIndex, shouldAnnounce, throttle } from './crosshair.js';
 import { areaPath, extent, linePath, seamForecast, slotIconPath, truncateToWidth, withUnit } from './geom.js';
 import { describeCompare } from './describe.js';
 import {
-  WIDE_PX, contentWidth, defaultAnnounce, joinParts, lineKey, observeWidth, renderReadout, slotGlyph, uid,
+  WIDE_PX, contentWidth, defaultAnnounce, joinParts, lineKey, observeWidth, rangeControl, renderReadout, slotGlyph,
+  uid, uiText,
 } from './common.js';
 
 const HEIGHT_WIDE = 340;
@@ -38,6 +43,10 @@ const HEIGHT_NARROW = 260;
 const MARGIN_TOP = 24;
 const LABEL_BAND = 22;
 const LABEL_GAP = 14;                       // F.7.2: direct labels ≥ 14 px apart
+const LABEL_MERGE_PX = 4;                   // line ends this close (same date) share one label `A · B` (UX-16)
+const LABEL_BOTTOM = 7;                     // a label's centre stays this far above the x axis line (UX-16)
+const HOVER_PX = 8;                         // mouse: a line within 8 px of the pointer takes the focus
+const TOUCH_PX = 16;                        // touch: a line within 16 px of the finger takes the focus (UX-14)
 const ICONS = ['circle', 'diamond', 'hexagon', 'square', 'cross'];
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
@@ -46,11 +55,13 @@ const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
  *   scale?: 'raw'|'index'|'log',
  *   bands?: boolean,
  *   hidden?: Iterable<number>,
- *   focus?: number|null
+ *   focus?: number|null,
+ *   fullRange?: boolean
  * }} CompareChartOptions
  * scale: URL `scale` param (default compareVM.scale.default; a disallowed scale falls back to 'raw');
  * bands: the 예측 범위 보기 toggle (default false); hidden: series indexes switched off in the legend;
- * focus: series index whose band is shown (when `bands`) and whose line is emphasised.
+ * focus: series index whose band is shown (when `bands`) and whose line is emphasised; fullRange: below 640 px,
+ * show the whole history instead of the default window (scale.narrowWindow; flipped by the chart's own toggle).
  */
 
 /**
@@ -111,6 +122,8 @@ function buildModel(compareVM, seriesVMs) {
   const points = isos.map((iso) => ({ iso, ms: isoToMs(iso) }));
   const lastIso = series.reduce((m, s) => (s.last && s.last.date > m ? s.last.date : m), '');
   const xLabels = new Set(series.map((s) => s.xLabel));
+  const rankOrder = ((compareVM && compareVM.ranking) || []).slice()
+    .sort((a, b) => (a.rank ?? Infinity) - (b.rank ?? Infinity)).map((r) => r.index);
   return {
     series,
     points,
@@ -120,6 +133,7 @@ function buildModel(compareVM, seriesVMs) {
     valueKind: (compareVM && compareVM.value_kind) || (vms[0] && vms[0].chart.value_kind) || 'raw',
     freq: (vms[0] && vms[0].chart.freq) || 'D',
     caption: xLabels.size === 1 ? [...xLabels][0] : null,
+    rankOrder,
   };
 }
 
@@ -127,6 +141,8 @@ function buildModel(compareVM, seriesVMs) {
  * Render the comparison chart into `container` (children replaced): legend chips (`button[aria-pressed]`, swatch +
  * slot icon + name), read-out bar, focusable wrapper and `<svg role="img">` (height 340 / 260 px). Relative
  * indexes use the fixed 0–100 frame (scale.compareYDomain). Weak-forecast rule per series from its chart.display.
+ * Below 640 px a long history is windowed (scale.narrowWindow, with a 전체 기간 toggle under the plot) and, with
+ * three or more direct labels, the labels give way to the legend chips (end markers stay).
  * May be called with a partial set while the job runs; call update() with the final envelope's VMs.
  * @param {HTMLElement} container
  * @param {Object} compareVM   D.4 compare VM (slots, value_kind, axis_label, scale, ranking)
@@ -158,11 +174,34 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
   const dots = svg('g', { class: 'chart-xh-dots' });
   xhLayer.appendChild(dots);
   const wrapper = h('div', { class: 'chart-wrap', tabindex: '0', role: 'group' }, svgEl);
-  const root = h('div', { class: ['chart', 'chart-compare'] }, legend, hint, readout, wrapper);
+  // below the plot, so its text changing with the focus never moves the chart
+  const bandHint = h('p', { class: 'chart-hint chart-band-hint', hidden: true });
+  const range = rangeControl(() => {
+    o.fullRange = !o.fullRange;
+    render();
+  });
+  const root = h('div', { class: ['chart', 'chart-compare'] }, legend, hint, readout, wrapper, bandHint, range.el);
   clear(container).appendChild(root);
 
   const t = (key, params) => o.t(key, params);
   const announce = throttle((text) => (o.announce || defaultAnnounce)(text), 250);
+
+  // The crosshair works on the points inside the x window (geo.off = index of the first one); everything else uses
+  // indexes into model.points.
+  const offset = () => (geo ? geo.off : 0);
+  const currentK = () => {
+    const i = crosshair.current();
+    return i < 0 ? -1 : i + offset();
+  };
+  /** Move the crosshair to model point k, showing the full period first when k lies before the window. */
+  function moveToK(k) {
+    if (!(k >= 0) || !geo) return;
+    if (k < geo.off) {
+      o.fullRange = true;
+      render();
+    }
+    if (geo) crosshair.moveTo(k - geo.off);
+  }
 
   // ------------------------------------------------------------------------------------------ scale
 
@@ -198,6 +237,25 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
     const f = localFocus ?? extFocus;
     return f !== null && f !== undefined && !hidden.has(f) && model.series.some((s) => s.k === f) ? f : null;
   };
+
+  /**
+   * The series whose 80 % band is drawn: the focused one; while 예측 범위 보기 is on and nothing is focused, the
+   * best-ranked visible series with a forecast (request order before the ranking exists), so the toggle always
+   * shows a band — touch screens have no hover, and a legend tap hides the series (UX-14).
+   */
+  function bandSeries(f) {
+    const hasFc = (s) => s && !hidden.has(s.k) && s.fc.dates.length > 0;
+    if (f !== null) {
+      const fs = model.series.find((s) => s.k === f);
+      return hasFc(fs) ? fs : null;
+    }
+    if (!o.bands) return null;
+    for (const k of model.rankOrder) {
+      const s = model.series.find((it) => it.k === k);
+      if (hasFc(s)) return s;
+    }
+    return model.series.find(hasFc) || null;
+  }
 
   function setLocalFocus(k) {
     if (k === localFocus) return;
@@ -277,7 +335,7 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
     rows.sort((a, b) => (isNum(b.sortV) ? b.sortV : -Infinity) - (isNum(a.sortV) ? a.sortV : -Infinity));
     const date = fmt.dateLabel(p.iso, model.freq, o.lang);
     const dateText = allForecast ? joinParts([date, t('chart.forecast')]) : date;
-    const view = rows.map((r) => ({ key: slotGlyph(r.s.icon, r.s.cls, 10), name: r.s.name, text: r.text }));
+    const view = rows.map((r) => ({ key: slotGlyph(r.s.icon, r.s.cls), name: r.s.name, text: r.text }));
     return { date: dateText, rows: view, text: joinParts([dateText, ...rows.map((r) => `${r.s.name} ${r.text}`)]) };
   }
 
@@ -307,58 +365,132 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
     }
   }
 
-  function onMove(k) {
+  function onMove(i, cause) {
+    const k = i < 0 ? -1 : i + offset();
     const content = showReadout(k);
     drawDots(k);
-    if (k >= 0 && content) announce(content.text);
+    if (k >= 0 && content && shouldAnnounce(cause)) announce(content.text);
   }
 
   const crosshair = createCrosshair({
     wrapper, plot: wrapper, layer: xhLayer, plotHeight: 0, points: [], startIndex: model.startIndex, onMove,
   });
 
-  // line hover → focus (pointer within 8 px of a visible line at the nearest date)
+  // line hover → focus (mouse: within 8 px of a visible line at the nearest date). Touch has no hover: pressing or
+  // scrubbing within 16 px of a line focuses it until the next touch (a touch away from every line clears it), so
+  // the 예측 범위 보기 band can be switched on phones too (UX-14).
+  /** Series key of the visible line nearest to the client point within `tol` px at the nearest date, or null. */
+  function lineAt(clientX, clientY, tol) {
+    if (!geo) return null;
+    const ctm = svgEl.getScreenCTM();
+    if (!ctm) return null;
+    const pt = svgEl.createSVGPoint();
+    pt.x = clientX;
+    pt.y = clientY;
+    const { x: px, y: py } = pt.matrixTransform(ctm.inverse());
+    const i = nearestIndex(geo.xs, px);
+    const p = model.points[i < 0 ? -1 : i + geo.off];
+    let best = null;
+    let bestD = tol;
+    for (const s of model.series) {
+      if (hidden.has(s.k) || !p) continue;
+      const entry = s.byDate.get(p.iso);
+      if (!entry || (entry.part === 'forecast' && s.display === 'bands_only')) continue;
+      const v = tx(s, entry.v, geo.scale);
+      if (v === null) continue;
+      const d = Math.abs(geo.y.map(v) - py);
+      if (d < bestD) {
+        bestD = d;
+        best = s.k;
+      }
+    }
+    return best;
+  }
+
   let hoverFrame = 0;
+  let touchDown = false;
+  const isTouch = (e) => e.pointerType === 'touch' || e.pointerType === 'pen';
   const onHover = (e) => {
+    if (isTouch(e)) {
+      if (!touchDown) return;
+      const k = lineAt(e.clientX, e.clientY, TOUCH_PX);
+      if (k !== null) setLocalFocus(k);                // scrubbing off a line keeps the last one
+      return;
+    }
     if (e.pointerType !== 'mouse' || hoverFrame) return;
     const { clientX, clientY } = e;
     hoverFrame = requestAnimationFrame(() => {
       hoverFrame = 0;
-      if (!geo) return;
-      const ctm = svgEl.getScreenCTM();
-      if (!ctm) return;
-      const pt = svgEl.createSVGPoint();
-      pt.x = clientX;
-      pt.y = clientY;
-      const { x: px, y: py } = pt.matrixTransform(ctm.inverse());
-      const k = nearestIndex(geo.xs, px);
-      const p = model.points[k];
-      let best = null;
-      let bestD = 8;
-      for (const s of model.series) {
-        if (hidden.has(s.k) || !p) continue;
-        const entry = s.byDate.get(p.iso);
-        if (!entry || (entry.part === 'forecast' && s.display === 'bands_only')) continue;
-        const v = tx(s, entry.v, geo.scale);
-        if (v === null) continue;
-        const d = Math.abs(geo.y.map(v) - py);
-        if (d < bestD) {
-          bestD = d;
-          best = s.k;
-        }
-      }
-      setLocalFocus(best);
+      setLocalFocus(lineAt(clientX, clientY, HOVER_PX));
     });
   };
-  const onLeave = () => setLocalFocus(null);
+  const onDown = (e) => {
+    if (!isTouch(e)) return;
+    touchDown = true;
+    setLocalFocus(lineAt(e.clientX, e.clientY, TOUCH_PX));
+  };
+  const onUp = (e) => {
+    if (isTouch(e)) touchDown = false;
+  };
+  const onLeave = (e) => {
+    if (!isTouch(e)) setLocalFocus(null);             // a lifted finger also "leaves": keep its focus
+  };
   wrapper.addEventListener('pointermove', onHover);
+  wrapper.addEventListener('pointerdown', onDown);
+  wrapper.addEventListener('pointerup', onUp);
+  wrapper.addEventListener('pointercancel', onUp);
   wrapper.addEventListener('pointerleave', onLeave);
 
   // ------------------------------------------------------------------------------------------ render
 
+  /** The 전체 기간 toggle: shown below 640 px whenever a window applies (also while the full period is on). */
+  function updateRange(win) {
+    range.set({
+      shown: Boolean(win),
+      full: Boolean(o.fullRange),
+      note: win ? uiText(t, o.lang, 'chart.window_note', { span: fmt.spanLabel(win.n, win.unit, o.lang) }) : '',
+      label: win ? uiText(t, o.lang, 'chart.window_full') : '',
+    });
+  }
+
+  /**
+   * Where each visible series ends: the end marker sits where its drawn line ends (forecast end, or the last actual
+   * for bands_only); the label anchor is the same point, except for bands_only series, whose label is anchored at
+   * the middle of their 80 % band at its last date — the seam would pull a long leader across the forecast region
+   * (UX-16). Pixel y; times in ms.
+   */
+  function lineEnds(visible, scale, y) {
+    const ends = new Map();
+    for (const s of visible) {
+      let mark = null;
+      if (s.last) {
+        const lv = tx(s, s.last.value, scale);
+        if (lv !== null) mark = { ms: isoToMs(s.last.date), y: y.map(lv) };
+      }
+      let anchor = null;
+      for (let j = s.fc.dates.length - 1; j >= 0 && !anchor; j -= 1) {
+        const ms = isoToMs(s.fc.dates[j]);
+        if (s.display === 'bands_only') {
+          const lo = tx(s, s.fc.lo80[j], scale);
+          const hi = tx(s, s.fc.hi80[j], scale);
+          if (lo !== null && hi !== null) anchor = { ms, y: (y.map(lo) + y.map(hi)) / 2 };
+        } else {
+          const v = tx(s, s.fc.mean[j], scale);
+          if (v !== null) {
+            anchor = { ms, y: y.map(v) };
+            mark = anchor;
+          }
+        }
+      }
+      if (mark) ends.set(s.k, { mark, anchor: anchor || mark });
+    }
+    return ends;
+  }
+
   /** Static layers: frame, axes, lines, markers. Then drawDynamic() for focus, band and labels. */
   function render() {
     const width = contentWidth(container);
+    const keepK = geo ? currentK() : -1;
     clear(svgEl);
     clear(dots);
     const title = t('compare.title');
@@ -368,6 +500,8 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
     const { series, points } = model;
     if (!width || !points.length) {
       geo = null;
+      updateRange(null);
+      bandHint.hidden = true;
       showReadout(-1);
       return;
     }
@@ -401,34 +535,10 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
     const labelKind = scale === 'index' ? 'relative_index' : model.valueKind;
     const yLabels = tickLabels(ticks.values, dom.log ? 0 : ticks.decimals, o.lang, { kind: labelKind, log: dom.log });
 
-    // direct labels: every visible slotted series, plus highlighted grey ones
-    const labelled = visible.filter((s) => s.slot || highlighted.has(s.k));
-    const maxLabel = wide ? 140 : 84;
-    const measureLabel = (str) => textWidths(svgEl, [str], 'chart-end-label')[0];
-    const labelText = new Map(labelled.map((s) => [s.k, truncateToWidth(s.name, maxLabel, measureLabel)]));
-    const labelW = labelled.length ? Math.max(...labelled.map((s) => measureLabel(labelText.get(s.k)))) : 0;
-
+    // y first: it does not depend on the right margin, which the direct labels decide
     const caption = model.caption;
-    const margin = {
-      top: MARGIN_TOP,
-      right: labelled.length ? labelW + 22 : 16,
-      bottom: X_TICK_SPACE + (caption ? X_CAPTION_SPACE : 0),
-      left: Math.max(measureLabels(svgEl, yLabels) + 8, 20),
-    };
-    const t0 = points[0].ms;
-    const t1 = points[points.length - 1].ms > t0 ? points[points.length - 1].ms : t0 + 86400000;
-    const seamMs = model.lastIso ? isoToMs(model.lastIso) : t1;
-    const fcLabel = t('chart.forecast');
-    const fcLabelW = textWidths(svgEl, [fcLabel], 'chart-region-label')[0];
-    let x = linearScale([t0, t1], [margin.left, width - margin.right]);
-    if (seamMs < t1 && width - margin.right - x.map(seamMs) < fcLabelW + 12 && margin.right < 48) {
-      margin.right = 48;
-      x = linearScale([t0, t1], [margin.left, width - margin.right]);
-    }
-    const L = margin.left;
-    const R = width - margin.right;
-    const T = margin.top;
-    const B = height - margin.bottom;
+    const T = MARGIN_TOP;
+    const B = height - (X_TICK_SPACE + (caption ? X_CAPTION_SPACE : 0));
     let y;
     if (dom.log) {
       const top = 10 ** (Math.log10(ticks.max)
@@ -438,8 +548,58 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
       const top = ticks.max + ((ticks.max - ticks.min) * LABEL_BAND) / Math.max(1, B - T - LABEL_BAND);
       y = linearScale([ticks.min, top], [B, T]);
     }
+
+    // direct labels: every visible slotted series, plus highlighted grey ones; lines ending in one spot share a
+    // label (UX-16); below 640 px three or more labels give way to the legend chips, which name every line with
+    // its slot icon, so the forecast keeps its width (UX-4)
+    const ends = lineEnds(visible, scale, y);
+    for (const e of ends.values()) e.anchor.y = Math.min(B, Math.max(T, e.anchor.y));   // a band beyond the axis
+    const labelled = visible.filter((s) => (s.slot || highlighted.has(s.k)) && ends.has(s.k));
+    let groups = groupAnchors(labelled.map((s) => ends.get(s.k).anchor), LABEL_MERGE_PX)
+      .map((g) => g.map((i) => labelled[i]));
+    const dropLabels = !wide && groups.length >= 3;
+    if (dropLabels) groups = [];
+    const maxLabel = wide ? 140 : 84;
+    const measureLabel = (str) => textWidths(svgEl, [str], 'chart-end-label')[0];
+    const labelGroups = groups.map((members) => {
+      const text = truncateToWidth(members.map((s) => s.name).join(' · '),
+        members.length > 1 ? maxLabel + 60 : maxLabel, measureLabel);
+      return { keys: members.map((s) => s.k), text, w: measureLabel(text) };
+    });
+    const labelW = labelGroups.length ? Math.max(...labelGroups.map((g) => g.w)) : 0;
+
+    const margin = {
+      top: T,
+      right: labelGroups.length ? labelW + 22 : 16,
+      bottom: height - B,
+      left: Math.max(measureLabels(svgEl, yLabels) + 8, 20),
+    };
+    const first = points[0].ms;
+    const t1 = points[points.length - 1].ms > first ? points[points.length - 1].ms : first + 86400000;
+    const seamMs = model.lastIso ? isoToMs(model.lastIso) : t1;
+    // below 640 px a long history leaves the forecast ~20 px: show the last years only, unless asked (UX-4)
+    const win = wide ? null : narrowWindow(first, seamMs, t1, model.freq);
+    const t0 = win && !o.fullRange ? win.startMs : first;
+    const off = Math.max(0, points.findIndex((p) => p.ms >= t0));
+    const fcLabel = t('chart.forecast');
+    const fcLabelW = textWidths(svgEl, [fcLabel], 'chart-region-label')[0];
+    let x = linearScale([t0, t1], [margin.left, width - margin.right]);
+    if (seamMs < t1 && width - margin.right - x.map(seamMs) < fcLabelW + 12 && margin.right < 48) {
+      margin.right = 48;
+      x = linearScale([t0, t1], [margin.left, width - margin.right]);
+    }
+    const L = margin.left;
+    const R = width - margin.right;
     const frame = { width, height, margin };
-    geo = { x, y, scale, frame, L, R, T, B, xs: points.map((p) => x.map(p.ms)), labelText };
+    for (const e of ends.values()) {
+      e.mark.x = x.map(e.mark.ms);
+      e.anchor.x = x.map(e.anchor.ms);
+    }
+    geo = {
+      x, y, scale, frame, L, R, T, B, off, t0, ends, labelGroups, dropLabels,
+      xs: points.slice(off).map((p) => x.map(p.ms)),
+    };
+    updateRange(win);
 
     svgEl.appendChild(svg('defs', null, svg('clipPath', { id: ids.clip },
       svg('rect', { x: L - 2, y: T - 3, width: R - L + 4, height: B - T + 6 }))));
@@ -469,7 +629,6 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
     geo.bandLayer = svg('g', { class: 'chart-bands' });
     dataG.appendChild(geo.bandLayer);
     geo.groups = new Map();
-    geo.ends = new Map();
     const order = visible.slice().sort((a, b) => (a.slot ? 6 - a.slot : 0) - (b.slot ? 6 - b.slot : 0));
     for (const s of order) {
       const g = svg('g', { class: ['chart-series', s.cls], 'data-k': s.k });
@@ -478,25 +637,17 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
         class: 'chart-line chart-line-hist',
         d: linePath(s.actual.map((v, i) => { const tv = tx(s, v, scale); return tv === null ? null : [histXs[i], y.map(tv)]; })),
       }));
-      let end = null;
-      if (s.last) {
-        const lv = tx(s, s.last.value, scale);
-        if (lv !== null) end = { x: x.map(isoToMs(s.last.date)), y: y.map(lv) };
-      }
       if (s.display !== 'bands_only' && s.fc.dates.length) {
         const pts = s.fc.mean.map((v, j) => { const tv = tx(s, v, scale); return tv === null ? null : [x.map(isoToMs(s.fc.dates[j])), y.map(tv)]; });
         g.appendChild(svg('path', { class: ['chart-line', 'chart-line-fc', s.display === 'weak' && 'is-weak'], d: linePath(pts) }));
-        const lastPt = pts.filter(Boolean).pop();
-        if (lastPt) end = { x: lastPt[0], y: lastPt[1] };
       }
       geo.groups.set(s.k, g);
-      if (end) geo.ends.set(s.k, end);
       dataG.appendChild(g);
     }
     svgEl.appendChild(dataG);
 
     // click targets for grey lines (highlight until clicked again)
-    const hits = svg('g', { class: 'chart-hits' });
+    const hits = svg('g', { class: 'chart-hits', 'clip-path': `url(#${ids.clip})` });
     for (const s of visible.filter((v) => !v.slot)) {
       const pts = [...s.byDate.entries()].map(([iso, e]) => {          // history then forecast, by date
         const v = e.part === 'forecast' && s.display === 'bands_only' ? null : tx(s, e.v, scale);
@@ -521,14 +672,18 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
     svgEl.append(geo.markers, geo.labels, xhLayer);
     drawDynamic();
 
-    crosshair.setPoints(points.map((p, i) => ({ ms: p.ms, x: geo.xs[i] })),
-      { plotTop: T, plotHeight: B - T, startIndex: model.startIndex });
-    const k = crosshair.current();
+    crosshair.setPoints(points.slice(off).map((p, i) => ({ ms: p.ms, x: geo.xs[i] })),
+      { plotTop: T, plotHeight: B - T, startIndex: Math.max(0, model.startIndex - off) });
+    if (keepK >= 0 && keepK !== currentK()) {                           // the window moved under the crosshair
+      if (keepK >= off) crosshair.moveTo(keepK - off);
+      else crosshair.hide();
+    }
+    const k = currentK();
     showReadout(k);
     drawDots(k);
   }
 
-  /** Focus classes, the focused series' 80 % band, end markers and direct labels. */
+  /** Focus classes, the shown 80 % band and its hint, end markers and direct labels. */
   function drawDynamic() {
     if (!geo) return;
     const f = focusK();
@@ -538,29 +693,48 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
       g.classList.toggle('is-dimmed', f !== null && f !== k);
       g.classList.toggle('is-highlight', highlighted.has(k) || (f === k && !model.series.find((s) => s.k === k).slot));
     }
-    // band of the focused series (예측 범위 보기)
+    // band (예측 범위 보기): the focused series', else the default one (bandSeries)
     clear(geo.bandLayer);
-    const fs = f === null ? null : model.series.find((s) => s.k === f);
-    if (o.bands && fs && fs.fc.dates.length) {
+    const fs = o.bands ? bandSeries(f) : null;
+    if (fs) {
       const xs = fs.fc.dates.map((iso) => x.map(isoToMs(iso)));
       const py = (arr) => arr.map((v) => { const tv = tx(fs, v, scale); return tv === null ? null : y.map(tv); });
       geo.bandLayer.appendChild(svg('g', { class: ['chart-series', fs.cls] },
         svg('path', { class: 'chart-series-band', d: areaPath(xs, py(fs.fc.lo80), py(fs.fc.hi80)) })));
     }
-    // markers and labels
+    bandHint.hidden = !fs;
+    bandHint.textContent = fs ? uiText(t, o.lang, 'compare.bands_hint', { name: fs.name }) : '';
+
+    // end markers: every visible slotted series, plus highlighted or focused grey ones
     clear(geo.markers);
     clear(geo.labels);
     const items = model.series.filter((s) => !hidden.has(s.k) && geo.ends.has(s.k)
       && (s.slot || highlighted.has(s.k) || f === s.k));
-    const wanted = items.map((s) => geo.ends.get(s.k).y);
-    const placed = dodge(wanted, LABEL_GAP, T + 6, B - 2);
-    items.forEach((s, i) => {
-      const end = geo.ends.get(s.k);
-      const dim = f !== null && f !== s.k;
+    for (const s of items) {
+      const { mark } = geo.ends.get(s.k);
       geo.markers.appendChild(svg('path', {
-        class: ['chart-end-marker', s.cls, dim && 'is-dimmed'],
-        d: slotIconPath(s.icon || 'circle', end.x, end.y, s.icon ? 4 : 3),
+        class: ['chart-end-marker', s.cls, f !== null && f !== s.k && 'is-dimmed'],
+        d: slotIconPath(s.icon || 'circle', mark.x, mark.y, s.icon ? 4 : 3),
       }));
+    }
+    if (geo.dropLabels) return;
+
+    // direct labels (groups from render(), plus a focused grey line), nudged ≥ 14 px apart above the x axis
+    const measure = (str) => textWidths(svgEl, [str], 'chart-end-label')[0];
+    const groups = geo.labelGroups.slice();
+    if (f !== null && geo.ends.has(f) && !groups.some((g) => g.keys.includes(f))) {
+      const name = model.series.find((s) => s.k === f).name;
+      groups.push({ keys: [f], text: truncateToWidth(name, Math.max(40, geo.frame.margin.right - 22), measure) });
+    }
+    const anchorOf = (g) => {
+      const list = g.keys.map((k) => geo.ends.get(k).anchor);
+      return { x: list[0].x, y: list.reduce((sum, a) => sum + a.y, 0) / list.length };
+    };
+    const anchors = groups.map(anchorOf);
+    const placed = dodge(anchors.map((a) => a.y), LABEL_GAP, T + 6, B - LABEL_BOTTOM);
+    groups.forEach((g, i) => {
+      const end = anchors[i];
+      const dim = f !== null && !g.keys.includes(f);
       const ly = placed[i];
       const lx = R + 10;
       if (Math.abs(ly - end.y) > 6 || end.x < R - 2) {
@@ -568,11 +742,9 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
           class: ['chart-leader', dim && 'is-dimmed'], d: `M${end.x + 6},${end.y}L${lx - 3},${ly}`,
         }));
       }
-      const text = geo.labelText.get(s.k) || truncateToWidth(s.name, Math.max(40, geo.frame.margin.right - 22),
-        (str) => textWidths(svgEl, [str], 'chart-end-label')[0]);
       geo.labels.appendChild(svg('text', {
         class: ['chart-end-label', dim && 'is-dimmed'], x: lx, y: ly, dy: '0.34em',
-      }, text));
+      }, g.text));
     });
   }
 
@@ -582,7 +754,7 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
 
   return {
     update(compareVM2, seriesVMs2, opts2 = {}) {
-      const keep = crosshair.current() >= 0 ? model.points[crosshair.current()]?.iso : null;
+      const keep = currentK() >= 0 ? model.points[currentK()]?.iso : null;
       if (compareVM2) cvm = compareVM2;
       if (seriesVMs2) svms = seriesVMs2;
       Object.assign(o, opts2);
@@ -592,7 +764,7 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
       crosshair.hide();
       buildLegend();
       render();
-      if (keep && model.indexByDate.has(keep)) crosshair.moveTo(model.indexByDate.get(keep));
+      if (keep && model.indexByDate.has(keep)) moveToK(model.indexByDate.get(keep));
     },
     setScale(scale) {
       o.scale = scale;
@@ -622,7 +794,7 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
     highlightDate(iso) {
       const k = model.indexByDate.get(iso);
       if (k === undefined || !geo) return false;
-      crosshair.moveTo(k);
+      moveToK(k);
       return true;
     },
     getSvg() {
@@ -634,6 +806,9 @@ export function createCompareChart(container, compareVM, seriesVMs, opts) {
       crosshair.destroy();
       if (hoverFrame) cancelAnimationFrame(hoverFrame);
       wrapper.removeEventListener('pointermove', onHover);
+      wrapper.removeEventListener('pointerdown', onDown);
+      wrapper.removeEventListener('pointerup', onUp);
+      wrapper.removeEventListener('pointercancel', onUp);
       wrapper.removeEventListener('pointerleave', onLeave);
       legendListeners.length = 0;
       focusListeners.length = 0;

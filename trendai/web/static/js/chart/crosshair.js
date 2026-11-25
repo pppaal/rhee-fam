@@ -1,6 +1,7 @@
 // Crosshair and read-out plumbing shared by the fan and comparison charts (spec F.7.4).
 // Owner: WP3-chart. Internal to the chart modules (pages use FanChart/CompareChart methods instead).
-// nearestIndex, keyTarget and throttle are pure (tests/js/chart-crosshair.test.mjs); createCrosshair needs a DOM.
+// nearestIndex, keyTarget, throttle and shouldAnnounce are pure (tests/js/chart-crosshair.test.mjs); createCrosshair
+// needs a DOM.
 
 import { svg } from '../dom.js';
 
@@ -52,6 +53,19 @@ export function keyTarget(event, index, length, startIndex) {
     default:
       return null;
   }
+}
+
+/**
+ * Whether a crosshair move is mirrored into `#live-polite` (F.7.4: the throttled mirror belongs to keyboard
+ * exploration). Keyboard steps ('key'), focusing the chart ('focus') and moves the page asked for ('api': narrative
+ * date links, the changepoint list, badge activation) are announced; mouse hover ('pointer') and touch scrubbing
+ * ('touch') are not, so a mouse passing over a chart does not keep a screen reader talking or overwrite route and
+ * toast messages that share the region (A11Y-16). Pure; unit-testable without a DOM.
+ * @param {'pointer'|'touch'|'key'|'focus'|'api'|undefined} cause
+ * @returns {boolean}
+ */
+export function shouldAnnounce(cause) {
+  return cause === 'key' || cause === 'focus' || cause === 'api';
 }
 
 /**

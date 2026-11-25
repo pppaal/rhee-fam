@@ -1,18 +1,20 @@
 // Compare view (spec F.6.8, brief §3.4): header (names, 공유, 내보내기 ▾) · card 한눈에 보기 (?, ⋯ menu, scale
 // segmented control, 예측 범위 보기, 표로 보기, comparison chart or ranking + values tables, source line, axis note,
 // notices) · 무엇이 뜨나요? (sort select, score note with ?, spark note, ranking cards; failed series as error cards).
-// While the job runs it renders progressively from the series VMs received so far. Owner: WP3-app.
+// While the job runs it renders progressively from the series VMs received so far. A first Naver comparison shows
+// the one-time explainer after the comparison card, never above the chart (UX-3). 내보내기 has 요약 복사: the
+// ranking in one line (FU-15). Owner: WP3-app.
 
 import { h, clear } from '../dom.js';
 import { getLang, t } from '../i18n.js';
 import { serialize, withState } from '../state.js';
-import { cardHead, icon } from '../ui.js';
+import { cardHead, icon, rovingRadios } from '../ui.js';
 import { createCompareChart } from '../chart/comparechart.js';
 import { rankingTable, valuesTable } from '../components/datatable.js';
 import { helpButton } from '../components/help.js';
 import { noticeList } from '../components/notices.js';
 import { SORT_KEYS, failedCard, provisionalRow, rankCard, sortRows } from '../components/rankcards.js';
-import { compareMoreMenu, exportMenu, shareButton } from '../components/sharemenu.js';
+import { chartMoreMenu, compareSummaryLine, exportMenu, shareButton, summaryUrl } from '../components/sharemenu.js';
 import { noteLine, sourceLine } from '../components/sourceline.js';
 import { naverExplainer } from './detail.js';
 
@@ -62,6 +64,7 @@ export function createCompareView(opts) {
       exportMenu({
         exports: env ? env.exports : null,
         png: { getChart: () => chart, title: t('compare.title'), footer: compare ? compare.source_line : '', name: opts.names.join(' vs ') },
+        summary: compare ? { line: compareSummaryLine(compare, opts.names), url: () => summaryUrl(env, state) } : null,
       })));
 
   // ------------------------------------------------------------------ controls
@@ -81,19 +84,10 @@ export function createCompareView(opts) {
           scaleNote.textContent = '';
           ctx.patch({ scale: s === compare.scale.default ? null : s }, { replace: true });
         },
-        keydown: (e) => {
-          const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
-          if (!step) return;
-          e.preventDefault();
-          const usable = scaleButtons.filter((b) => b.getAttribute('aria-disabled') !== 'true');
-          const i = usable.indexOf(e.currentTarget);
-          const next = usable[(i + step + usable.length) % usable.length];
-          next.focus();
-          next.click();
-        },
       },
     }, t(`compare.scale.${s}`));
   });
+  rovingRadios(scaleButtons, (next) => next.click(), { vertical: false });
   const segmented = h('div', { class: 'segmented', role: 'radiogroup', 'aria-label': t('compare.scale.label') }, scaleButtons);
   const bandsBtn = h('button', {
     type: 'button', class: 'chip chip-toggle chip-small', 'aria-pressed': 'false', disabled: compare ? null : true,
@@ -111,7 +105,7 @@ export function createCompareView(opts) {
   const compareCard = h('section', { class: 'card compare-card', 'aria-labelledby': 'compare-title' },
     cardHead({
       title: t('compare.title'), id: 'compare-title', help: helpButton(t('compare.title'), t('help.compare')),
-      actions: compare ? [compareMoreMenu({ env, ctx, png: { getChart: () => chart, title: t('compare.title'), footer: compare.source_line, name: opts.names.join(' vs ') } })] : [],
+      actions: compare ? [chartMoreMenu({ env, ctx, png: { getChart: () => chart, title: t('compare.title'), footer: compare.source_line, name: opts.names.join(' vs ') } })] : [],
     }),
     h('div', { class: 'compare-controls' }, segmented, h('div', { class: 'toggle-row' }, bandsBtn, tableBtn)),
     scaleNote,
@@ -133,10 +127,10 @@ export function createCompareView(opts) {
       h('h2', { class: 'section-title', id: 'rank-title' }, t('compare.rank.title')),
       h('div', { class: 'rank-tools' },
         h('label', { class: 'field-label inline', for: 'rank-sort' }, t('compare.sort')), sortSelect)),
-    h('p', { class: 'muted small rank-notes' },
-      h('span', null, t('compare.score_short')), helpButton(t('compare.sort.score'), compare ? compare.score_note : t('help.score')),
-      h('span', { class: 'dot-sep', 'aria-hidden': 'true' }, '·'),
-      h('span', null, compare ? compare.spark_note : '')),
+    // two notes, two lines on a phone: no separator left dangling at a line end (UX-31)
+    h('div', { class: 'muted small rank-notes' },
+      h('p', { class: 'rank-note' }, h('span', null, t('compare.score_short')), helpButton(t('compare.sort.score'), compare ? compare.score_note : t('help.score'))),
+      compare && compare.spark_note ? h('p', { class: 'rank-note rank-note-sep' }, compare.spark_note) : null),
     grid);
 
   function moreHref(row) {
@@ -182,8 +176,8 @@ export function createCompareView(opts) {
   const el = h('div', { class: 'view compare-view' },
     head,
     opts.banner || null,
-    naver ? naverExplainer() : null,
     compareCard,
+    naver ? naverExplainer() : null,
     rankSection);
 
   requestAnimationFrame(() => {

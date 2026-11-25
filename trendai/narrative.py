@@ -55,6 +55,7 @@ __all__ = [
     "zero_level_reason", "zscore_text", "volatility_undefined", "prob_undefined", "prob_reason",
     "forecast_is_zero", "trailing_zero_run", "floor_change_reason", "ZeroLevelReason",
     "scenario_reference", "ScenarioRef", "demand_rates", "long_zero_run",
+    "plain_language", "phase_reason_kind",
 ]
 
 DEFAULT_MODEL = "claude-opus-5-5"
@@ -1316,6 +1317,148 @@ def translate_reason(reason: str) -> Optional[str]:
             out = fn(mt.groups())
             return None if _HANGUL.search(out) else out
     return None
+
+
+# --------------------------------------------------------------------------- plain wording for the web
+
+
+def _certainty(pct: str, lang: str) -> str:
+    """The phase-certainty word of a printed percentage (``57`` -> ``보통``): the web's phase tile levels
+    (>= 75 % high, >= 50 % medium, else low; docs/WEB_SPEC.md D.2.5)."""
+    try:
+        v = float(pct.lstrip("<>"))
+    except ValueError:
+        v = 0.0
+    level = "high" if v >= 75 else "medium" if v >= 50 else "low"
+    return _CONF[lang][level]
+
+
+_SIGN = r"[+−-]?"
+_Z_RX = rf"z\s*[=<>]\s*{_SIGN}[\d.,]+"
+_STATS_PAREN = re.compile(r"\s*\([^()]*(?:τ\s*=|\bp\s*[<=>]\s*[\d.])[^()]*\)")
+#: (pattern, replacement) in order; ``{lvl}`` in a replacement is the certainty word of group 1
+_PLAIN: dict[str, tuple[tuple[re.Pattern, str], ...]] = {
+    "ko": tuple((re.compile(p), r) for p, r in (
+        # phase certainty as a word, never "신뢰도 57%" beside 상승 확률 / 예측 신뢰도 (brief §4.6)
+        (r"\(관측치가 적어 잠정 판단, 신뢰도 [<>]?\d+%\)", "(관측치가 적어 잠정 판단)"),
+        (r"단계\(신뢰도 ([<>]?\d+)%\)", "단계(판단 확신도 {lvl})"),
+        (r"\(판단 신뢰도 ([<>]?\d+)%\)", "(판단 확신도 {lvl})"),
+        (r"잠정 판단입니다\(신뢰도 [<>]?\d+%\)", "잠정 판단입니다"),
+        (r"국면 판단의 신뢰도가 [<>]?\d+%로 낮아", "국면 판단의 확신도가 낮아"),
+        # technical notes that live in the 자세히 blocks (accuracy details, model list, reason details)
+        (r"\s*\(기술 참고: 백테스트 MASE[^()]*\)", ""),
+        (r"\s*\(모델 ID: [^()]*\)", ""),
+        # the trend test in words
+        (r"Mann-Kendall 검정에서 통계적으로 유의한 \*\*(상승|하락)\*\* 추세가 확인됩니다",
+         "전체 기간에 걸친 **\\1** 흐름이 우연으로 보기 어려울 만큼 꾸준합니다"),
+        (r"Mann-Kendall 검정에서 통계적으로 유의한 장기 추세는 확인되지 않습니다",
+         "전체 기간을 놓고 보면 우연을 넘어서는 뚜렷한 방향은 보이지 않습니다"),
+        (r"Mann-Kendall 검정에서는 통계적으로 유의한 \*\*(상승|하락)\*\* 추세가 나옵니다",
+         "값의 오르내림 순서만 따지면 **\\1** 추세가 통계적으로 뚜렷하게 나옵니다"),
+        (r"Mann-Kendall 검정에서 전체 기간의 (상승|하락) 추세가 유의합니다",
+         "전체 기간에 걸친 \\1 흐름이 우연으로 보기 어려울 만큼 꾸준합니다"),
+        (r"Mann-Kendall 검정에서 전체 기간의 뚜렷한 추세가 확인되지 않습니다",
+         "전체 기간을 놓고 보면 뚜렷한 방향이 보이지 않습니다"),
+        (r"Mann-Kendall 검정", "추세 검정"),
+        (r"Mann-Kendall", "추세 검정"),
+        (r"연평균 성장률\(CAGR\)", "연평균 성장률"),
+        (r"\s*\(CAGR\)", ""),
+        # anomaly lines: no z-scores (brief §4.6)
+        (rf",\s*{_Z_RX}(?=\))", ""),
+        (rf"\s*\({_Z_RX}\)", ""),
+        # momentum without its definition and %p
+        (r"모멘텀\(최근 기울기 − 장기 기울기, 현재 추세 수준 대비\)은 \S+%p\S*이며, ", "모멘텀으로 보면 "),
+        (r"모멘텀\(최근 기울기 − 장기 기울기\)은 .+? %p로 나타내지 않았으며, ", "모멘텀으로 보면 "),
+        (r"(변동성)\(잔차의 (?:변동계수|표준편차)\)", "\\1"),
+        (r",? 변화 강도 [\d.]+", ""),
+        # random walk in words
+        (r"변화가 누적되는 무작위 행보(?:\(random walk\))?에 가까운 움직임이라",
+         "오르내림이 우연히 쌓여 생긴 움직임에 가까워"),
+        (r"무작위 행보에서는 흔한 일이라", "우연한 오르내림이 쌓일 때도 흔히 나타나는 일이라"),
+        (r"무작위 행보(?:\(random walk\))?", "우연한 오르내림의 누적"),
+    )),
+    "en": tuple((re.compile(p), r) for p, r in (
+        (r"\(tentative: too few observations; confidence [<>]?\d+%\)", "(tentative: too few observations)"),
+        (r"\(tentative, too few observations; confidence [<>]?\d+%\)", "(tentative, too few observations)"),
+        (r"tentative call \(confidence [<>]?\d+%\)", "tentative call"),
+        (r"low confidence \([<>]?\d+%\)", "low certainty"),
+        (r"\(confidence ([<>]?\d+)%\)", "(phase certainty: {lvl})"),
+        (r"Probability of increase", "Chance of rise"),
+        (r"forecast confidence", "forecast reliability"),
+        (r"Forecast confidence", "Forecast reliability"),
+        (r"\s*\(Technical note: backtest MASE[^()]*\)", ""),
+        (r"\s*\(model ids: [^()]*\)", ""),
+        (r"The Mann-Kendall test finds a statistically significant \*\*(upward|downward)\*\* trend",
+         "Over the whole period the **\\1** trend is too steady to be chance"),
+        (r"The Mann-Kendall test finds no statistically significant long-run trend",
+         "Over the whole period there is no direction beyond chance"),
+        (r"The Mann-Kendall test comes out as a statistically significant \*\*(upward|downward)\*\* trend",
+         "Ranking the values alone gives a statistically clear **\\1** trend"),
+        (r"The Mann-Kendall test finds a significant (upward|downward) trend over the whole period",
+         "Over the whole period the \\1 trend is too steady to be chance"),
+        (r"The Mann-Kendall test finds no clear trend over the whole period",
+         "Over the whole period there is no clear direction"),
+        (r"[Tt]he Mann-Kendall test", "a trend test"),
+        (r"Mann-Kendall", "trend test"),
+        (r",\s*CAGR\)", ")"),
+        (r"\s*\(CAGR\)", ""),
+        (rf"[,;]\s*{_Z_RX}(?=\))", ""),
+        (rf"\s*\({_Z_RX}\)", ""),
+        (r"Momentum \(recent minus long-run slope, relative to the current trend level\) is \S+ pp\S*: ",
+         "Momentum: "),
+        (r"Momentum \(recent minus long-run slope\) is not given in pp because .+?: ", "Momentum: "),
+        (r"(Volatility) \(residual (?:coefficient of variation|standard deviation)\)", "\\1"),
+        (r", strength [\d.]+", ""),                       # a changepoint's strength (not seasonality's)
+        (r"Changes accumulate like a random walk", "The ups and downs add up by chance"),
+        (r"typical of a random walk", "typical of ups and downs that add up by chance"),
+        (r"a random walk", "ups and downs that add up by chance"),
+    )),
+}
+
+
+def plain_language(text: str, lang: str = "ko") -> str:
+    """The rule-based narrative (or one phase reason) without statistical jargon, for readers who are no
+    analysts (the web app; brief §4.6): the phase certainty as a word (``판단 확신도 보통``, never
+    ``신뢰도 57%`` beside ``상승 확률``), the trend test in words instead of ``Mann-Kendall … τ = 0.95,
+    p < 0.001``, no z-scores, no MASE note or model ids, no CAGR, no momentum ``%p``, no change strength,
+    and the random-walk caveat in plain words.  ``lang`` is the language of ``text``; whatever is not
+    jargon is returned unchanged (the CLI and the HTML report keep the full text)."""
+    lang = _norm_lang(lang)
+    out = _STATS_PAREN.sub("", str(text or ""))
+    for rx, repl in _PLAIN[lang]:
+        if "{lvl}" in repl:
+            out = rx.sub(lambda m, r=repl: r.replace("{lvl}", _certainty(m.group(1), lang)), out)
+        else:
+            out = rx.sub(repl, out)
+    # a sentence that started with the replaced "The Mann-Kendall test" keeps its capital
+    return re.sub(r"(^|\n- |[.!?] )a trend test", lambda m: m.group(1) + "A trend test", out)
+
+
+#: phases that claim a direction: a reason saying there is none (or the opposite one) is a caveat
+_DIRECTED = {"emerging": "up", "growing": "up", "reviving": "up", "declining": "down"}
+
+
+def phase_reason_kind(reason: str, label: str) -> str:
+    """``'caveat'`` when one of ``analysis.phase.reasons`` qualifies the phase ``label`` instead of supporting
+    it -- the random-walk sentence or the short-data sentence beside a directed phase, a trend test that
+    finds no direction (or the opposite one) for a growing / declining phase -- else ``'support'``.  The web
+    shows a caveat with a neutral mark, not the ✓ of the evidence.  Korean reasons (as
+    ``analysis.lifecycle_phase`` writes them) and their :func:`translate_reason` English both work."""
+    text = " ".join(str(reason or "").split())
+    lab = str(label or "")
+    if "데이터가 부족" in text or "too few observations" in text:
+        return "caveat"
+    if "무작위 행보" in text or "random walk" in text:
+        return "support" if lab in ("volatile", "stable") else "caveat"
+    want = _DIRECTED.get(lab)
+    if want is not None:
+        if "뚜렷한 추세가 확인되지 않습니다" in text or "finds no clear trend" in text:
+            return "caveat"
+        opposite = ("하락 추세가 유의", "significant downward") if want == "up" else ("상승 추세가 유의",
+                                                                                   "significant upward")
+        if any(o in text for o in opposite):
+            return "caveat"
+    return "support"
 
 
 # --------------------------------------------------------------------------- rule-based narrative

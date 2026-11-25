@@ -98,7 +98,10 @@ export function seamForecast(lastActual, forecast) {
 
 /**
  * Path of a slot icon (D.2.1: 1 circle ●, 2 diamond ◆, 3 hexagon ⬢, 4 square ■, 5 cross ✚) centred on
- * (cx, cy) with "radius" r; shapes are scaled to look equally heavy. Unknown icons give a circle.
+ * (cx, cy) with "radius" r; shapes are scaled to look about equally heavy, except the hexagon, which is drawn a
+ * quarter larger than the circle (circumradius 1.25 r): at legend and marker sizes on a 1× screen a hexagon of the
+ * circle's size renders as a dot, and the icon is the colour-blind second cue (UX-29). Unknown icons give a
+ * circle.
  * @param {string|null} icon
  * @param {number} cx
  * @param {number} cy
@@ -113,7 +116,7 @@ export function slotIconPath(icon, cx, cy, r) {
       return `M${P(0, -k)}L${P(k, 0)}L${P(0, k)}L${P(-k, 0)}Z`;
     }
     case 'hexagon': {
-      const k = r * 1.12;
+      const k = r * 1.25;
       const pts = [0, 1, 2, 3, 4, 5].map((i) => {
         const a = (Math.PI / 3) * i - Math.PI / 2;
         return P(k * Math.cos(a), k * Math.sin(a));

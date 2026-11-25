@@ -3,7 +3,7 @@
 
 import { h } from '../dom.js';
 import { t } from '../i18n.js';
-import { arrowLine, icon, phaseBadge, pill, toneClass } from '../ui.js';
+import { arrowLine, disclosure, icon, phaseBadge, pill, toneClass } from '../ui.js';
 import { helpButton } from './help.js';
 
 let counter = 0;
@@ -20,16 +20,8 @@ export function renderHero(vm) {
       icon('ui-check', { cls: 'reason-icon' }), h('span', null, r.text)))),
     h('p', { class: 'muted small' }, phase.certainty.label, ' · ',
       h('a', { href: phase.rules_url || '/method#phase' }, t('detail.now.rules'))));
-  const whyBtn = h('button', {
-    type: 'button', class: 'link-btn hero-why-btn', 'aria-expanded': 'false', 'aria-controls': id,
-    on: {
-      click: () => {
-        const open = why.hidden;
-        why.hidden = !open;
-        whyBtn.setAttribute('aria-expanded', String(open));
-      },
-    },
-  }, t('detail.why'), icon('ui-chevron-down', { cls: 'chev' }));
+  const whyBtn = disclosure(h('button', { type: 'button', class: 'link-btn hero-why-btn' },
+    t('detail.why'), icon('ui-chevron-down', { cls: 'chev' })), why);
 
   return h('section', { class: 'card hero', 'aria-label': hero.title },
     h('div', { class: 'hero-top' },

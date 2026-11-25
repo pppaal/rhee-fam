@@ -624,8 +624,15 @@ xlsx = ["openpyxl>=3.1"]
 web = ["openpyxl>=3.1", "anthropic>=1.0"]    # optional features of the web app (it runs without them)
 dev = ["pytest>=7"]
 
+[tool.setuptools]
+include-package-data = false    # data only from the patterns below; the manifest scan warns once per static/ sub-dir
+
+[tool.setuptools.packages.find]
+include = ["trendai*"]
+namespaces = false    # static/** is package data of trendai.web, not a tree of namespace packages
+
 [tool.setuptools.package-data]
-"trendai.web" = ["static/**/*"]
+"trendai.web" = ["static/**/*", "vm.schema.json"]
 
 [tool.setuptools.exclude-package-data]
 "trendai.web" = ["static/dev/**"]
@@ -652,8 +659,9 @@ RUN pip install --no-cache-dir . openpyxl anthropic \
 USER trendai
 VOLUME ["/data"]
 EXPOSE 8000
+# probes the port the server really listens on (TRENDAI_PORT) and never goes through an HTTP(S)_PROXY set for the app
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"
+  CMD python -c "import os, urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:%s/api/health' % (os.environ.get('TRENDAI_PORT') or '8000'), timeout=3)"
 CMD ["trendai", "serve"]
 ```
 
@@ -670,13 +678,14 @@ trendai.web.wsgi:application` — **`--preload` 금지**, `waitress-serve --thre
 trendai.web.wsgi:application`, 리버스 프록시·TLS: nginx는 `client_max_body_size 11m;` + `proxy_request_buffering off;`
 (아니면 업로드 본문이 nginx 임시 파일로 디스크에 쓰여 ‘원본 미저장’ 약속이 깨짐), `proxy_set_header Host $host;`,
 `X-Forwarded-For`/`X-Forwarded-Proto`/`X-Forwarded-Host`, `TRENDAI_TRUST_PROXY` + `TRENDAI_PUBLIC_URL`, `TRENDAI_HSTS`,
-Docker 실행 예 `-e TRENDAI_CONTACT=…`) · 처리량 (한 프로세스 기준 대략: 주간 5개 비교 분석이 GIL 시간 약 3.6초를 써서 분당
-15–20건, 단일 시계열은 0.4–1.0초; `TRENDAI_WORKERS`를 늘려도 처리량은 거의 늘지 않고 긴 작업 뒤에 짧은 작업이 막히지 않게
-해 줄 뿐; 같은 조회의 동시 요청은 한 작업으로 합쳐짐(C.5); 넘치면 `503 server_busy`) · 요청 한도와 NAT (IP당 한도는 통신사
-CGNAT·사무실 NAT 뒤 사용자끼리 나눠 씀, 프록시 뒤에서 `TRENDAI_TRUST_PROXY`를 안 켜면 모든 사용자가 한 IP로 보임) · 데이터 보관
-(폴더 구조, TTL, 용량 한도, 백업은 공유 링크 폴더만 의미 있음, `WEB_VM_SCHEMA`가 바뀌는 업그레이드는 기존 결과·공유 링크를
-무효화함) · 보안 메모 (CSP, 로그 정책, 키 관리) · 정식 공개 전 법무 확인 항목 (brief §5.6, §7; 그리고: 네이버 비율 값을 화면과
-API 응답에 *표시*하는 것은 허용, 파일 내려받기·복사는 불가라는 판단(A.3); 네이버 결과에 ‘기준 시점=100’ 변환을 막은 것이
+Docker 실행 예 `-e TRENDAI_CONTACT=…`, 포트는 `TRENDAI_PORT`로 바꾸고 `HEALTHCHECK`가 그 포트를 따름) · 처리량 (한 프로세스
+기준, 측정한 하드웨어와 함께: 4 vCPU에서 주간 5개 비교 분석 분당 약 12–15건, 단일 시계열은 0.2–1.3초; `TRENDAI_WORKERS`를
+늘려도 처리량은 거의 늘지 않고 긴 작업 뒤에 짧은 작업이 막히지 않게 해 줄 뿐; 같은 조회의 동시 요청은 한 작업으로
+합쳐짐(C.5); 넘치면 `503 server_busy`) · 요청 한도와 NAT (IP당 한도는 통신사 CGNAT·사무실 NAT 뒤 사용자끼리 나눠 씀, 프록시
+뒤에서 `TRENDAI_TRUST_PROXY`를 안 켜면 모든 사용자가 한 IP로 보임) · 데이터 보관 (폴더 구조, TTL, 용량 한도, 결과 하나의
+크기와 `TRENDAI_STORE_MAX_MB` 산정 규칙, 백업은 공유 링크 폴더만 의미 있음, `WEB_VM_SCHEMA`가 바뀌는 업그레이드는 기존
+결과·공유 링크를 무효화함) · 보안 메모 (CSP, 로그 정책, 키 관리) · 정식 공개 전 법무 확인 항목 (brief §5.6, §7;
+그리고: 네이버 비율 값을 화면과 API 응답에 *표시*하는 것은 허용, 파일 내려받기·복사는 불가라는 판단(A.3); 네이버 결과에 ‘기준 시점=100’ 변환을 막은 것이
 충분한지; Google 트렌드 업로드 출처 표기) · 문제 해결 (프록시 뒤 TLS 오류 시 `SSL_CERT_FILE`, 포트 사용 중, 네이버 401, POST가
 `403 cross_origin`이면 `TRENDAI_PUBLIC_URL` 확인) · 테스트 실행 (`python -m pytest`, E2E는 전역 playwright를 `NODE_PATH=$(npm root -g)`로 찾음, H.5).
 
@@ -932,8 +941,10 @@ Uploads have no result-cache key and are never joined.
  "poll_url": "/api/jobs/Zx8kP2mQ9rT4vW6yA1bC3d", "result_url": "/api/results/Zx8kP2mQ9rT4vW6yA1bC3d"}
 ```
 
-`status` is `"queued"`, `"running"` (joined) or (cached) `"done"`. `queue_position` = number of jobs ahead (0 = starts
-now or already running).
+`status` is the job's state when the answer is built: `"queued"`, `"running"` or (cached) `"done"`. `"running"` comes
+from a joined job, **or** from a new job that a free worker picked up before the answer was written (`"joined":
+false`); clients treat `queued` and `running` alike and poll. `queue_position` = number of jobs ahead (0 = starts now
+or already running).
 
 ### C.6 `GET /api/jobs/<id>?since=0&hl=ko` and `DELETE /api/jobs/<id>`
 
@@ -1072,7 +1083,7 @@ private, no-store`, `X-Robots-Tag: noindex, nofollow`.
 
 | Path | Content |
 |---|---|
-| `GET /api/export/<id>.<fmt>` | Whole result. `csv`: compare → ranking table; single → same as series 0. `xlsx`: conditions + one data sheet per series + summary sheet. `html`: `render_compare_html` page (compare) or `render_html` (single). `json`: array of `report_to_dict` (compare) or one object (single). |
+| `GET /api/export/<id>.<fmt>` | Whole result. `csv`: compare → ranking table; single → same as series 0. `xlsx`: conditions + one data sheet per series + summary sheet. `html`: `render_compare_html` page (compare) or `render_html` (single). `json`: compare → `{"source_line": …, "source": [one source object per series], "reports": [one object per series]}`; single → one object. |
 | `GET /api/export/<id>/<k>.<fmt>` | One series: `csv`, `xlsx`, `html`, `json`. |
 | `GET /api/export/<id>/values.csv` | Compare results only: the date × series values table of the compare table view (F.6.8): `날짜` + one column per successful series (display names, request order) with the history values on the union of dates (empty where a series has no value). **Naver: `403 export_naver_raw`** (the values are raw ratios). Single-series results → `404 not_found`. |
 | `GET /api/export/s/<share_id>.<fmt>` · `/api/export/s/<share_id>/<k>.<fmt>` · `/api/export/s/<share_id>/values.csv` | The same from a share snapshot. |
@@ -1120,9 +1131,11 @@ Response headers for HTML:
 
 **JSON**: `report_to_dict(report, lang=hl)` stored at job time in both languages, plus a top-level `"source"` object
 = the series VM's `source` block in that language (kind, label, line, value_kind, value_kind_label, freq, start, end,
-as_of, filters_label, filename, attribution; compare: an array of such objects plus `"source_line"`). **Naver**: the
-`history` key is removed, `metrics.last_value`, `metrics.peak_value`, `metrics.mean` and every `anomalies[].value`
-are removed, and `"raw_excluded": true` is added (model outputs such as `trend`, `forecast`, `scenarios` stay, A.3).
+as_of, filters_label, filename, attribution). The whole-result JSON of a compare is an object, not a bare array:
+`{"source_line": compare.source_line, "source": [each series' source object], "reports": [each series' object]}`
+(WEB_INTERFACES §4.1); a single series is the one object. **Naver**: the `history` key is removed,
+`metrics.last_value`, `metrics.peak_value`, `metrics.mean` and every `anomalies[].value` are removed, and
+`"raw_excluded": true` is added (model outputs such as `trend`, `forecast`, `scenarios` stay, A.3).
 
 All exports: `Content-Disposition: attachment; filename="trendai-<id8>-<k|all>.<fmt>"; filename*=UTF-8''<pct-encoded "trendai-<display name>.<fmt>">`,
 `Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`. MIME: `text/csv; charset=utf-8`,
@@ -1742,7 +1755,9 @@ Axis ticks (client only, F.7.1): span ≥ 3 years → yearly ticks `2022`; 6 mon
 * `short` (summary line, D.2.10), per kind: `naver` 네이버 / Naver · `wiki` 위키백과 / Wikipedia · `upload` 내 파일 /
   my file · `google_trends_upload` Google 트렌드 업로드 / Google Trends upload · `sample` 샘플·가상 데이터 / sample ·
   synthetic data.
-* `as_of` = the fetch time (cached data keep their original fetch time); uploads/samples: analysis time.
+* `as_of` = the fetch time (cached data keep their original fetch time); uploads/samples: analysis time. The
+  `line` shows it only for Naver/Wikipedia (`데이터 기준`) and uploads (`분석`); a sample line has no as-of (table
+  above), because synthetic data have no fetch time.
 * `filters_label`: device `PC`/`모바일` (`PC`/`mobile`), gender `남성`/`여성` (`male`/`female`), ages from
   `/api/config` labels with consecutive codes merged (`4,5` → `25–34세` / `25–34`; `2,5` → `13–18세·30–34세`).
   Joined with `·` (ko) / ` · ` (en). Empty when no filter.
@@ -2004,10 +2019,12 @@ weak-forecast rule; `display` = the series' `chart.display`). Up to 20 rows (upl
 
 `source_line` = `"출처: "`/`"Source: "` + the parts shared by the compared series, in the D.2.2 order: label · freq ·
 filters · range · value kind · as-of. `range` = earliest successful series start ~ latest end (`range_label`);
-as-of = the **oldest** `as_of` among the series (`데이터 기준` for Naver/Wikipedia, `분석` for uploads/samples), so
-mixed cache times never overstate freshness. Uploads use the upload label with the filename; samples the sample
-label (`가상 데이터` included). It is rendered under the compare chart (F.6.8), is the first comment line of the
-compare CSVs (C.10), the HTML source paragraph, and the footer of a compare PNG (F.7.6).
+as-of = the **oldest** `as_of` among the series (`데이터 기준` for Naver/Wikipedia, `분석` for uploads), so mixed
+cache times never overstate freshness. Uploads use the upload label with the filename. Samples follow the D.2.2
+sample row: label (`가상 데이터` included) · freq · range, with **no value kind and no as-of**
+(`출처: trendai 내장 샘플 · 가상 데이터 · 월 단위 · 2016.01 ~ 2025.12`). It is rendered under the compare chart (F.6.8),
+is the first comment line of the compare CSVs (C.10), the HTML source paragraph, and the footer of a compare PNG
+(F.7.6).
 
 #### D.4.2 Slots
 
@@ -2359,9 +2376,10 @@ of C.10. No inline scripts or styles exist in the app (F.1 rules), so no `unsafe
 * Analysis jobs: thread pool of `workers` (2); AI jobs: thread pool of 2. Request threads never run analyses;
   they parse uploads (bounded to 2 at a time, C.13).
 * **Capacity**: the engine is CPU-bound Python under the GIL. Measured on 4 CPUs: 8 weekly series × 260 points take
-  ≈ 5.8 s sequentially and *not less* with 2 or 4 threads; one analysis takes 0.4–1.0 s up to 3,900 points. So one
-  process handles roughly 15–20 five-series weekly comparisons per minute. `workers = 2` buys fairness (a short job
-  is not stuck behind a long one), not throughput. Mitigations in this spec: result cache, in-flight joining of
+  ≈ 5.8 s sequentially and *not less* with 2 or 4 threads; one analysis takes 0.2–1.3 s up to 3,900 points. Measured
+  end to end (4 vCPU Xeon 2.1 GHz, Python 3.13, fake fetchers, 10–20 jobs submitted at once): one process handles
+  about 12–15 five-series weekly comparisons per minute (Wikipedia ≈ 12, Naver ≈ 15). `workers = 2` buys fairness
+  (a short job is not stuck behind a long one), not throughput. Mitigations in this spec: result cache, in-flight joining of
   identical queries (C.5), Naver fetch single-flight (E.6), upload parse limit; the numbers go in docs/WEB.md. A
   process pool is deliberately not used in the MVP (J).
 * **Data notices are captured per thread, never through `warnings`.** `warnings.catch_warnings` swaps
@@ -3470,8 +3488,12 @@ WP1 tests use `write_static_fixture`. Existing tests (`python -m pytest`, ~1,450
   `test_serve_second_signal_exits_1`.
 * `tests/test_packaging.py`: `test_static_index_is_package_data` (`importlib.resources.files("trendai.web") / "static"
   / "index.html"` exists) · `test_pyproject_package_data_patterns` (tomllib: `trendai.web` includes `static/**/*`,
-  excludes `static/dev/**`) · `test_fonts_present_with_license` (92 `.woff2` files + `LICENSE.txt` mentioning `SIL
-  Open Font License`) · `test_no_runtime_deps_added` (`[project].dependencies` still exactly numpy and pandas) ·
+  excludes `static/dev/**`, `include-package-data = false`) · `test_build_ships_static_without_dev` (`build_py` of a
+  clean copy ships every static file except `static/dev/**` and prints no "absent from the `packages` configuration"
+  warning) · `test_dockerfile_healthcheck_follows_trendai_port` (the Dockerfile's health-check code exits 0 against a
+  server on the port in `TRENDAI_PORT` with `HTTP_PROXY` pointing at a closed port, and non-zero when nothing listens) ·
+  `test_fonts_present_with_license` (92 `.woff2` files + `LICENSE.txt` mentioning `SIL Open Font License`) ·
+  `test_no_runtime_deps_added` (`[project].dependencies` still exactly numpy and pandas) ·
   `test_wsgi_import_is_lazy` (importing `trendai.web.wsgi` in a subprocess with `TRENDAI_DATA_DIR=<tmp>/x` creates
   no directory and starts no thread).
 
@@ -3557,11 +3579,12 @@ Reviewers tick every item; an unticked item blocks the merge of the owning WP (o
 - [ ] `trendai serve` (Korean help, `--host/--port/--data-dir/--dev`), graceful SIGTERM (drain while serving, then
       `os._exit`), public bind refused without `TRENDAI_CONTACT` (warning on loopback), warning baseline installed
       after the CLI filters; `trendai.web.wsgi` is lazy [WP4, WP1]
-- [ ] `pip install .` ships `trendai/web/static/**` minus `static/dev/**`; dependencies still only numpy + pandas [WP4]
+- [ ] `pip install .` ships `trendai/web/static/**` minus `static/dev/**` without setuptools "Package would be ignored"
+      warnings; dependencies still only numpy + pandas [WP4]
 - [ ] `Dockerfile`: `python:3.12-slim`, non-root user, `pip install --no-cache-dir . openpyxl anthropic`,
-      `ENV TRENDAI_DATA_DIR=/data TRENDAI_HOST=0.0.0.0`, `VOLUME /data`, `EXPOSE 8000`, `HEALTHCHECK` with
-      `python -c "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"`,
-      `CMD ["trendai", "serve"]`; `.dockerignore` excludes `.git`, `.trendai-data`, `tests`, `out`, caches [WP4]
+      `ENV TRENDAI_DATA_DIR=/data TRENDAI_HOST=0.0.0.0`, `VOLUME /data`, `EXPOSE 8000`, `HEALTHCHECK` probing
+      `http://127.0.0.1:${TRENDAI_PORT:-8000}/api/health` without any proxy (B.5), `CMD ["trendai", "serve"]`;
+      `.dockerignore` excludes `.git`, `.trendai-data`, `tests`, `out`, caches [WP4]
 - [ ] `docs/WEB.md` covers: quick start, every E.1 variable, Naver HUB/legacy key setup, Wikimedia contact,
       single-process rule with gunicorn/waitress commands, reverse proxy + TLS + `TRENDAI_TRUST_PROXY`/`TRENDAI_HSTS`,
       data dir and retention, budget behaviour, backups (none needed beyond shares), legal checklist (brief §5.6/§7) [WP4]
@@ -3578,7 +3601,7 @@ part, and why. Everything else from both reviews was applied in the sections nam
 
 | # | Finding | Decision | Why |
 |---|---|---|---|
-| J1 | Feasibility, blocking (warnings capture): "Option A, preferred: run each series' prepare + run + VM/export build in a `ProcessPoolExecutor` (spawn)". Also feasibility, non-blocking (capacity): "use a process pool for the per-series compute". | **Not adopted.** The blocking defect is fixed with a third variant of option B that touches no global state at all: a `ContextVar`-backed `data.collect_notices()` sink in the data layer's single emission point (`data.emit_notice`), plus `pipeline.run` inside a discarded block and a process-owner warnings baseline (B.3.1, E.6, E.13). | The ContextVar sink removes the cross-thread mixing and the leaked-recorder risk by construction, without `showwarning` hooks. A process pool would add, for the MVP: pickling of reports/VMs, cross-process progress (`current.step`) and cancellation plumbing, no way to stop a hung series short of killing the pool, ~1–2 s spawn cost and ~150–200 MB per worker, and slow, flaky unit tests (every test app would spawn workers). The throughput limit is real but bounded and now documented (E.13, docs/WEB.md: ≈ 15–20 five-series comparisons per minute per process), and the in-flight joining, Naver single-flight, result cache and upload limits remove the launch-day duplicate load the review described. A process pool remains the scale-out path once traffic shows it is needed. |
+| J1 | Feasibility, blocking (warnings capture): "Option A, preferred: run each series' prepare + run + VM/export build in a `ProcessPoolExecutor` (spawn)". Also feasibility, non-blocking (capacity): "use a process pool for the per-series compute". | **Not adopted.** The blocking defect is fixed with a third variant of option B that touches no global state at all: a `ContextVar`-backed `data.collect_notices()` sink in the data layer's single emission point (`data.emit_notice`), plus `pipeline.run` inside a discarded block and a process-owner warnings baseline (B.3.1, E.6, E.13). | The ContextVar sink removes the cross-thread mixing and the leaked-recorder risk by construction, without `showwarning` hooks. A process pool would add, for the MVP: pickling of reports/VMs, cross-process progress (`current.step`) and cancellation plumbing, no way to stop a hung series short of killing the pool, ~1–2 s spawn cost and ~150–200 MB per worker, and slow, flaky unit tests (every test app would spawn workers). The throughput limit is real but bounded and now documented (E.13, docs/WEB.md: measured ≈ 12–15 five-series weekly comparisons per minute per process on 4 vCPU), and the in-flight joining, Naver single-flight, result cache and upload limits remove the launch-day duplicate load the review described. A process pool remains the scale-out path once traffic shows it is needed. |
 | J2 | Feasibility, non-blocking (uploads): "run parsing in the job or worker pool instead of the request thread". | **Not adopted**; the other parts of that finding (2 concurrent parses → `503`, header-first column check, cell cap, 30 MB zip guard) are applied (C.4, C.13, E.17). | `POST /api/upload` answers synchronously with the detection result that the confirm step needs; moving it into a job would add a second polling flow for a ≤ 3.5 s operation. With at most 2 concurrent parses the memory (≈ 2 × 180 MB) and the GIL share are bounded, and notice capture no longer serialises jobs behind uploads (there is no lock any more). |
 | J3 | Design, non-blocking (likelihood bins): "pick the bin from the rounded value, or move bin edges to rounding midpoints". | **Not adopted.** Words keep the narrative's raw-P bins (D.1.5). | The rule-based narrative on the same page prints the exact probability with raw-P words (`narrative._probability_line`, frozen code outside every WP). Binning the card on the rounded value would make the card and the narrative of the *same series* disagree at 0.69/0.70 (card "우세", narrative "약간 우세"), which is worse than two *different* series near a boundary sharing a number with adjacent words. Since the number is now always labelled `상승 확률 약 70%`, the reader sees one measured quantity with two neighbouring descriptions, both of which are true. |
 | J4 | Design, non-blocking (jargon in reasons): "map test statistics to plain words (통계적으로 뚜렷한 상승 추세)". | **Applied in part**: dates are reformatted and trailing statistics move to a `detail` sub-line (D.2.5); the sentences themselves stay the engine's. | Rewriting free-text reasons would duplicate and could contradict the phase rules in `analysis.py` (outside every WP). Structured plain-word reasons are S1 (A.2). |
@@ -3588,4 +3611,5 @@ part, and why. Everything else from both reviews was applied in the sections nam
 | J8 | Design, non-blocking (compact numbers): "accept `1,235만` in A.3, or round to `1,200만`". | **Neither exactly**: at most 3 significant digits (`1,230만`) (D.1.1). | Matches the brief's "2–3 significant digits" while losing less than the 2-digit `1,200만`; English K/M/B already never exceed 3 digits. |
 | J9 | Design, blocking (outlook line): "either `(상승 확률 약 20%)`, or show the fall probability `(하락 확률 약 80%)`". | **The first form** (D.1.5 `prob_labelled`, D.2.3). | One quantity everywhere (tile 5, ranking sort, `/method`) is easier to learn than a number whose meaning flips with the direction. |
 | J10 | Feasibility, non-blocking (Naver raw-ratio policy): "either accept that the API is machine-readable, or round/strip in the API". | **Accepted as machine-readable display data** and recorded as the working legal judgement (A.3, docs/WEB.md legal checklist). | The SPA needs the values to draw the chart and read-outs; rounding would degrade the display without changing what can be scraped from the page. Files and copy controls stay free of raw ratios. |
-
+| J11 | Verification CON-16 (spec drift): "C.10 says the compare JSON is an array; D.4.1 gives samples an as-of that D.2.2 does not; C.5 says a new job answers `queued`". | **The spec text follows the implementation** (C.5, C.10, D.2.2, D.4.1). | Compare JSON: a bare array cannot hold the top-level `source` array and `source_line` C.10 asks for, so it is `{source_line, source, reports}` (WEB_INTERFACES §4.1). Samples: synthetic data have no fetch time, and an analysis time on a fixed built-in series adds nothing, so the D.2.2 row (no as-of) wins over the old D.4.1 wording. C.5: the `status` of a fresh job races with a free worker; clients poll either way, so the answer reports the real state instead of forcing `queued`. |
+| J12 | Verification OPS-14 (capacity): "15–20 comparisons per minute and 24 h retention under the 2 GB default are not what operators will see". | **Docs corrected, defaults kept** (E.13, docs/WEB.md 처리량 and 데이터 보관). | Measured 12–15 five-series weekly comparisons per minute on 4 vCPU, and 0.07–1.2 MB stored per series (a five-series weekly Wikipedia comparison ≈ 2.5 MB). docs/WEB.md now gives per-result sizes and the rule `TRENDAI_STORE_MAX_MB ≥ results per TTL × size ÷ 0.9 + shares`; 2 GB suits a few thousand analyses a day, and operators with more raise it. Shrinking stored results is tracked separately (OPS-2/OPS-3). |

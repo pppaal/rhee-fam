@@ -103,7 +103,7 @@ def test_compare_three_samples(client):
     assert cmp_["slots"] == {"0": 1, "1": 2, "2": 3}
     assert [v["slot"] for v in env["series"]] == [1, 2, 3]
     by_name = {r["name"]: r["index"] for r in cmp_["ranking"]}
-    assert by_name == {"emerging": 0, "fad": 1, "seasonal": 2}
+    assert by_name == {"태동기형": 0, "반짝유행": 1, "계절형": 2}           # sample titles (G.13), never the ids
     assert env["exports"]["values_csv"] == f"/api/export/{env['result_id']}/values.csv"
 
 

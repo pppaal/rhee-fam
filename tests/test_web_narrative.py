@@ -72,9 +72,9 @@ def test_ai_job_success(client, app):
     assert done["status"] == "done" and done["poll_after_ms"] is None and done["error"] is None
     nar = done["narrative"]
     assert nar["source"] == "llm" and nar["badge"] == "AI 해석 · Claude" and nar["model"] == "claude-opus-5-5"
-    assert nar["markdown"].startswith("**AI 테스트 해석** — growing")
+    assert nar["markdown"].startswith("**AI 테스트 해석** — 성장형")
     assert "## 주의할 점" not in nar["markdown"] and nar["caveats_markdown"] == "- 테스트 주의입니다."
-    assert seen[0][1] == "ko" and seen[0][0]["series"]["name"] == "growing"
+    assert seen[0][1] == "ko" and seen[0][0]["series"]["name"] == "성장형"     # the VM's name, never the id
     assert os.path.isfile(os.path.join(app.config.data_dir, "results", rid, "ai", "0-ko.json"))
     later = client.get(f"/api/results/{rid}").json()
     stored = later["series"][0]["narrative"]["ai"]

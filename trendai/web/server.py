@@ -17,14 +17,48 @@ from typing import Any, Callable, Optional
 
 from .app import TrendaiApp
 
-__all__ = ["ThreadingWSGIServer", "make_server", "serve_forever", "start_background", "begin_graceful_shutdown"]
+__all__ = ["ThreadingWSGIServer", "make_server", "serve_forever", "start_background", "begin_graceful_shutdown",
+           "DRAIN_LINGER_S", "EXIT_WAIT_S"]
 
 LOG = logging.getLogger("trendai.web")
+
+#: after the last running job ends, keep serving this long (capped by the grace period) so the clients polling every
+#: 0.5 s still see ``done`` and fetch the result before the listener closes (E.14 step 1's purpose)
+DRAIN_LINGER_S = 3.0
+#: before the process exits, wait up to this long for requests that are still being answered
+EXIT_WAIT_S = 2.0
 
 
 class ThreadingWSGIServer(socketserver.ThreadingMixIn, wsgiref.simple_server.WSGIServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._busy = 0
+        self._busy_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        with self._busy_lock:
+            self._busy += 1
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._busy_lock:
+                self._busy -= 1
+
+    @property
+    def busy(self) -> int:
+        """Connections being handled (request read, application call and response write)."""
+        with self._busy_lock:
+            return self._busy
+
+    def wait_quiet(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds until no connection is being handled; ``True`` when quiet."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while self.busy and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return not self.busy
 
 
 class _V6Server(ThreadingWSGIServer):
@@ -68,10 +102,17 @@ def begin_graceful_shutdown(app: TrendaiApp, server: ThreadingWSGIServer, *,
 
     def wait_then_stop() -> None:
         deadline = time.monotonic() + limit
+        had_jobs = bool(app.jobs.running())
         while app.jobs.running() and time.monotonic() < deadline:
             time.sleep(0.2)
         if app.jobs.running():
             LOG.warning("shutdown grace period over: %d running job(s) abandoned", app.jobs.running())
+        elif had_jobs:
+            # the jobs the drain waited for just finished: their clients learn it at their next poll and then fetch
+            # the result -- keep serving a little longer, or most of them meet a closed port instead
+            linger_until = min(deadline, time.monotonic() + DRAIN_LINGER_S)
+            while time.monotonic() < linger_until:
+                time.sleep(0.1)
         app.close(timeout=0)
         server.shutdown()
 
@@ -134,6 +175,9 @@ def serve_forever(app: TrendaiApp, host: str, port: int, *, on_ready: Optional[C
     finally:
         state["stopped"] = True
         signalled.set()                  # lets the watcher thread end when no signal came
+        # handler threads are daemons that the caller's os._exit would cut off mid-response: let the requests
+        # that are still being answered finish first (bounded)
+        server.wait_quiet(EXIT_WAIT_S)
         server.server_close()
         for sig, handler in previous.items():
             try:

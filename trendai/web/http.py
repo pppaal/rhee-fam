@@ -14,7 +14,7 @@ from urllib.parse import parse_qs
 from .errors import WebError
 
 __all__ = ["Request", "Response", "dumps", "json_response", "text_response", "SECURITY_HEADERS", "APP_CSP",
-           "JSON_TYPE", "ID_RX", "valid_id"]
+           "JSON_TYPE", "ID_RX", "valid_id", "parse_json", "is_loopback_host"]
 
 JSON_TYPE = "application/json; charset=utf-8"
 
@@ -117,6 +117,21 @@ def _client_key(addr: str) -> str:
     return str(ip)
 
 
+def is_loopback_host(host: str) -> bool:
+    """``localhost`` / ``*.localhost`` / a loopback IP, with or without a port (``[::1]:8000``)."""
+    text = host.strip().lower()
+    if text.startswith("["):
+        text = text[1:].split("]", 1)[0]
+    elif text.count(":") == 1:
+        text = text.split(":", 1)[0]
+    if text == "localhost" or text.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
+
+
 def _origin_tuple(scheme: str, host: str) -> tuple[str, str]:
     scheme = scheme.lower().strip()
     host = host.lower().strip()
@@ -129,8 +144,11 @@ def _origin_tuple(scheme: str, host: str) -> tuple[str, str]:
 class Request:
     """A parsed WSGI request. ``path`` is ``PATH_INFO`` (already percent-decoded by the server) re-read as UTF-8."""
 
-    def __init__(self, environ: dict, *, trust_proxy: bool = False, public_url: Optional[str] = None) -> None:
+    def __init__(self, environ: dict, *, trust_proxy: bool = False, public_url: Optional[str] = None,
+                 loopback_only: bool = False) -> None:
         self.environ = environ
+        #: a loopback server without public_url/trust_proxy: browser requests must come from a loopback origin
+        self.loopback_only = loopback_only
         self.method = str(environ.get("REQUEST_METHOD", "GET")).upper()
         raw_path = str(environ.get("PATH_INFO", "") or "")
         try:
@@ -207,7 +225,12 @@ class Request:
         scheme, sep, rest = origin.partition("://")
         if not sep:
             return False
-        return _origin_tuple(scheme, rest.split("/", 1)[0]) == self.own_origin()
+        host = rest.split("/", 1)[0]
+        if self.loopback_only and not is_loopback_host(host):
+            # DNS rebinding: a page whose host name now resolves to 127.0.0.1 sends matching Host and Origin
+            # headers; a server bound to loopback only ever has loopback origins of its own
+            return False
+        return _origin_tuple(scheme, host) == self.own_origin()
 
     # ------------------------------------------------------------------ body
     @property
@@ -238,7 +261,10 @@ class Request:
         chunks: list[bytes] = []
         remaining = length
         while remaining > 0 and stream is not None:
-            chunk = stream.read(min(remaining, 1 << 16))
+            try:
+                chunk = stream.read(min(remaining, 1 << 16))
+            except OSError:          # socket timeout (a body shorter than its Content-Length) or a reset: the client's
+                raise WebError("bad_request") from None   # fault, not a 500 with an ERROR traceback (TimeoutError too)
             if not chunk:
                 break
             chunks.append(chunk)
@@ -254,10 +280,16 @@ class Request:
         if self.content_type != "application/json":
             raise WebError("unsupported_media_type")
         body = self.read_body(limit, max_mb=round(limit / (1024 * 1024), 2))
-        try:
-            obj = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            raise WebError("bad_request") from None
+        obj = parse_json(body)
         if not isinstance(obj, dict):
             raise WebError("bad_request")
         return obj
+
+
+def parse_json(body: bytes) -> Any:
+    """``json.loads`` of a request body; invalid UTF-8/JSON *and* nesting deep enough to hit the recursion limit
+    (``[[[[…`` in 60 KB) are ``400 bad_request``, never a 500 with a traceback."""
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise WebError("bad_request") from None

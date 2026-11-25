@@ -18,7 +18,7 @@ import pandas as pd
 from pandas.errors import OutOfBoundsDatetime
 
 from .analysis import analyze
-from .data import DataError, DataWarning, default_horizon, emit_notice, future_index, prepare
+from .data import INTERPOLATED_ATTR, DataError, DataWarning, default_horizon, emit_notice, future_index, prepare
 from .forecast import auto_forecast, compute_outlook, is_random_walk, outlook_levels
 from .messages import Localised, Msg, msg
 from .narrative import direction_label, generate_narrative, is_synthetic, metric_pct_undefined, prob_undefined
@@ -66,6 +66,9 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
     Data issues that were worked around (interpolated gaps, weekday-only data,
     unreadable values) and a horizon of more than 5x the history -- the
     default horizon included -- are reported as :class:`trendai.data.DataWarning`.
+    ``report.analysis.series.attrs[trendai.data.INTERPOLATED_ATTR]`` lists the dates of
+    the periods that were filled by interpolation (also when ``series`` was already
+    prepared by :func:`trendai.data.prepare`, whose list it keeps).
     """
     if horizon is not None:
         try:
@@ -90,6 +93,8 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
     analysis = analyze(s, freq=f, name=display_name)
     if is_synthetic_series(series):   # a built-in sample: every surface says it is synthetic
         analysis.series.attrs[SYNTHETIC_ATTR] = True
+    # the periods prepare() filled by interpolation (estimates, not observations: FU-5)
+    analysis.series.attrs[INTERPOLATED_ATTR] = list(s.attrs.get(INTERPOLATED_ATTR) or [])
     stage("forecast")
     forecast = auto_forecast(analysis.series, horizon=horizon, freq=f, levels=tuple(levels),
                              candidates=candidates, random_walk=is_random_walk(analysis))

@@ -7,7 +7,8 @@
 // anomalies[].text, source.unit_label). The few UI words a chart needs come from `opts.t` with these catalog keys
 // (G.1, G.6): 'chart.forecast' (forecast region label), 'chart.readout_actual', 'chart.readout_forecast',
 // 'chart.readout_range' (bands_only read-out; falls back to 'chart.readout_forecast' while the key is missing),
-// 'common.reference_only' (weak / bands_only chip), 'a11y.chart_keys' (wrapper aria-label suffix).
+// 'common.reference_only' (weak / bands_only chip), 'a11y.chart_keys' (wrapper aria-label suffix),
+// 'chart.window_note' / 'chart.window_full' (the narrow-width history window, through common.uiText).
 //
 // DOM (all classes styled by css/chart.css):
 //   .chart.chart-fan
@@ -16,16 +17,20 @@
 //       svg.chart-svg[role=img]           the picture (title, desc, every visual layer) — getSvg(), PNG export
 //       svg.chart-overlay                 interactive layer: changepoint badge buttons (an <svg role="img"> exposes
 //                                         no children to assistive technology, so the buttons live beside it)
+//     .chart-range                        below 640 px when the history is windowed (UX-4): note + 전체 기간 toggle
 
 import { h, svg, clear } from '../dom.js';
 import * as fmt from '../fmt.js';
-import { detailYDomain, dodge, isoToMs, linearScale, tickCount, tickLabels, timeTicks } from './scale.js';
+import {
+  detailYDomain, dodge, isoToMs, linearScale, narrowWindow, tickCount, tickLabels, timeTicks,
+} from './scale.js';
 import { drawXAxis, drawYAxis, measureLabels, textWidths, X_CAPTION_SPACE, X_TICK_SPACE } from './axes.js';
-import { createCrosshair, throttle } from './crosshair.js';
+import { createCrosshair, shouldAnnounce, throttle } from './crosshair.js';
 import { areaPath, circled, extent, linePath, seamForecast, truncateToWidth, withUnit } from './geom.js';
 import { describeSeries } from './describe.js';
 import {
-  WIDE_PX, contentWidth, defaultAnnounce, joinParts, lineKey, observeWidth, renderReadout, svgChip, uid,
+  WIDE_PX, contentWidth, defaultAnnounce, joinParts, lineKey, observeWidth, rangeControl, renderReadout, svgChip, uid,
+  uiText,
 } from './common.js';
 
 const HEIGHT_WIDE = 320;
@@ -49,9 +54,12 @@ const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
  * @typedef {ChartBaseOptions & {
  *   band?: 'both'|'80'|'95'|'off',
  *   trend?: boolean,
- *   anomalies?: boolean
+ *   anomalies?: boolean,
+ *   fullRange?: boolean
  * }} FanChartOptions
- * band: URL `band` param (default 'both'); trend / anomalies: the 추세선 / 이상치 toggles (default true).
+ * band: URL `band` param (default 'both'); trend / anomalies: the 추세선 / 이상치 toggles (default true);
+ * fullRange: below 640 px, show the whole history instead of the default window (scale.narrowWindow; default false,
+ * flipped by the chart's own 전체 기간 toggle).
  */
 
 /**
@@ -155,11 +163,32 @@ export function createFanChart(container, seriesVM, opts) {
   const dots = svg('g', { class: 'chart-xh-dots' });
   xhLayer.appendChild(dots);
   const wrapper = h('div', { class: 'chart-wrap', tabindex: '0', role: 'group' }, svgEl, overlay);
-  const root = h('div', { class: ['chart', 'chart-fan'] }, readout, wrapper);
+  const range = rangeControl(() => {
+    o.fullRange = !o.fullRange;
+    render();
+  });
+  const root = h('div', { class: ['chart', 'chart-fan'] }, readout, wrapper, range.el);
   clear(container).appendChild(root);
 
   const t = (key, params) => o.t(key, params);
   const announce = throttle((text) => (o.announce || defaultAnnounce)(text), 250);
+
+  // The crosshair works on the points inside the x window (geo.off = index of the first one); everything else uses
+  // indexes into model.points.
+  const offset = () => (geo ? geo.off : 0);
+  const currentK = () => {
+    const i = crosshair.current();
+    return i < 0 ? -1 : i + offset();
+  };
+  /** Move the crosshair to model point k, showing the full period first when k lies before the window. */
+  function moveToK(k) {
+    if (!(k >= 0) || !geo) return;
+    if (k < geo.off) {
+      o.fullRange = true;
+      render();
+    }
+    if (geo) crosshair.moveTo(k - geo.off);
+  }
 
   // ------------------------------------------------------------------------------------------ read-out texts
 
@@ -215,10 +244,11 @@ export function createFanChart(container, seriesVM, opts) {
     }
   }
 
-  function onMove(k) {
+  function onMove(i, cause) {
+    const k = i < 0 ? -1 : i + offset();
     const content = showReadout(k);
     drawDots(k);
-    if (k >= 0 && content) announce(content.text);
+    if (k >= 0 && content && shouldAnnounce(cause)) announce(content.text);
     const p = model.points[k];
     const payload = k >= 0 && p && content ? { date: p.iso, index: k, part: p.part, text: content.text } : null;
     for (const cb of pointListeners) cb(payload);
@@ -240,7 +270,7 @@ export function createFanChart(container, seriesVM, opts) {
   function activateCp(n) {
     setActiveCp(n);
     const cp = model.cps.find((c) => c.n === n);
-    if (cp && cp.index >= 0) crosshair.moveTo(cp.index);
+    if (cp && cp.index >= 0) moveToK(cp.index);
     for (const cb of cpListeners) cb(n);
   }
 
@@ -264,10 +294,14 @@ export function createFanChart(container, seriesVM, opts) {
       top: MARGIN_TOP, right: 16, bottom: X_TICK_SPACE + (caption ? X_CAPTION_SPACE : 0),
       left: Math.max(measureLabels(svgEl, yLabels) + 8, 20),            // widest y label + 8
     };
-    const t0 = points[0].ms;
-    const t1 = points[points.length - 1].ms > t0 ? points[points.length - 1].ms : t0 + 86400000;
+    const first = points[0].ms;
+    const t1 = points[points.length - 1].ms > first ? points[points.length - 1].ms : first + 86400000;
     const hasFc = model.seam.dates.length > 0;
     const seamMs = model.last ? isoToMs(model.last.date) : t1;
+    // below 640 px a long history leaves the forecast ~20 px: show the last years only, unless asked (UX-4)
+    const win = wide || !hasFc ? null : narrowWindow(first, seamMs, t1, model.freq);
+    const t0 = win && !o.fullRange ? win.startMs : first;
+    const off = Math.max(0, points.findIndex((p) => p.ms >= t0));
     const fcLabel = t('chart.forecast');
     let x = linearScale([t0, t1], [margin.left, width - margin.right]);
     if (hasFc && width - margin.right - x.map(seamMs) < textWidths(svgEl, [fcLabel], 'chart-region-label')[0] + 12) {
@@ -279,7 +313,7 @@ export function createFanChart(container, seriesVM, opts) {
     const yTop = ticks.max + ((ticks.max - ticks.min) * LABEL_BAND) / Math.max(1, plotH - LABEL_BAND);
     const y = linearScale([ticks.min, yTop], [height - margin.bottom, margin.top]);
     return {
-      width, height, wide, margin, x, y, ticks, excluded, yLabels, caption, t0, t1, hasFc, fcLabel,
+      width, height, wide, margin, x, y, ticks, excluded, yLabels, caption, t0, t1, hasFc, fcLabel, win, off,
       frame: { width, height, margin },
       L: margin.left, R: width - margin.right, T: margin.top, B: height - margin.bottom,
       seamX: x.map(seamMs), chipW: 0, yLabelRight: 0, badgeXs: [],
@@ -342,7 +376,7 @@ export function createFanChart(container, seriesVM, opts) {
 
   /** Changepoint lines and numbered badges in the label band (≥ 2r + 2 apart), with button twins in the overlay. */
   function drawChangepoints(g) {
-    const shown = model.cps.filter((cp) => cp.on_chart && cp.index >= 0);
+    const shown = model.cps.filter((cp) => cp.on_chart && cp.index >= g.off);
     const trueXs = shown.map((cp) => g.x.map(isoToMs(cp.date)));
     g.badgeXs = dodge(trueXs, BADGE_R * 2 + 2, g.L + BADGE_R, g.R - BADGE_R);
     const cy = g.T + BADGE_R + 2;
@@ -407,7 +441,7 @@ export function createFanChart(container, seriesVM, opts) {
     const group = svg('g', { class: 'chart-anoms' });
     const excluded = new Set(g.excluded);
     model.anomalies.forEach((a, i) => {
-      if (!isNum(a.value) || !model.indexByDate.has(a.date)) return;
+      if (!isNum(a.value) || !model.indexByDate.has(a.date) || isoToMs(a.date) < g.t0) return;
       const ax = g.x.map(isoToMs(a.date));
       if (!excluded.has(i)) {
         group.appendChild(svg('circle', { class: 'chart-anom', cx: ax, cy: g.y.map(a.value), r: 4 }));
@@ -430,8 +464,20 @@ export function createFanChart(container, seriesVM, opts) {
     svgEl.appendChild(group);
   }
 
+  /** The 전체 기간 toggle: shown below 640 px whenever a window applies (also while the full period is on). */
+  function updateRange(g) {
+    const win = g && g.win;
+    range.set({
+      shown: Boolean(win),
+      full: Boolean(o.fullRange),
+      note: win ? uiText(t, o.lang, 'chart.window_note', { span: fmt.spanLabel(win.n, win.unit, o.lang) }) : '',
+      label: win ? uiText(t, o.lang, 'chart.window_full') : '',
+    });
+  }
+
   function render() {
     const width = contentWidth(container);
+    const keepK = geo ? currentK() : -1;
     const focusedCp = overlay.contains(document.activeElement) ? document.activeElement.getAttribute('data-cp') : null;
     clear(svgEl);
     clear(overlay);
@@ -441,6 +487,7 @@ export function createFanChart(container, seriesVM, opts) {
     svgEl.append(svg('title', { id: ids.title }, c.title || ''), svg('desc', { id: ids.desc }, describeSeries(model.vm)));
     if (!width || !points.length) {
       geo = null;
+      updateRange(null);
       showReadout(-1);
       return;
     }
@@ -452,6 +499,7 @@ export function createFanChart(container, seriesVM, opts) {
     }
     const g = layout(width);
     geo = g;
+    updateRange(g);
     drawFrame(g);
     drawData(g);
     drawChangepoints(g);
@@ -461,10 +509,14 @@ export function createFanChart(container, seriesVM, opts) {
       svgEl.appendChild(svg('circle', { class: 'chart-last', cx: g.seamX, cy: g.y.map(model.last.value), r: 4 }));
     }
     svgEl.appendChild(xhLayer);                                          // crosshair on top
-    crosshair.setPoints(points.map((p) => ({ ms: p.ms, x: g.x.map(p.ms) })),
-      { plotTop: g.T, plotHeight: g.B - g.T, startIndex: model.lastIndex });
+    crosshair.setPoints(points.slice(g.off).map((p) => ({ ms: p.ms, x: g.x.map(p.ms) })),
+      { plotTop: g.T, plotHeight: g.B - g.T, startIndex: Math.max(0, model.lastIndex - g.off) });
+    if (keepK >= 0 && keepK !== currentK()) {                           // the window moved under the crosshair
+      if (keepK >= g.off) crosshair.moveTo(keepK - g.off);
+      else crosshair.hide();
+    }
     setActiveCp(activeCp);
-    const k = crosshair.current();
+    const k = currentK();
     showReadout(k);
     drawDots(k);
     if (focusedCp !== null) {
@@ -479,13 +531,13 @@ export function createFanChart(container, seriesVM, opts) {
 
   return {
     update(vm, opts2 = {}) {
-      const keep = crosshair.current() >= 0 ? model.points[crosshair.current()]?.iso : null;
+      const keep = currentK() >= 0 ? model.points[currentK()]?.iso : null;
       if (vm) model = buildModel(vm);
       Object.assign(o, opts2);
       applyToggles();
       crosshair.hide();
       render();
-      if (keep && model.indexByDate.has(keep)) crosshair.moveTo(model.indexByDate.get(keep));
+      if (keep && model.indexByDate.has(keep)) moveToK(model.indexByDate.get(keep));
     },
     setBand(band) {
       o.band = band;
@@ -499,13 +551,13 @@ export function createFanChart(container, seriesVM, opts) {
     highlightDate(iso) {
       const k = model.indexByDate.get(iso);
       if (k === undefined || !geo) return false;
-      crosshair.moveTo(k);
+      moveToK(k);
       return true;
     },
     highlightChangepoint(n) {
       setActiveCp(n);
       const cp = n == null ? null : model.cps.find((c) => c.n === n);
-      if (cp && cp.index >= 0) crosshair.moveTo(cp.index);
+      if (cp && cp.index >= 0) moveToK(cp.index);
     },
     onChangepoint(cb) {
       cpListeners.push(cb);

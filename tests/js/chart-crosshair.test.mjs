@@ -1,9 +1,9 @@
 // chart/crosshair.js pure helpers (F.7.4): nearest point snapping, keyboard targets, the 250 ms live-region
-// throttle. Run: node --test tests/js
+// throttle and which moves reach the live region. Run: node --test tests/js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { keyTarget, nearestIndex, throttle } from '../../trendai/web/static/js/chart/crosshair.js';
+import { keyTarget, nearestIndex, shouldAnnounce, throttle } from '../../trendai/web/static/js/chart/crosshair.js';
 
 test('nearestIndex: binary search, ties go to the earlier point', () => {
   const xs = [0, 10, 20, 30];
@@ -54,4 +54,13 @@ test('throttle: leading call, at most one call per window, trailing call with th
   fn(5);
   assert.deepEqual(calls, [1, 3, 5]);
   fn.cancel();
+});
+
+test('shouldAnnounce: keyboard, focus and page-driven moves only, never mouse hover or touch scrubbing (A11Y-16)', () => {
+  assert.equal(shouldAnnounce('key'), true);
+  assert.equal(shouldAnnounce('focus'), true);
+  assert.equal(shouldAnnounce('api'), true);           // narrative date links, changepoint list and badges
+  assert.equal(shouldAnnounce('pointer'), false);
+  assert.equal(shouldAnnounce('touch'), false);
+  assert.equal(shouldAnnounce(undefined), false);
 });

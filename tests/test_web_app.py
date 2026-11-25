@@ -285,10 +285,11 @@ def test_two_apps_in_one_process(tmp_path, static):
     b = make_test_app(tmp_path / "b", static_dir=static)
     try:
         ca, cb = TestClient(a), TestClient(b)
+        missing = f"/api/results/{'N' * 22}"
         for _ in range(60):
-            ca.get("/api/config")
-        assert ca.get("/api/config").status == 429
-        assert cb.get("/api/config").status == 200            # no shared limiter state
+            ca.get(missing)
+        assert ca.get(missing).status == 429
+        assert cb.get(missing).status == 404                   # no shared limiter state
     finally:
         a.close(timeout=5)
         b.close(timeout=5)

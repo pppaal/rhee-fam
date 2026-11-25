@@ -2,39 +2,79 @@
 //
 // openPopover(): from 640 px a panel anchored under its opener (role="dialog", aria-modal, labelled, focus trap, Esc
 // and outside click close, focus returns to the opener); below 640 px the same content opens as a bottom sheet.
-// menuButton(): a button with aria-haspopup="menu" opening a role="menu" list (arrow keys, Home/End, Esc).
+// menuButton(): a button with aria-haspopup="menu" opening a role="menu" list (arrow keys, Home/End, Esc; Tab closes
+// the menu and continues from the button). Every open panel registers with sheet.js so a route change closes it.
 
 import { focusFirst, h } from '../dom.js';
 import { t } from '../i18n.js';
 import { icon, isNarrow } from '../ui.js';
-import { openSheet, registerModal } from './sheet.js';
+import { openSheet, registerModal, registerTransient, resolveOpener } from './sheet.js';
 
 let counter = 0;
+const GUTTER = 8;
 
-/** Position a fixed panel under (or above) `anchor`, kept inside the viewport. */
-export function placeUnder(panel, anchor, gap = 6) {
+/**
+ * The position of a fixed panel of size `pw` × `ph` under (or above) an anchor rect, kept inside the viewport.
+ * Pure (exported for tests).
+ * @param {{left: number, top: number, bottom: number}} r  anchor rect
+ * @param {number} pw
+ * @param {number} ph
+ * @param {number} vw  viewport width
+ * @param {number} vh  viewport height
+ * @param {number} [gap=6]
+ * @returns {{left: number, top: number}}
+ */
+export function panelPosition(r, pw, ph, vw, vh, gap = 6) {
+  let left = Math.min(Math.max(GUTTER, r.left), Math.max(GUTTER, vw - pw - GUTTER));
+  if (!Number.isFinite(left)) left = GUTTER;
+  let top = r.bottom + gap;
+  if (top + ph > vh - GUTTER) {
+    if (r.top - gap - ph >= GUTTER) top = r.top - gap - ph;              // room above: flip
+    else top = Math.max(GUTTER, vh - ph - GUTTER);                       // neither: keep it on screen
+  }
+  return { left: Math.round(left), top: Math.round(top) };
+}
+
+/**
+ * Position a fixed panel under (or above) `anchor`, kept inside the viewport. The panel is moved to 0,0 before it is
+ * measured, so its width is its natural width and not the space left at its static position (UX-2).
+ * @param {HTMLElement} panel
+ * @param {HTMLElement} anchor
+ * @param {number} [gap=6]
+ * @param {{gutters?: boolean}} [opts]  gutters: below 640 px span the page between the 16 px gutters
+ */
+export function placeUnder(panel, anchor, gap = 6, opts = {}) {
+  if (!anchor || !anchor.isConnected) return;
   const r = anchor.getBoundingClientRect();
   const vw = document.documentElement.clientWidth;
   const vh = window.innerHeight;
-  const pw = panel.offsetWidth;
-  const ph = panel.offsetHeight;
-  let left = Math.min(Math.max(8, r.left), Math.max(8, vw - pw - 8));
-  let top = r.bottom + gap;
-  if (top + ph > vh - 8 && r.top - gap - ph > 8) top = r.top - gap - ph;
-  if (!Number.isFinite(left)) left = 8;
-  panel.style.setProperty('left', `${Math.round(left)}px`);
-  panel.style.setProperty('top', `${Math.round(top)}px`);
+  panel.style.setProperty('left', '0px');
+  panel.style.setProperty('top', '0px');
+  if (opts.gutters && isNarrow()) {
+    panel.style.setProperty('width', `${Math.max(0, vw - 32)}px`);
+    panel.style.setProperty('max-width', 'none');
+  } else {
+    panel.style.removeProperty('width');
+    panel.style.removeProperty('max-width');
+  }
+  const pos = panelPosition(r, panel.offsetWidth, panel.offsetHeight, vw, vh, gap);
+  if (opts.gutters && isNarrow()) pos.left = 16;
+  panel.style.setProperty('left', `${pos.left}px`);
+  panel.style.setProperty('top', `${pos.top}px`);
 }
 
 /**
  * Open an anchored popover (bottom sheet below 640 px).
  * @param {HTMLElement} anchor
- * @param {{title: string, content: Node|Node[], footer?: Node|Node[], onClose?: () => void, className?: string}} opts
- * @returns {{close: () => void, el: HTMLElement}}
+ * @param {{title: string, content: Node|Node[], footer?: Node|Node[], onClose?: () => void, className?: string,
+ *          opener?: HTMLElement|(() => HTMLElement|null)}} opts
+ *        opener: where focus returns (default: the anchor); a function is resolved at close time
+ * @returns {{close: (restoreFocus?: boolean) => void, el: HTMLElement}}
  */
 export function openPopover(anchor, opts) {
+  const opener = opts.opener || anchor;
   if (isNarrow()) {
-    const sheet = openSheet({ ...opts, opener: anchor });
+    const sheet = openSheet({ ...opts, opener });
     return { close: sheet.close, el: sheet.dialog };
   }
   const id = `pop-title-${++counter}`;
@@ -52,11 +92,14 @@ export function openPopover(anchor, opts) {
   placeUnder(panel, anchor);
 
   let closed = false;
-  const reposition = () => placeUnder(panel, anchor);
+  const reposition = () => {
+    if (!anchor.isConnected) close(false);
+    else placeUnder(panel, anchor);
+  };
   const onPointer = (e) => {
     if (!panel.contains(e.target) && !anchor.contains(e.target)) close(false);
   };
-  const unregister = registerModal({ dialog: panel, close: () => close() });
+  const unregister = registerModal({ dialog: panel, close: (restore) => close(restore) });
   window.addEventListener('resize', reposition);
   window.addEventListener('scroll', reposition, true);
   document.addEventListener('pointerdown', onPointer, true);
@@ -71,7 +114,8 @@ export function openPopover(anchor, opts) {
     panel.remove();
     anchor.setAttribute('aria-expanded', 'false');
     if (opts.onClose) opts.onClose();
-    if (restoreFocus && anchor.isConnected) anchor.focus({ preventScroll: true });
+    const target = restoreFocus ? resolveOpener(opener) : null;
+    if (target) target.focus({ preventScroll: true });
   }
   if (!focusFirst(panel.querySelector('.popover-body'))) panel.focus();
   return { close, el: panel };
@@ -85,10 +129,12 @@ export function openPopover(anchor, opts) {
  * @returns {HTMLButtonElement}
  */
 export function menuButton(opts) {
-  const id = `menu-${++counter}`;
+  const n = ++counter;
+  const id = `menu-${n}`;
+  const buttonId = `menu-btn-${n}`;
   const button = h('button', {
-    type: 'button', class: ['btn', opts.className], 'aria-haspopup': 'menu', 'aria-expanded': 'false',
-    'aria-controls': id, 'aria-label': opts.ariaLabel || null, on: { click: () => (open ? close() : show()) },
+    type: 'button', id: buttonId, class: ['btn', opts.className], 'aria-haspopup': 'menu', 'aria-expanded': 'false',
+    'aria-label': opts.ariaLabel || null, on: { click: () => (open ? close() : show()) },
   }, opts.icon ? icon(opts.icon) : null, opts.label);
   let open = null;
 
@@ -99,7 +145,8 @@ export function menuButton(opts) {
     m.cleanup();
     m.menu.remove();
     button.setAttribute('aria-expanded', 'false');
-    if (restore) button.focus({ preventScroll: true });
+    button.removeAttribute('aria-controls');
+    if (restore && button.isConnected) button.focus({ preventScroll: true });
   }
 
   function show() {
@@ -123,9 +170,10 @@ export function menuButton(opts) {
         },
       }, content);
     });
-    const menu = h('div', { class: 'menu', role: 'menu', id, 'aria-label': opts.ariaLabel || null }, nodes);
+    const menu = h('div', { class: 'menu', role: 'menu', id, 'aria-labelledby': buttonId }, nodes);
     document.body.appendChild(menu);
     button.setAttribute('aria-expanded', 'true');
+    button.setAttribute('aria-controls', id);
     placeUnder(menu, button, 4);
     const focusAt = (i) => {
       if (!nodes.length) return;
@@ -139,19 +187,25 @@ export function menuButton(opts) {
       else if (e.key === 'Home') { e.preventDefault(); focusAt(0); }
       else if (e.key === 'End') { e.preventDefault(); focusAt(nodes.length - 1); }
       else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
-      else if (e.key === 'Tab') close(false);
+      // Tab: focus goes back to the button first, so the browser's own Tab move continues from there (A11Y-7)
+      else if (e.key === 'Tab') close(true);
     };
     const onPointer = (e) => {
       if (!menu.contains(e.target) && !button.contains(e.target)) close(false);
     };
-    const reposition = () => placeUnder(menu, button, 4);
+    const reposition = () => {
+      if (!button.isConnected) close(false);
+      else placeUnder(menu, button, 4);
+    };
     menu.addEventListener('keydown', onKey);
     document.addEventListener('pointerdown', onPointer, true);
     window.addEventListener('resize', reposition);
     window.addEventListener('scroll', reposition, true);
+    const unregister = registerTransient({ close: (restore) => close(restore) });
     open = {
       menu,
       cleanup() {
+        unregister();
         document.removeEventListener('pointerdown', onPointer, true);
         window.removeEventListener('resize', reposition);
         window.removeEventListener('scroll', reposition, true);

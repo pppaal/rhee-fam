@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 import threading
 from typing import Callable
 
@@ -19,6 +20,7 @@ from .store import Store, utc_iso
 __all__ = ["NaverBudget", "AiBudget", "kst_now"]
 
 _KST = _dt.timezone(_dt.timedelta(hours=9))
+LOG = logging.getLogger("trendai.web")
 
 
 def kst_now(clock: Callable[[], _dt.datetime]) -> _dt.datetime:
@@ -32,6 +34,7 @@ class _Counter:
         self.clock = clock
         self.limit = int(limit)
         self._lock = threading.Lock()
+        self._warned: set[str] = set()
 
     def _period(self) -> tuple[str, str]:   # (file name, period label)
         raise NotImplementedError
@@ -40,14 +43,23 @@ class _Counter:
         raise NotImplementedError
 
     def count(self) -> int:
+        """The period's count; 0 when the period has no file yet. A file that exists but cannot be read (or holds
+        another period or a non-number) counts as the limit -- the guard fails closed instead of silently starting
+        again at 0 -- and is logged once at WARNING."""
         name, label = self._period()
         obj = self.store.budget_read(name)
-        if not obj or obj.get(self._key()) != label:
-            return 0
-        try:
-            return max(0, int(obj.get("count", 0)))
-        except (TypeError, ValueError):
-            return 0
+        if obj is None:
+            return self._corrupt(name) if self.store.budget_exists(name) else 0
+        count = obj.get("count", 0)
+        if obj.get(self._key()) != label or isinstance(count, bool) or not isinstance(count, (int, float)):
+            return self._corrupt(name)
+        return max(0, int(count))
+
+    def _corrupt(self, name: str) -> int:
+        if name not in self._warned:
+            self._warned.add(name)
+            LOG.warning("budget file %s.json is unreadable: counted as exhausted until it is fixed or removed", name)
+        return self.limit
 
     def _write(self, count: int) -> None:
         name, label = self._period()

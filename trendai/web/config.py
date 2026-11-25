@@ -48,7 +48,7 @@ def _int(value: Any, name: str, *, minimum: int = 0, maximum: Optional[int] = No
     return number
 
 
-def _float(value: Any, name: str, *, positive: bool = True) -> float:
+def _float(value: Any, name: str, *, positive: bool = True, maximum: Optional[float] = None) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{name}: expected a number, got {value!r}")
     try:
@@ -61,6 +61,10 @@ def _float(value: Any, name: str, *, positive: bool = True) -> float:
         raise ValueError(f"{name}: must be > 0, got {number}")
     if not positive and number < 0:
         raise ValueError(f"{name}: must be >= 0, got {number}")
+    if maximum is not None and number > maximum:
+        # an upper bound where a huge value would only fail later (a TTL of 1e9 hours overflows the date arithmetic
+        # of every analysis and share): refused at start-up, naming the variable (E.1)
+        raise ValueError(f"{name}: must be <= {maximum:g}, got {number:g}")
     return number
 
 
@@ -119,11 +123,11 @@ _FIELDS: dict[str, tuple[Optional[str], Callable[[Any, str], Any]]] = {
     "log_level": ("TRENDAI_LOG_LEVEL", _log_level),
     "workers": ("TRENDAI_WORKERS", lambda v, n: _int(v, n, minimum=1, maximum=64)),
     "max_queued": ("TRENDAI_MAX_QUEUED", lambda v, n: _int(v, n, minimum=0, maximum=10_000)),
-    "job_timeout_s": ("TRENDAI_JOB_TIMEOUT", _float),
+    "job_timeout_s": ("TRENDAI_JOB_TIMEOUT", lambda v, n: _float(v, n, maximum=86_400)),
     "upload_max_mb": ("TRENDAI_UPLOAD_MAX_MB", lambda v, n: _int(v, n, minimum=1, maximum=1024)),
     "upload_max_series": ("TRENDAI_UPLOAD_MAX_SERIES", lambda v, n: _int(v, n, minimum=1, maximum=99)),
-    "result_ttl_h": ("TRENDAI_RESULT_TTL_H", _float),
-    "share_ttl_d": ("TRENDAI_SHARE_TTL_D", _float),
+    "result_ttl_h": ("TRENDAI_RESULT_TTL_H", lambda v, n: _float(v, n, maximum=8_760)),       # one year
+    "share_ttl_d": ("TRENDAI_SHARE_TTL_D", lambda v, n: _float(v, n, maximum=3_650)),        # ten years
     "naver_monthly_limit": ("TRENDAI_NAVER_MONTHLY_LIMIT", lambda v, n: _int(v, n, minimum=1)),
     "naver_ip_per_hour": ("TRENDAI_NAVER_IP_PER_HOUR", lambda v, n: _int(v, n, minimum=1)),
     "naver_cache_days": ("TRENDAI_NAVER_CACHE_DAYS", _cache_days),
@@ -133,7 +137,7 @@ _FIELDS: dict[str, tuple[Optional[str], Callable[[Any, str], Any]]] = {
     "ai_daily_limit": ("TRENDAI_AI_DAILY_LIMIT", lambda v, n: _int(v, n, minimum=0)),
     "hsts": ("TRENDAI_HSTS", parse_bool),
     "store_max_mb": ("TRENDAI_STORE_MAX_MB", lambda v, n: _int(v, n, minimum=1)),
-    "shutdown_grace_s": ("TRENDAI_SHUTDOWN_GRACE", lambda v, n: _float(v, n, positive=False)),
+    "shutdown_grace_s": ("TRENDAI_SHUTDOWN_GRACE", lambda v, n: _float(v, n, positive=False, maximum=3_600)),
 }
 
 

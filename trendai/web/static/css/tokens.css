@@ -1,14 +1,18 @@
 /* Design tokens (spec F.8, exact values; brief §4.2). Owner: WP3-app.
  * Light values on :root; the dark block applies with the system setting unless the user chose light, and again,
- * verbatim, when the user chose dark. Up/down colours follow data-updown (theme-init.js). */
+ * verbatim, when the user chose dark. Up/down colours follow data-updown (theme-init.js).
+ * Light --accent / --focus are #1f6bc5 (not F.8's #2a78d6): accent carries 13–16 px text (links, link buttons,
+ * white on .btn-primary) and #2a78d6 is only 4.42:1 on --surface (WCAG 1.4.3 needs 4.5:1); #1f6bc5 gives 5.29 on
+ * --surface, 4.89 on --bg, 4.72 on --surface-2. Chart strokes keep #2a78d6 through --c-hist (3:1 is enough). */
 :root {
   --font: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo",
           "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
   --bg: #f6f6f3; --surface: #ffffff; --surface-2: #f2f2ee;
+  --seg-on: #ffffff;   /* the selected option of a segmented control on its --surface-2 track */
   --ink: #141413; --ink-2: #4e4d49; --ink-3: #6b6963;
   --grid: #ebeae5; --axis: #c3c2b7;
   --border: rgba(20, 20, 19, .10); --border-strong: rgba(20, 20, 19, .18);
-  --accent: #2a78d6; --accent-ink: #ffffff; --focus: #2a78d6;
+  --accent: #1f6bc5; --accent-ink: #ffffff; --focus: #1f6bc5;
   --c-hist: #2a78d6; --c-fc: #eb6834; --c-trend: #7a7871; --c-anom: #b4418e;
   --c-cp-bg: var(--ink); --c-cp-fg: #ffffff;
   --fc-region: rgba(235, 104, 52, .045);
@@ -28,6 +32,7 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #0e0e0d; --surface: #1a1a19; --surface-2: #242422;
+    --seg-on: #3a3a36;   /* lighter than the track, not darker (UX-19) */
     --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9c9a92;
     --grid: #2a2a28; --axis: #46463f;
     --border: rgba(240, 239, 236, .12); --border-strong: rgba(240, 239, 236, .22);
@@ -45,6 +50,7 @@
 }
 :root[data-theme="dark"] {
     --bg: #0e0e0d; --surface: #1a1a19; --surface-2: #242422;
+    --seg-on: #3a3a36;
     --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9c9a92;
     --grid: #2a2a28; --axis: #46463f;
     --border: rgba(240, 239, 236, .12); --border-strong: rgba(240, 239, 236, .22);

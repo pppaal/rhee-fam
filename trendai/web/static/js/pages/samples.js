@@ -75,7 +75,7 @@ export function create(ctx) {
               if (e.target.checked) {
                 if (selected.size >= MAX_SERIES) {
                   e.target.checked = false;
-                  toast(t('samples.max'));
+                  toast(t('samples.max'), { kind: 'warning' });
                   return;
                 }
                 selected.add(s.name);

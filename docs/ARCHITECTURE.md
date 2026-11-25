@@ -1652,22 +1652,28 @@ start_background(app, host="127.0.0.1", port=0) -> (server, thread, base_url)
 **Request and job flow.** `POST /api/analyze` validates the query, takes an
 `analyze` token, then answers `200 cached` (fresh result for the same
 result-cache key), `202 joined` (an identical job is queued or running) or
-`202` with a new job (`job_id == result_id`). The job walks the stages `data`
-→ `series` → `finish`; the SPA polls `GET /api/jobs/<id>?since=k` (≈ 500 ms),
+`202` with a new job (`job_id == result_id`; its `status` is `queued`, or
+already `running` when a free worker picked it up first). The job walks the
+stages `data` → `series` → `finish`; the SPA polls `GET /api/jobs/<id>?since=k` (≈ 500 ms),
 receives each finished series' view model as it completes, and fetches
 `GET /api/results/<id>?hl=…` at the end. `DELETE /api/jobs/<id>` drops one
 subscriber; the job is cancelled when none is left. Uploads are parsed
 synchronously by `POST /api/upload` (confirm step), cached in memory, and
 analysed by reference (`upload_id`); raw bytes are never written to disk.
-Shares (`POST /api/share`, uploads only) copy the stored result into
-`shares/<sid>/` without its `result_id`; the delete token is stored hashed.
+Shares (`POST /api/share`, uploads only) snapshot the stored result into
+`shares/<sid>/` without its `result_id` (its files hard-linked where the file
+system allows, so a shared result is stored once); the delete token is stored
+hashed.
 
 **Store** (`TRENDAI_DATA_DIR`): `results/<id>/` (result.json with export
 availability, `vm-ko/en.json`, `export-ko/en.json`, HTML reports, LLM payloads,
 `ai/`), `shares/<sid>/`, `cache/naver` (≤ 21 days), `cache/wiki`,
 `cache/results`, `budget/`. Results and shares carry `schema` =
 `viewmodel.WEB_VM_SCHEMA`; a different value reads as absent. Stored view
-models hold no URLs or ids: export links are added per response.
+models hold no URLs or ids: export links are added per response. A result takes
+about 0.07–1.2 MB per series on disk (both languages, exports, HTML reports);
+the sweeper evicts the oldest results when the store passes
+`TRENDAI_STORE_MAX_MB` (docs/WEB.md, 용량 산정).
 
 **Limits.** Per-IP token buckets (`analyze`, `upload`, `naver`, `ai`, `share`,
 `export`, `poll` per job, `read`), executor caps (`503 server_busy` with

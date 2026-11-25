@@ -2,14 +2,44 @@
 //
 // <div role="dialog" aria-modal="true" aria-labelledby> with a title, focus trap, Esc and backdrop close; focus returns
 // to the opener. Below 640 px it slides up from the bottom (CSS; no animation with reduced motion), otherwise it is
-// a centred dialog. Dialogs stack: Esc closes only the top one.
+// a centred dialog. Dialogs stack: Esc closes only the top one. closeAllOverlays() closes every dialog, sheet,
+// popover, menu and help popover at once (app.js calls it on every route change, so browser Back never leaves a
+// modal over the next page, A11Y-10).
 
 import { clear, focusables, focusFirst, h } from '../dom.js';
 import { t } from '../i18n.js';
 import { icon } from '../ui.js';
 
 const stack = [];
+const transient = new Set();     // non-modal overlays (menus, help popovers): {close(restoreFocus)}
 let counter = 0;
+
+/**
+ * Register a non-modal overlay so closeAllOverlays() can close it.
+ * @param {{close: (restoreFocus?: boolean) => void}} entry
+ * @returns {() => void} unregister
+ */
+export function registerTransient(entry) {
+  transient.add(entry);
+  return () => transient.delete(entry);
+}
+
+/** Close every open overlay (top modal first) without moving focus: the caller decides where focus goes. */
+export function closeAllOverlays() {
+  for (const entry of [...transient]) entry.close(false);
+  transient.clear();
+  let guard = stack.length + 1;
+  while (stack.length && guard > 0) {
+    guard -= 1;
+    stack[stack.length - 1].close(false);
+  }
+}
+
+/** The element an overlay returns focus to: `opener` may be an element or a function resolving it lazily. */
+export function resolveOpener(opener) {
+  const el = typeof opener === 'function' ? opener() : opener;
+  return el && el.isConnected && typeof el.focus === 'function' ? el : null;
+}
 
 /**
  * Keep Tab / Shift+Tab inside `container`.
@@ -55,7 +85,7 @@ export function modalOpen() {
 
 /**
  * Register a modal surface (also used by popover.js) so Esc and focus trapping work for the top one.
- * @param {{dialog: HTMLElement, close: () => void}} entry
+ * @param {{dialog: HTMLElement, close: (restoreFocus?: boolean) => void}} entry
  * @returns {() => void} unregister
  */
 export function registerModal(entry) {
@@ -70,9 +100,13 @@ export function registerModal(entry) {
 
 /**
  * Open a modal sheet.
- * @param {{title: string, content: Node|Node[], footer?: Node|Node[], opener?: HTMLElement|null,
- *          onClose?: () => void, className?: string, initialFocus?: HTMLElement|null}} opts
- * @returns {{el: HTMLElement, dialog: HTMLElement, body: HTMLElement, close: () => void, setContent: (n) => void}}
+ * @param {{title: string, content: Node|Node[], footer?: Node|Node[],
+ *          opener?: HTMLElement|(() => HTMLElement|null)|null, onClose?: () => void, className?: string,
+ *          initialFocus?: HTMLElement|null}} opts
+ *        opener: where focus returns on close; a function is resolved at close time, so a re-rendered opener
+ *        (top bar, query bar) still gets focus back.
+ * @returns {{el: HTMLElement, dialog: HTMLElement, body: HTMLElement, close: (restoreFocus?: boolean) => void,
+ *            setContent: (n) => void}}
  */
 export function openSheet(opts) {
   const id = `sheet-title-${++counter}`;
@@ -96,16 +130,17 @@ export function openSheet(opts) {
   document.documentElement.classList.add('has-modal');
 
   let closed = false;
-  const entry = { dialog, close: () => close() };
+  const entry = { dialog, close: (restoreFocus) => close(restoreFocus) };
   const unregister = registerModal(entry);
-  function close() {
+  function close(restoreFocus = true) {
     if (closed) return;
     closed = true;
     unregister();
     layer.remove();
     if (!modalOpen()) document.documentElement.classList.remove('has-modal');
     if (opts.onClose) opts.onClose();
-    if (opener && opener.isConnected && typeof opener.focus === 'function') opener.focus({ preventScroll: true });
+    const target = restoreFocus ? resolveOpener(opener) : null;
+    if (target) target.focus({ preventScroll: true });
   }
   requestAnimationFrame(() => layer.classList.add('is-open'));
   if (opts.initialFocus) opts.initialFocus.focus();

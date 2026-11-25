@@ -48,6 +48,10 @@ test('slotIconPath: one closed path per icon, centred on the point', () => {
   }
   assert.equal(slotIconPath('square', 10, 10, 4), 'M6.4,6.4L13.6,6.4L13.6,13.6L6.4,13.6Z');
   assert.equal(slotIconPath('diamond', 0, 0, 4), 'M0,-5.2L5.2,0L0,5.2L-5.2,0Z');
+  // UX-29: the hexagon is a quarter taller than the circle, so it does not read as a dot at 1×
+  const ys = (d) => [...d.matchAll(/-?[\d.]+,(-?[\d.]+)/g)].map((m) => Number(m[1]));
+  assert.equal(Math.max(...ys(slotIconPath('hexagon', 0, 0, 4))) - Math.min(...ys(slotIconPath('hexagon', 0, 0, 4))), 10);
+  assert.ok(slotIconPath('hexagon', 0, 0, 4).startsWith('M0,-5L'));
 });
 
 test('estimateTextWidth: Hangul wider than digits, scales with font size', () => {

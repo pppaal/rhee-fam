@@ -8,6 +8,8 @@ with ``502 ai_failed``; a job still running after :data:`AI_JOB_TIMEOUT_S` fails
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
 from typing import Any, Mapping, Optional
 
@@ -15,15 +17,32 @@ from . import viewmodel
 from .errors import WebError
 from .http import valid_id
 from .jobs import Job, JobContext
-from .log import log_exception
+from .log import log_exception, short_id
 from .store import utc_iso
 
-__all__ = ["start_narrative", "AI_JOB_TIMEOUT_S"]
+__all__ = ["start_narrative", "AI_JOB_TIMEOUT_S", "MAX_NAME_CHARS", "MAX_PAYLOAD_CHARS", "payload_for"]
 
 LOG = logging.getLogger("trendai.web.jobs")
 
 #: a narrative job still running after this many seconds fails with ``ai_failed`` at its next check (C.11)
 AI_JOB_TIMEOUT_S = 120.0
+#: the series name sent to the model (uploads: a column header of any length -- each call's cost and the room for
+#: instructions hidden in a header must not grow with it)
+MAX_NAME_CHARS = 80
+#: payloads above this size (canonical JSON characters; a normal one is ~10 k) are refused before calling the model:
+#: the operator's per-day call limit must also bound each call's cost
+MAX_PAYLOAD_CHARS = 40_000
+
+
+def payload_for(payload: Mapping[str, Any], vm: Mapping[str, Any]) -> dict:
+    """The stored LLM payload as sent for one language: ``series.name`` is the VM's display name in that language
+    (sample titles, E.6.1), cut to :data:`MAX_NAME_CHARS`."""
+    out = copy.deepcopy(dict(payload))
+    series = out.get("series")
+    if isinstance(series, dict):
+        name = " ".join(str(vm.get("name") or series.get("name") or "").split())
+        series["name"] = name if len(name) <= MAX_NAME_CHARS else name[:MAX_NAME_CHARS - 1] + "…"
+    return out
 
 
 def _series_index(value: Any) -> Optional[int]:
@@ -65,7 +84,7 @@ def start_narrative(app: Any, body: Mapping[str, Any], *, client_key: str,
     app.ai_budget.reserve()
     try:
         job = app.jobs.submit("narrative", _job_fn(app, rid, k, lang), timeout_s=AI_JOB_TIMEOUT_S,
-                              timeout_code="ai_failed", request_id=request_id,
+                              timeout_code="ai_failed", request_id=request_id, client_key=client_key,
                               log_info={"source": result.get("source_kind", "-"), "series": 1})
     except WebError:
         app.ai_budget.release()
@@ -84,11 +103,18 @@ def _job_fn(app: Any, rid: str, k: int, lang: str):
         llm = app.fetchers.llm
         if vm is None or llm is None:
             raise WebError("ai_failed")
+        payload = payload_for(payload, vm)
+        size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        if size > MAX_PAYLOAD_CHARS:
+            LOG.warning("job=%s AI payload of %d characters refused (limit %d)", short_id(ctx.job.id), size,
+                        MAX_PAYLOAD_CHARS)
+            raise WebError("ai_failed")
         try:
             markdown = llm(payload, lang)
         except Exception as exc:  # noqa: BLE001 - NarrativeUnavailable and anything else -> ai_failed (C.11)
             if type(exc).__name__ != "NarrativeUnavailable":
-                log_exception(LOG, "AI narrative failed", exc, code="ai_failed")
+                log_exception(LOG, f"job={short_id(ctx.job.id)} AI narrative failed", exc, rid=ctx.job.request_id,
+                              code="ai_failed")
             raise WebError("ai_failed") from None
         ctx.check()
         if not isinstance(markdown, str) or not markdown.strip():

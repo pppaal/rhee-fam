@@ -51,11 +51,28 @@ def test_cross_origin_post_403(make):
 
 
 def test_same_origin_post_ok(make):
-    c = TestClient(make())
-    assert c.post("/api/analyze", json=SAMPLE, headers={"Origin": "http://testserver"}).status == 202
-    assert c.post("/api/analyze", json=SAMPLE, headers={"Origin": "http://testserver:80"}).status in (200, 202)
+    app = make()
+    c = TestClient(app, host="127.0.0.1:8000")
+    assert c.post("/api/analyze", json=SAMPLE, headers={"Origin": "http://127.0.0.1:8000"}).status == 202
+    local = TestClient(app, host="localhost")
+    assert local.post("/api/analyze", json=SAMPLE, headers={"Origin": "http://localhost:80"}).status in (200, 202)
     assert c.post("/api/analyze", json=SAMPLE).status in (200, 202)          # no Origin header at all
     assert c.get("/api/config", headers={"Origin": "https://evil.example"}).status == 200   # GET is not checked
+    public = TestClient(make(host="0.0.0.0", allow_no_contact=True))        # a public bind: any matching host
+    assert public.post("/api/analyze", json=SAMPLE, headers={"Origin": "http://testserver"}).status == 202
+
+
+def test_dns_rebinding_refused_on_loopback(make):
+    """SEC-10: a page whose host name was rebound to 127.0.0.1 sends matching Host and Origin headers; a server bound
+    to loopback (no TRENDAI_PUBLIC_URL, no proxy) accepts only loopback origins for POST/DELETE."""
+    c = TestClient(make(), host="rebind.attacker.example:8000")
+    hdrs = {"Origin": "http://rebind.attacker.example:8000"}
+    for method, path in (("POST", "/api/analyze"), ("POST", "/api/narrative"), ("POST", "/api/upload"),
+                         ("DELETE", f"/api/jobs/{'A' * 22}")):
+        resp = c.request(method, path, json=SAMPLE, headers=hdrs)
+        assert resp.status == 403 and resp.json()["error"]["code"] == "cross_origin", path
+    assert TestClient(make(), host="[::1]:8000").post("/api/analyze", json=SAMPLE,
+                                                       headers={"Origin": "http://[::1]:8000"}).status == 202
 
 
 def test_origin_behind_proxy(make):
@@ -146,9 +163,10 @@ def _client_key(environ_extra: dict, trust: bool) -> str:
 def test_x_forwarded_for_ignored_by_default(make):
     assert _client_key({"HTTP_X_FORWARDED_FOR": "1.2.3.4"}, False) == "10.0.0.1"
     c = TestClient(make())
+    missing = f"/api/results/{'N' * 22}"
     for i in range(60):
-        assert c.get("/api/config", headers={"X-Forwarded-For": f"9.9.9.{i}"}).status == 200
-    assert c.get("/api/config", headers={"X-Forwarded-For": "9.9.8.1"}).status == 429
+        assert c.get(missing, headers={"X-Forwarded-For": f"9.9.9.{i}"}).status == 404
+    assert c.get(missing, headers={"X-Forwarded-For": "9.9.8.1"}).status == 429
 
 
 def test_trust_proxy_uses_last_hop(make):

@@ -81,6 +81,7 @@ _LABEL_EN: tuple[tuple[str, str], ...] = (
     ("YYYY + 월", "YYYY + month"),
     ("YYYY + 분기", "YYYY + quarter"),
     ("(열 머리글)", "(column headers)"),
+    ("날짜", "date"),             # native date cells (Excel); last: the labels above contain the word
 )
 _HANGUL = re.compile(r"[가-힣]")
 
@@ -189,6 +190,16 @@ MESSAGES: dict[str, tuple[str, str]] = {
     "table_empty_values": ("표가 비어 있습니다 (값이 있는 행이 없습니다).", "The table is empty (no row has a value)."),
     "table_too_many_columns": ("표의 열이 너무 많습니다({n}개, 최대 {max}개).",
                                "The table has too many columns ({n}, at most {max})."),
+    "table_too_large": ("표가 너무 큽니다(칸 {n:,}개 이상, 최대 {max:,}개). 기간이나 열을 줄여 주세요.",
+                        "The table is too large (at least {n:,} cells, at most {max:,}). Use a shorter period or "
+                        "fewer columns."),
+    "table_out_of_memory": ("{what}: 표가 너무 커서 읽을 수 없습니다. 기간이나 열을 줄여 주세요.",
+                            "{what}: the table is too large to read. Use a shorter period or fewer columns."),
+    "title_rows_skipped": ("{what}: 맨 위 {n}개 행(표 제목 등)을 건너뛰고 {row}행을 열 이름으로 읽었습니다.",
+                           "{what}: skipped {n} row(s) at the top (a title) and read row {row} as the column "
+                           "names."),
+    "header_row_invalid": ("{row}행은 열 이름으로 쓸 수 없습니다(비어 있거나 표 밖입니다).",
+                           "Row {row} cannot be used for the column names (it is empty or outside the table)."),
     "date_col_missing": ("날짜 열 {col!r}을(를) 찾지 못했습니다. 열 목록: {columns}",
                          "Date column {col!r} not found. Columns: {columns}"),
     "date_col_unreadable": ("{col!r} 열을 날짜로 읽을 수 없습니다 (예: {examples}). 지원 형식: 2024-01-05, "
@@ -340,6 +351,8 @@ MESSAGES: dict[str, tuple[str, str]] = {
                          "For public data the page address is the share link. Copy the address."),
     "upload_expired": ("올린 파일의 보관 시간(30분)이 지났어요. 다시 올려 주세요.",
                        "The uploaded file is no longer available (kept for 30 minutes). Please upload it again."),
+    "upload_evicted": ("서버 메모리가 부족해 올린 파일을 보관하지 못했어요. 다시 올려 주세요.",
+                       "The server ran short of memory and could not keep the uploaded file. Please upload it again."),
     "upload_unreadable": ("파일을 읽지 못했어요. CSV·TSV·엑셀(.xlsx)·JSON 파일을 올려 주세요.",
                           "The file could not be read. Upload a CSV, TSV, Excel (.xlsx) or JSON file."),
     "upload_too_many_columns": ("열이 너무 많아요({n}개). {max}개 이하의 열만 읽을 수 있어요.",
@@ -366,6 +379,8 @@ MESSAGES: dict[str, tuple[str, str]] = {
     "server_busy": ("지금 분석 요청이 몰려 있어요. 잠시 뒤 다시 시도해 주세요.",
                     "The server is busy with other analyses. Please try again shortly."),
     "internal_error": ("예기치 못한 오류가 났어요. 잠시 뒤 다시 시도해 주세요.", "Something went wrong. Please try again shortly."),
+    "store_full": ("저장 공간이 부족해 지금은 저장할 수 없어요. 잠시 뒤 다시 시도해 주세요.",
+                   "The server is out of storage space right now. Please try again later."),
     "job_timeout": ("분석이 너무 오래 걸려 멈췄어요. 기간이나 비교 개수를 줄여 보세요.",
                     "The analysis took too long and was stopped. Try a shorter period or fewer series."),
     "naver_unconfigured": ("네이버 검색어 트렌드는 아직 연결되지 않았어요.", "Naver search trends are not connected yet."),
@@ -387,6 +402,9 @@ MESSAGES: dict[str, tuple[str, str]] = {
     "wiki_not_found": ("위키백과에 ‘{title}’ 문서가 없어요. 정식 문서 제목인지 확인하거나 네이버로 바꿔 보세요.",
                        "Wikipedia has no article titled ‘{title}’. Check that it is the article's exact title, or "
                        "switch to Naver."),
+    "wiki_not_found_no_naver": ("위키백과에 ‘{title}’ 문서가 없어요. 정식 문서 제목인지 확인해 주세요.",
+                                "Wikipedia has no article titled ‘{title}’. Check that it is the article's exact "
+                                "title."),
     "wiki_rate": ("위키백과 조회가 잠시 막혔어요. 잠시 뒤 다시 시도해 주세요.",
                   "Wikipedia lookups are blocked for a moment. Please try again shortly."),
     "wiki_empty": ("이 기간에는 ‘{title}’ 조회수 데이터가 없어요.", "There are no page views of ‘{title}’ in this period."),
@@ -447,6 +465,9 @@ MESSAGES: dict[str, tuple[str, str]] = {
     "log_hint": ("최댓값 차이가 {ratio}배를 넘어요. 로그 축으로 보면 작은 시계열도 잘 보여요.",
                  "The largest series is more than {ratio}× the smallest. A log axis shows the small ones better."),
     "naver_cached": ("저장된 네이버 조회 결과({fetched} 기준)를 보여 드려요.", "Showing stored Naver data (as of {fetched})."),
+    "gaps_filled": ("빈 기간 {n}개({dates})는 앞뒤 값으로 채운 추정값이에요. 실제 관측값이 아니에요.",
+                    "{n} empty period(s) ({dates}) were filled in from the values on either side: estimates, not "
+                    "observations."),
     # ---- fix actions: button labels of an error's fixes (C.12.6; messages.fix_label)
     "fix_reload": ("새로고침", "Reload"),
     "fix_retry": ("다시 시도", "Try again"),
@@ -665,6 +686,14 @@ WEB_OVERRIDES: dict[str, tuple[str, str]] = {
     "table_empty_rows": _library_en("table_empty_rows", "표가 비어 있어요(읽을 행이 없어요)."),
     "table_empty_values": _library_en("table_empty_values", "표가 비어 있어요(값이 있는 행이 없어요)."),
     "table_too_many_columns": _library_en("table_too_many_columns", "표의 열이 너무 많아요({n}개, 최대 {max}개)."),
+    "table_too_large": _library_en("table_too_large", "표가 너무 커요(칸 {n:,}개 이상, 최대 {max:,}개). 기간이나 열을 "
+                                   "줄여 주세요."),
+    "table_out_of_memory": _library_en("table_out_of_memory", "{what}: 표가 너무 커서 읽을 수 없어요. 기간이나 열을 "
+                                       "줄여 주세요."),
+    "title_rows_skipped": _library_en("title_rows_skipped", "{what}: 맨 위 {n}개 행(표 제목 등)을 건너뛰고 {row}행을 "
+                                      "열 이름으로 읽었어요."),
+    "header_row_invalid": _library_en("header_row_invalid", "{row}행은 열 이름으로 쓸 수 없어요(비어 있거나 표 "
+                                      "밖이에요)."),
     "date_col_missing": ("날짜 열 ‘{col}’을(를) 찾지 못했어요. 열 목록: {columns}",
                          "Date column ‘{col}’ not found. Columns: {columns}"),
     "date_col_unreadable": ("‘{col}’ 열을 날짜로 읽을 수 없어요(예: {examples}). 지원 형식: 2024-01-05, 2024-01, "

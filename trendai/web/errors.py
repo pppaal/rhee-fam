@@ -8,6 +8,7 @@ cases). Fix objects use ``viewmodel.fix_object`` so notices and errors share one
 
 from __future__ import annotations
 
+import errno as _errno
 import logging
 from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import quote
@@ -15,7 +16,7 @@ from urllib.parse import quote
 from .. import messages
 
 __all__ = ["WebError", "STATUS", "DEFAULT_FIXES", "error_object", "error_envelope", "from_connector_error",
-           "from_data_error", "series_error", "wiki_search_url", "encode_series"]
+           "from_data_error", "series_error", "wiki_search_url", "encode_series", "catalog_code", "store_error"]
 
 LOG = logging.getLogger("trendai.web")
 
@@ -34,7 +35,7 @@ STATUS: dict[str, int] = {
     "naver_server": 502, "source_timeout": 504, "source_unreachable": 502, "source_bad_response": 502,
     "wiki_not_found": 404, "wiki_rate": 429, "wiki_empty": 404, "export_xlsx_unavailable": 501,
     "export_naver_raw": 403, "ai_unavailable": 503, "ai_naver_blocked": 403, "ai_readonly": 403, "ai_failed": 502,
-    "ai_rate_limited": 429,
+    "ai_rate_limited": 429, "store_full": 503, "upload_evicted": 410,
 }
 
 #: Default fix actions per code (C.12.2), before the context rules of C.12.1.
@@ -59,13 +60,34 @@ DEFAULT_FIXES: dict[str, tuple[str, ...]] = {
     "wiki_not_found": ("wiki_title_help", "use_naver"), "wiki_rate": ("retry_in",), "wiki_empty": ("extend_range",),
     "export_xlsx_unavailable": ("export_csv",), "export_naver_raw": ("export_csv",), "ai_failed": ("retry",),
     "ai_rate_limited": ("retry_in",),
+    "store_full": ("retry_in",), "upload_evicted": ("reupload",),
 }
 
 #: Codes whose envelope carries a ``Retry-After`` / ``retry_after`` default (seconds).
-_RETRY_DEFAULTS: dict[str, int] = {"server_busy": 10, "naver_rate": 30, "wiki_rate": 60}
+_RETRY_DEFAULTS: dict[str, int] = {"server_busy": 10, "naver_rate": 30, "wiki_rate": 60, "store_full": 300}
 
 _UPLOAD_KINDS = ("upload", "google_trends_upload")
 _MAX_FIXES = 3
+_RETRY_AFTER_MAX = 300
+#: a text variant for a context, used when the catalog has it (``messages.MESSAGES``); else the base text is used
+#: with the clause cut below. ``wiki_not_found`` ends "…or switch to Naver", which is wrong when Naver is unavailable.
+_NO_NAVER_VARIANT = {"wiki_not_found": "wiki_not_found_no_naver"}
+_NO_NAVER_CUT = {"wiki_not_found": {"ko": ("인지 확인하거나 네이버로 바꿔 보세요.", "인지 확인해 주세요."),
+                                    "en": (" or switch to Naver.", ".")}}
+
+
+def catalog_code(code: str, fallback: str) -> str:
+    """``code`` when the message catalog has a text for it, else ``fallback`` (a code a later catalog adds can be
+    raised now without breaking the C.12 rule that every emitted code has a text)."""
+    return code if code in messages.MESSAGES or code in getattr(messages, "WEB_OVERRIDES", {}) else fallback
+
+
+def store_error(exc: BaseException) -> Optional["WebError"]:
+    """A full disk or quota while writing the store is not an internal error: ``store_full`` (or ``server_busy``
+    until the catalog has it), ``503`` with ``Retry-After: 300``. ``None`` for anything else."""
+    if isinstance(exc, OSError) and exc.errno in (_errno.ENOSPC, getattr(_errno, "EDQUOT", _errno.ENOSPC)):
+        return WebError(catalog_code("store_full", "server_busy"), 503, retry_after=300)
+    return None
 
 
 class WebError(Exception):
@@ -118,9 +140,16 @@ def _fix_object(action: str, params: Mapping[str, Any]) -> dict:
     return fix_object(action, params)
 
 
-def _text(err: WebError, lang: str) -> str:
+def _text(err: WebError, lang: str, *, naver_available: bool = True) -> str:
     if err.detail is not None:
         return messages.render_web_msg(err.detail, lang)
+    if not naver_available and err.code in _NO_NAVER_VARIANT:
+        variant = _NO_NAVER_VARIANT[err.code]
+        if catalog_code(variant, "") == variant:
+            return messages.render_web(variant, err.params, lang)
+        text = messages.render_web(err.code, err.params, lang)
+        old, new = _NO_NAVER_CUT[err.code]["en" if lang == "en" else "ko"]
+        return text.replace(old, new) if text.endswith(old) else text
     return messages.render_web(err.code, err.params, lang)
 
 
@@ -136,8 +165,8 @@ def error_object(err: WebError, request_id: Optional[str] = None, *, naver_avail
     return {
         "code": err.code,
         "status": err.status,
-        "message_ko": _text(err, "ko"),
-        "message_en": _text(err, "en"),
+        "message_ko": _text(err, "ko", naver_available=naver_available),
+        "message_en": _text(err, "en", naver_available=naver_available),
         "params": dict(err.params),
         "fixes": fixes,
         "retry_after": err.retry_after,
@@ -163,6 +192,19 @@ def encode_series(terms: Sequence[str]) -> str:
 
 
 # --------------------------------------------------------------------------- connector errors (C.12.3)
+
+def _upstream_retry_after(exc: BaseException, default: int) -> int:
+    """The upstream ``Retry-After`` a connector attached to its error (``exc.retry_after`` or ``params.retry_after``,
+    seconds), clamped to 1-300; ``default`` when there is none."""
+    raw = getattr(exc, "retry_after", None)
+    if raw is None:
+        raw = (getattr(exc, "params", None) or {}).get("retry_after")
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(1, min(_RETRY_AFTER_MAX, value))
+
 
 _CONN_SIMPLE: dict[str, str] = {
     "conn_naver_unconfigured": "naver_unconfigured",
@@ -199,9 +241,10 @@ def from_connector_error(exc: BaseException, *, title: Optional[str] = None, wik
     simple = _CONN_SIMPLE.get(str(code))
     if simple is not None:
         if simple == "naver_rate":
-            return WebError(simple, params={"retry_after": 30}, retry_after=30, source_kind=source_kind)
+            wait = _upstream_retry_after(exc, 30)
+            return WebError(simple, params={"retry_after": wait}, retry_after=wait, source_kind=source_kind)
         if simple == "wiki_rate":
-            return WebError(simple, retry_after=60, source_kind=source_kind)
+            return WebError(simple, retry_after=_upstream_retry_after(exc, 60), source_kind=source_kind)
         return WebError(simple, source_kind=source_kind)
     if code == "conn_naver_too_many_groups":
         return WebError("too_many_series", params={"max": params.get("max", 5)})
@@ -230,9 +273,14 @@ def from_connector_error(exc: BaseException, *, title: Optional[str] = None, wik
 _SHORT_CODES = frozenset({"too_few_obs", "too_few_after_regularise", "series_empty", "no_valid_values"})
 
 
-def _unreadable(code: str) -> bool:
-    return (code in ("file_empty", "csv_ragged", "excel_is_html", "excel_wrong_ext", "file_unreadable")
-            or code.startswith(("json_", "excel_unreadable", "table_empty_")))
+def _quotes_library_text(exc: BaseException) -> bool:
+    """Whether a ``DataError`` text interpolates a library exception (``{error}``: pandas' "Error tokenizing data. C
+    error: …", openpyxl's "No such keys(s)…"): such a text is not shown, the catalog ``upload_unreadable`` text is."""
+    m = exc.args[0] if len(getattr(exc, "args", ()) or ()) == 1 else None
+    parts = getattr(m, "parts", None)
+    if parts:
+        return any("error" in (params or {}) for _code, params in parts)
+    return "error" in (getattr(exc, "params", None) or {})
 
 
 def from_data_error(exc: BaseException, context: str, *, source_kind: Optional[str] = None,
@@ -248,7 +296,7 @@ def from_data_error(exc: BaseException, context: str, *, source_kind: Optional[s
         if code == "excel_needs_pkg":
             return WebError("upload_excel_needs_pkg")
         return WebError("upload_unreadable", params={"reason": code or "file_unreadable"},
-                        detail=exc if code else None)
+                        detail=exc if code and not _quotes_library_text(exc) else None)
     if context == "analyze_cols":
         if code in ("date_col_missing", "date_col_unreadable", "no_date_col"):
             return WebError("upload_bad_date_col", params={"col": str(params.get("col", col or ""))},

@@ -85,6 +85,23 @@ test('dynamic key families used by components exist', () => {
   for (const id of ['upload', 'results', 'share', 'logs', 'ai', 'storage', 'contact']) assert.ok(`privacy.${id}.body` in CATALOG.ko, id);
 });
 
+/**
+ * Spec G rows whose catalog text deliberately differs from the spec until docs/WEB_SPEC.md G is updated (the web-app
+ * review fixes, reported as contract changes): the key must still exist, and the expected text is checked here.
+ */
+const PENDING_SPEC_TEXT = {
+  'theme.system': '시스템 테마',                                                         // UX-19
+  'home.samples.title': '샘플로 체험하기',                                                // UX-27
+  'source.naver.unconfigured': '네이버 검색어 트렌드는 아직 연결되지 않았어요. 위키백과나 내 파일로 분석해 보세요.', // UX-26
+  'upload.formats': 'CSV·TSV·TXT·엑셀(.xlsx)·JSON · 최대 {mb}MB · 값 열 최대 {n}개',      // OPS-12
+  'confirm.max_cols': '값 열은 {n}개까지 고를 수 있어요.',                                // OPS-12
+  'err.file_too_large': '파일이 너무 커요. {mb}MB까지 올릴 수 있어요.',                    // OPS-12
+};
+
+test('spec G rows with a pending spec update have the agreed text', () => {
+  for (const [key, text] of Object.entries(PENDING_SPEC_TEXT)) assert.equal(CATALOG.ko[key], text, key);
+});
+
 test('every key of the spec G tables (G.1–G.9) is in the catalog with the spec text', () => {
   const spec = readFileSync(SPEC, 'utf8');
   const start = spec.indexOf('### G.1 Common');
@@ -103,10 +120,14 @@ test('every key of the spec G tables (G.1–G.9) is in the catalog with the spec
       checked += 1;
     }
     const koParts = cells[1].split(' · ');
+    const specText = (k, text) => {
+      if (k in PENDING_SPEC_TEXT) return;
+      assert.equal(CATALOG.ko[k], text, `ko text of ${k}`);
+    };
     if (full.length === 1 && !cells[1].startsWith('(')) {
-      assert.equal(CATALOG.ko[full[0]], cells[1].replace(/\\\|/g, '|'), `ko text of ${full[0]}`);
+      specText(full[0], cells[1].replace(/\\\|/g, '|'));
     } else if (full.length === koParts.length && full.length > 1) {
-      full.forEach((k, i) => assert.equal(CATALOG.ko[k], koParts[i], `ko text of ${k}`));
+      full.forEach((k, i) => specText(k, koParts[i]));
     }
   }
   assert.ok(checked > 200, `checked ${checked}`);

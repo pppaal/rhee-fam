@@ -65,6 +65,7 @@ __all__ = [
     "frame_to_series", "load_table", "from_values",
     # web app (docs/WEB_SPEC.md B.3.1)
     "collect_notices", "emit_notice", "GoogleTrendsInfo", "RawTable", "read_table_bytes", "load_table_bytes",
+    "UNTRUSTED_MAX_CELLS", "INTERPOLATED_ATTR",
 ]
 
 # canonical frequency code -> pandas offset alias used for resampling / future dates
@@ -465,6 +466,13 @@ def _pick_order(options: list[tuple[str, pd.Series]], tie_index: int) -> tuple[s
     return options[i][0], options[i][1], tied
 
 
+def _has_clock_time(hour: pd.Series, minute: pd.Series, second: pd.Series) -> bool:
+    """Whether the extracted time parts hold any time other than midnight: ``2022-01-01 00:00:00`` (an
+    Excel date cell written out as text) is a date, not a date with a time of day (FU-13)."""
+    parts = [pd.to_numeric(x, errors="coerce").fillna(0.0) for x in (hour, minute, second)]
+    return bool(((parts[0] != 0) | (parts[1] != 0) | (parts[2] != 0)).any())
+
+
 def _string_candidates(s: pd.Series) -> Iterator[_Candidate]:
     """Whole-column interpretations of the (normalised, non-missing) strings ``s``, lazily."""
     idx = s.index
@@ -477,7 +485,7 @@ def _string_candidates(s: pd.Series) -> Iterator[_Candidate]:
     if m[0].notna().any():
         sep = m[1].dropna().mode().iloc[0] if m[1].notna().any() else "-"
         label = {"-": "YYYY-MM-DD", "/": "YYYY/MM/DD", ".": "YYYY.MM.DD"}[sep]
-        has_time = m[4].notna().any()
+        has_time = _has_clock_time(m[4], m[5], m[6])
         yield (_Candidate(label + (" hh:mm" if has_time else ""),
                               _from_parts(m[0], m[2], m[3], m[4] if has_time else None, m[5], m[6],
                                           index=idx)))
@@ -557,7 +565,7 @@ def _string_candidates(s: pd.Series) -> Iterator[_Candidate]:
     m = ext(r"^(\d{1,2})\s*([-/.])\s*(\d{1,2})\s*\2\s*(\d{4}|\d{2})\.?" + _TIME + "$")
     if m[0].notna().any():
         sep = m[1].dropna().mode().iloc[0] if m[1].notna().any() else "/"
-        has_time = m[4].notna().any()
+        has_time = _has_clock_time(m[4], m[5], m[6])
         year = _two_digit_year(m[3])
         tm = (m[4], m[5], m[6]) if has_time else (None, None, None)
         dmy = _from_parts(year, m[2], m[0], *tm, index=idx)
@@ -638,6 +646,38 @@ def _numeric_dates_as_strings(col: pd.Series) -> pd.Series:
     return out
 
 
+def _native_date_label(ts: pd.DatetimeIndex) -> str:
+    """``'날짜'`` for date cells (every time is midnight: Excel date cells), ``'날짜/시간'`` otherwise."""
+    t = ts[~ts.isna()]
+    midnight = bool(len(t)) and bool((t == t.normalize()).all())
+    return "날짜" if midnight else "날짜/시간"
+
+
+def _native_dates(col: pd.Series) -> Optional[tuple[pd.Series, str, Optional[Msg]]]:
+    """An object column of date objects (Excel date cells), possibly with a few text cells such as a
+    '합계' row: the dates as they are, the text cells read like any date text (unreadable ones reported
+    as ``dates_unreadable_rows``).  ``None`` when fewer than 80 % of the filled cells are date objects."""
+    present = col.dropna()
+    present = present[~present.map(lambda v: isinstance(v, str) and not v.strip())]
+    is_native = present.map(lambda v: isinstance(v, (pd.Timestamp, date)))
+    if not len(present) or float(is_native.mean()) < 0.8:
+        return None
+    full = pd.Series(pd.NaT, index=col.index, dtype="datetime64[us]")
+    natives = present[is_native]
+    full[natives.index] = pd.DatetimeIndex([_naive(v) for v in natives]).as_unit("us")
+    note: Optional[Msg] = None
+    others = present[~is_native]
+    if len(others):
+        parsed, _, _ = parse_dates(others.astype(str).reset_index(drop=True), name_hint=True, allow_epoch=False)
+        ok = (parsed.notna().to_numpy() if parsed is not None else np.zeros(len(others), dtype=bool))
+        if ok.any():
+            full[others.index[ok]] = pd.DatetimeIndex(parsed[ok].to_numpy()).as_unit("us")
+        if (~ok).any():
+            bad_ex = ", ".join(repr(str(x)) for x in others[~ok].head(3))
+            note = msg("dates_unreadable_rows", n=int((~ok).sum()), examples=bad_ex)
+    return full, _native_date_label(pd.DatetimeIndex(full)), note
+
+
 def parse_dates(col: pd.Series, name_hint: bool = True,
                 allow_epoch: bool = True) -> tuple[Optional[pd.Series], str, Optional[str]]:
     """Interpret ``col`` as dates with one format for the whole column.
@@ -651,14 +691,17 @@ def parse_dates(col: pd.Series, name_hint: bool = True,
     :class:`trendai.messages.Msg`, so it also renders in English (``note.text('en')``).
     """
     if isinstance(col.dtype, pd.DatetimeTZDtype):
-        return pd.Series(col.dt.tz_localize(None), index=col.index), "날짜/시간", None
+        ts = pd.Series(col.dt.tz_localize(None), index=col.index)
+        return ts, _native_date_label(pd.DatetimeIndex(ts)), None
     if pd.api.types.is_datetime64_any_dtype(col):
-        return pd.Series(pd.to_datetime(col), index=col.index), "날짜/시간", None
+        ts = pd.Series(pd.to_datetime(col), index=col.index)
+        return ts, _native_date_label(pd.DatetimeIndex(ts)), None
     if pd.api.types.is_bool_dtype(col):
         return None, "", None
-    if col.dtype == object and len(col.dropna()) and all(
-            isinstance(v, (pd.Timestamp, date)) for v in col.dropna()):
-        return pd.Series(pd.DatetimeIndex([_naive(v) for v in col]), index=col.index), "날짜/시간", None
+    if col.dtype == object and len(col.dropna()):
+        native = _native_dates(col)
+        if native is not None:
+            return native
     from_numbers = pd.api.types.is_numeric_dtype(col)
     s = _numeric_dates_as_strings(col) if from_numbers else _normalise_date_strings(col)
     present = s.notna()
@@ -819,10 +862,34 @@ def _weekday_only(index: pd.DatetimeIndex) -> bool:
     return span >= 14
 
 
+def _observed_mask(raw: pd.Series, out: pd.Series, freq: str) -> np.ndarray:
+    """Per period of the regular grid ``out``: does it hold at least one raw observation?"""
+    counts = raw.resample(_alias_for(freq, raw.index)).count()
+    return (counts.reindex(out.index, fill_value=0) > 0).to_numpy()
+
+
 def _observed_periods(raw: pd.Series, out: pd.Series, freq: str) -> int:
     """How many periods of the regular grid ``out`` hold at least one raw observation."""
-    counts = raw.resample(_alias_for(freq, raw.index)).count()
-    return int((counts.reindex(out.index, fill_value=0) > 0).sum())
+    return int(_observed_mask(raw, out, freq).sum())
+
+
+#: ``Series.attrs`` key that :func:`prepare` sets on its result: the dates (``'YYYY-MM-DD'``, ascending) of the
+#: periods that held no observation and were filled by linear interpolation -- ``[]`` when none was.  Kept
+#: through a second :func:`prepare` of an already prepared series (the web app prepares, then runs the
+#: pipeline) and copied to ``analysis.series`` by :func:`trendai.pipeline.run`, so every surface can tell
+#: an estimate from an observation (a blank month must not be exported as an actual value).
+INTERPOLATED_ATTR = "trendai_interpolated"
+
+
+def _interpolated_dates(raw: pd.Series, out: pd.Series, freq: str, prior: Any = None) -> list[str]:
+    """The :data:`INTERPOLATED_ATTR` list of ``out``: its periods without a raw observation, plus the dates an
+    earlier :func:`prepare` had filled (``prior``) that are still on the grid."""
+    filled = out.index[~_observed_mask(raw, out, freq)]
+    dates = {f"{t:%Y-%m-%d}" for t in filled}
+    if prior:
+        on_grid = {f"{t:%Y-%m-%d}" for t in out.index}
+        dates |= {str(d)[:10] for d in prior if str(d)[:10] in on_grid}
+    return sorted(dates)
 
 
 #: granularity order of the frequency codes (finer first): a --freq finer than the data's own
@@ -862,7 +929,8 @@ def prepare(series: pd.Series, freq: Optional[str] = None, name: Optional[str] =
     frequency; a ``freq`` finer than the data's (monthly data as ``'W'``) is reported
     as interpolation of most of the grid (``upsampled``: accuracy and probabilities
     can look better than the data allow), and a coarser one (an aggregation that was
-    asked for) only for large gaps.
+    asked for) only for large gaps.  Every filled period -- also below those warning
+    thresholds -- is listed in ``out.attrs[INTERPOLATED_ATTR]``.
     """
     s, dates = _clean_with_dates(series)
     if len(s) < 2:
@@ -897,6 +965,8 @@ def prepare(series: pd.Series, freq: Optional[str] = None, name: Optional[str] =
         out.name = "series"
     if len(out) < 2:
         raise DataError(msg("too_few_after_regularise", name=_label(series), unit=unit(freq), n=len(out)))
+    prior = series.attrs.get(INTERPOLATED_ATTR) if isinstance(getattr(series, "attrs", None), dict) else None
+    out.attrs[INTERPOLATED_ATTR] = _interpolated_dates(s, out, freq, prior)
     return out, freq
 
 
@@ -1098,7 +1168,7 @@ def frame_to_series(df: pd.DataFrame, date_col: Optional[str] = None,
             parsed_vals[c] = (vals, n_bad, ex)
     if not explicit:
         def index_like(c: str) -> bool:
-            unnamed = str(c) == "" or str(c).lower().startswith("unnamed")
+            unnamed = str(c) == "" or str(c).lower().startswith("unnamed") or bool(_BLANK_LABEL_RE.match(str(c)))
             if unnamed:  # a blank header over real values is kept; over 0..N-1 it is a row number
                 return _is_step1_sequence(parsed_vals[c][0])
             return bool(_INDEX_NAME_RE.match(str(c)))
@@ -1206,40 +1276,175 @@ def _header_is_data(columns: list[str]) -> bool:
 
 def _count_fields(line: str, sep: str) -> int:
     """Number of fields in one (header) line split with ``sep``."""
+    return len(_split_fields(line, sep))
+
+
+def _split_fields(line: str, sep: str) -> list[str]:
+    """One line split with ``sep`` (quotes honoured; runs of whitespace for the whitespace separator)."""
     if sep == r"\s+":
-        return len(line.split())
+        return line.split()
     try:
-        return len(next(csv.reader([line], delimiter=sep), []))
+        return next(csv.reader([line], delimiter=sep), [])
     except csv.Error:
-        return line.count(sep) + 1
+        return line.split(sep)
 
 
-def _parse_text_table(text: str, what: str,
-                      max_columns: Optional[int] = None) -> tuple[pd.DataFrame, str]:
-    """Parse delimited text into an all-string DataFrame. Returns ``(df, separator)``.
+# ---- header row (FU-4): a sheet title above the real header
+#
+# Korean spreadsheets often start with a title ("우리가게 월별 매출 현황 (단위: 원)") and a blank row above the
+# header.  Reading row 1 as the header made the title the "date column" and the real columns "Unnamed: 1".
+# Leading rows with a single filled cell are skipped when a row with at least two filled cells follows whose
+# first filled cell is a label (text that is neither a number nor a date) -- a header, not a data row.
 
-    ``max_columns``: a header row with more fields raises ``table_too_many_columns`` before the
-    full parse."""
+#: rows looked at for a title above the header row
+_HEADER_SCAN_ROWS = 12
+_LETTER_RE = re.compile(r"[^\W\d_]")
+#: label of a column whose header cell is blank (Excel column letter), instead of pandas' "Unnamed: 3"
+_BLANK_LABEL = "열 {}"
+_BLANK_LABEL_RE = re.compile(r"^열 [A-Z]{1,3}$")
+
+
+def _col_letter(j: int) -> str:
+    """Excel column letter of the 0-based column ``j``: 0 -> ``A``, 26 -> ``AA``."""
+    out = ""
+    j += 1
+    while j > 0:
+        j, r = divmod(j - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def _blank_cell(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return not v.strip()
+    if isinstance(v, float):
+        return v != v
+    try:
+        return bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_label(v: Any) -> bool:
+    """A header-like cell: text with letters that reads neither as a number nor as a date."""
+    if not isinstance(v, str):
+        return False
+    text = v.strip()
+    if not text or not _LETTER_RE.search(text) or len(text) > 200:
+        return False
+    one = pd.Series([text], dtype=object)
+    nums, _, _ = parse_numbers(one)
+    if bool(nums.notna().all()):
+        return False
+    dates, _, _ = parse_dates(one, name_hint=True, allow_epoch=False)
+    return not (dates is not None and bool(dates.notna().all()))
+
+
+def _header_index(rows: list[list[Any]]) -> int:
+    """Index into ``rows`` (the first rows of a table, cells as read) of the header row: the first row with a
+    filled cell, unless that row and the ones after it hold a single filled cell each (a title, a unit line,
+    blank rows between) above a row with at least two filled cells that starts with a label."""
+    filled = [[v for v in r if not _blank_cell(v)] for r in rows[:_HEADER_SCAN_ROWS]]
+    first = next((i for i, f in enumerate(filled) if f), None)
+    if first is None:
+        return 0
+    if len(filled[first]) >= 2:
+        return first
+    for i in range(first + 1, len(filled)):
+        if len(filled[i]) >= 2:
+            return i if _is_label(filled[i][0]) else first
+    return first
+
+
+def _skipped_rows(rows: list[list[Any]], header: int) -> int:
+    """How many rows above ``header`` hold anything (blank rows do not count)."""
+    return sum(1 for r in rows[:header] if any(not _blank_cell(v) for v in r))
+
+
+def _check_header_row(header_row: int, rows: list[list[Any]]) -> None:
+    if not 0 <= header_row < len(rows) or all(_blank_cell(v) for v in rows[header_row]):
+        raise DataError(msg("header_row_invalid", row=int(header_row) + 1))
+
+
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+def _head_lines(text: str, limit: int) -> list[tuple[int, str]]:
+    """``(start offset, line)`` of the first ``limit`` physical lines of ``text`` (blank lines included)."""
+    out: list[tuple[int, str]] = []
+    pos = 0
+    while pos < len(text) and len(out) < limit:
+        m = _LINE_BREAK.search(text, pos)
+        end = m.start() if m else len(text)
+        out.append((pos, text[pos:end]))
+        pos = m.end() if m else len(text)
+    return out
+
+
+def _check_cells(n_rows: int, n_cols: int, max_cells: Optional[int]) -> None:
+    if max_cells is not None and n_rows * n_cols > max_cells:
+        raise DataError(msg("table_too_large", n=int(n_rows * n_cols), max=int(max_cells)))
+
+
+@dataclass
+class _Parsed:
+    """A table read from text or Excel before the column labels are cleaned."""
+
+    frame: pd.DataFrame
+    sep: str                       # the sniffed separator ('' for Excel)
+    header_row: Optional[int]      # 0-based line / sheet row of the header (None: headerless)
+    skipped: int                   # non-blank rows skipped above the header (a title)
+
+
+def _parse_text_table(text: str, what: str, max_columns: Optional[int] = None, *,
+                      max_cells: Optional[int] = None, header_row: Optional[int] = None,
+                      letters: bool = False) -> _Parsed:
+    """Parse delimited text into an all-string DataFrame.
+
+    The header is the first non-blank line unless title lines sit above it (:func:`_header_index`) or
+    ``header_row`` (0-based physical line) names it.  ``max_columns``: a header row with more fields raises
+    ``table_too_many_columns`` before the full parse; ``max_cells``: (non-blank lines below the header) x
+    (header fields) above it raises ``table_too_large`` before the full parse.  ``letters``: blank header
+    fields are named ``열 B`` (their Excel column letter) instead of pandas' ``Unnamed: 1``."""
     text = text.lstrip("\ufeff")
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if not lines:
         raise DataError(msg("file_empty", what=what))
     sep = _sniff_sep(lines[:50]) or ","
-    if max_columns is not None:
-        n_fields = _count_fields(lines[0], sep)
-        if n_fields > max_columns:
-            raise DataError(msg("table_too_many_columns", n=n_fields, max=int(max_columns)))
+    head = _head_lines(text, max(_HEADER_SCAN_ROWS, (header_row or 0) + 1))
+    rows: list[list[Any]] = [_split_fields(ln, sep) for _, ln in head]
+    if header_row is None:
+        h = _header_index(rows)
+    else:
+        _check_header_row(header_row, rows)
+        h = int(header_row)
+    skipped = _skipped_rows(rows, h)
+    body = text[head[h][0]:] if h < len(head) else text
+    fields = rows[h] if h < len(rows) else _split_fields(lines[0], sep)
+    n_fields = len(fields)
+    if max_columns is not None and n_fields > max_columns:
+        raise DataError(msg("table_too_many_columns", n=n_fields, max=int(max_columns)))
+    if max_cells is not None:
+        above = sum(1 for _, ln in head[:h] if ln.strip())
+        _check_cells(max(len(lines) - above - 1, 0), n_fields, max_cells)
     kw: dict[str, Any] = dict(sep=sep, dtype=str, keep_default_na=False, na_filter=False,
                               skipinitialspace=True, skip_blank_lines=True)
     if sep == r"\s+":
         kw["engine"] = "python"
+    used: Optional[int] = h
     try:
-        df = pd.read_csv(io.StringIO(text), **kw)
+        df = pd.read_csv(io.StringIO(body), **kw)
         if _header_is_data([str(c) for c in df.columns]):
             ncol = df.shape[1]
             names = ["date"] + (["value"] if ncol == 2 else [f"value{i}" for i in range(1, ncol)])
-            df = pd.read_csv(io.StringIO(text), header=None, names=names, **kw)
+            df = pd.read_csv(io.StringIO(body), header=None, names=names, **kw)
             _warn(msg("headerless", what=what), DataNotice)
+            used = None
+        elif letters and len(df.columns) == n_fields and any(_blank_cell(f) for f in fields):
+            df.columns = [_BLANK_LABEL.format(_col_letter(j)) if _blank_cell(f) else c
+                          for j, (f, c) in enumerate(zip(fields, df.columns))]
     except pd.errors.EmptyDataError:
         raise DataError(msg("file_empty", what=what)) from None
     except (pd.errors.ParserError, csv.Error) as exc:
@@ -1250,34 +1455,72 @@ def _parse_text_table(text: str, what: str,
                      " Thousands separators (1,234) without quotes change the number of columns: quote the "
                      "values or save the file with tabs or semicolons as separators.")
         raise DataError(msg("csv_ragged", what=what, error=str(exc), hint=hint)) from None
-    return df, sep
+    if skipped and header_row is None and used is not None:
+        _warn(msg("title_rows_skipped", what=what, n=skipped, row=h + 1), DataNotice)
+    return _Parsed(df, sep, used, skipped if used is not None else 0)
 
 
 def _read_text_table(text: str, what: str) -> tuple[pd.DataFrame, bool]:
     """Parse delimited text into an all-string DataFrame. Returns (df, decimal_comma_hint)."""
-    df, sep = _parse_text_table(text, what)
-    return df, sep == ";"
+    t = _parse_text_table(text, what)
+    return t.frame, t.sep == ";"
 
 
-def _json_to_frame(obj: Any, what: str) -> pd.DataFrame:
-    """Accept the common JSON shapes: records, columns/index/split/table orients, {date: value}."""
+def _key_union(dicts: list, n_rows: int, max_columns: Optional[int], max_cells: Optional[int]) -> None:
+    """Raise before a frame is built when the union of the keys of ``dicts`` (the columns of the frame
+    pandas would build) passes ``max_columns`` or ``n_rows`` x keys passes ``max_cells``: records with
+    distinct keys (``[{"k0": 0}, {"k1": 1}, ...]``) make an N x N frame from an O(N) file."""
+    if max_columns is None and max_cells is None:
+        return
+    keys: set = set()
+    for d in dicts:
+        keys.update(d.keys())
+        if max_columns is not None and len(keys) > max_columns:
+            raise DataError(msg("table_too_many_columns", n=len(keys), max=int(max_columns)))
+        _check_cells(n_rows, len(keys), max_cells)
+
+
+def _json_to_frame(obj: Any, what: str, max_columns: Optional[int] = None,
+                   max_cells: Optional[int] = None) -> pd.DataFrame:
+    """Accept the common JSON shapes: records, columns/index/split/table orients, {date: value}.
+
+    ``max_columns`` / ``max_cells``: the shape of the frame is checked *before* it is built
+    (``table_too_many_columns`` / ``table_too_large``)."""
+    def bound(n_rows: int, n_cols: int) -> None:
+        if max_columns is not None and n_cols > max_columns:
+            raise DataError(msg("table_too_many_columns", n=int(n_cols), max=int(max_columns)))
+        _check_cells(n_rows, n_cols, max_cells)
+
+    def width(rows: list) -> int:
+        return max((len(r) for r in rows if isinstance(r, (list, tuple, dict))), default=1)
+
     if isinstance(obj, dict) and isinstance(obj.get("data"), list) and ("schema" in obj or "columns" in obj):
+        rows = obj["data"]
         if "columns" in obj:
-            df = pd.DataFrame(obj["data"], columns=obj["columns"])
+            cols = obj["columns"] if isinstance(obj["columns"], list) else []
+            bound(len(rows), max(len(cols), width(rows)) + 1)
+            df = pd.DataFrame(rows, columns=obj["columns"])
             if "index" in obj and len(obj["index"]) == len(df):
                 df.insert(0, "date", obj["index"])
             return df
-        return pd.DataFrame(obj["data"])
+        if all(isinstance(r, dict) for r in rows):
+            _key_union(rows, len(rows), max_columns, max_cells)
+        else:
+            bound(len(rows), width(rows))
+        return pd.DataFrame(rows)
     if isinstance(obj, dict) and len(obj) == 1:
         (only,) = obj.values()
         if isinstance(only, list) and only and all(isinstance(r, dict) for r in only):
+            _key_union(only, len(only), max_columns, max_cells)
             return pd.DataFrame(only)  # e.g. {"items": [...]} (Wikimedia API)
     if isinstance(obj, list):
         if not obj:
             raise DataError(msg("json_empty_array", what=what))
         if all(isinstance(r, dict) for r in obj):
+            _key_union(obj, len(obj), max_columns, max_cells)
             return pd.DataFrame(obj)
         if all(isinstance(r, (list, tuple)) for r in obj):
+            bound(len(obj), width(obj))
             head = obj[0]
             if all(isinstance(h, str) for h in head) and len(obj) > 1:
                 return pd.DataFrame(obj[1:], columns=head)
@@ -1289,15 +1532,21 @@ def _json_to_frame(obj: Any, what: str) -> pd.DataFrame:
             raise DataError(msg("json_empty_object", what=what))
         vals = list(obj.values())
         if all(not isinstance(v, (dict, list)) for v in vals):  # {date: value} (Series.to_json)
+            bound(len(obj), 2)
             return pd.DataFrame({"date": list(obj.keys()), "value": vals})
         if all(isinstance(v, list) for v in vals):
+            bound(max(len(v) for v in vals), len(vals))
             return pd.DataFrame(obj)
         if all(isinstance(v, dict) for v in vals):
             keys = pd.Series([str(k) for k in obj.keys()], dtype=object)
             outer_dates, _, _ = parse_dates(keys, name_hint=True)
             if outer_dates is not None:  # orient='index': {date: {col: value}}
+                _key_union(vals, len(vals), max_columns, max_cells)
                 df = pd.DataFrame.from_dict(obj, orient="index")
-            else:  # orient='columns': {col: {date: value}}
+            else:  # orient='columns': {col: {date: value}} -- the inner keys are the rows
+                if max_columns is not None and len(vals) > max_columns:
+                    raise DataError(msg("table_too_many_columns", n=len(vals), max=int(max_columns)))
+                _key_union(vals, len(vals), None, max_cells)   # rows x columns, transposed: same product
                 df = pd.DataFrame(obj)
             df.index.name = None
             return df.rename_axis("date").reset_index()
@@ -1310,31 +1559,173 @@ _EXCEL_FORMATS = {".xlsx": "xlsx", ".xlsm": "xlsx", ".xls": "xls", ".ods": "ods"
 _TEXT_FORMATS = {".csv": "csv", ".tsv": "tsv", ".txt": "txt"}
 
 
-def _read_excel(raw: bytes, what: str) -> pd.DataFrame:
-    """The first sheet of an Excel file given as bytes (read in memory), cells with pandas' native types."""
+#: values openpyxl gives for formula errors (pandas reads them as NaN)
+_EXCEL_ERRORS = frozenset({"#NULL!", "#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#NUM!", "#N/A", "#GETTING_DATA",
+                           "#SPILL!", "#CALC!", "#FIELD!", "#BLOCKED!", "#CONNECT!", "#BUSY!", "#UNKNOWN!"})
+_NO_ROW: tuple = ()
+
+
+def _xl_value(v: Any) -> Any:
+    """One openpyxl cell value as pandas' openpyxl reader converts it: empty -> ``""``, error -> NaN, a whole
+    float -> ``int``; text, booleans and dates unchanged."""
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        return int(v) if v.is_integer() else v
+    if isinstance(v, str) and v in _EXCEL_ERRORS:
+        return np.nan
+    return v
+
+
+def _xlsx_rows(raw: bytes, what: str, max_columns: Optional[int],
+               max_cells: Optional[int]) -> list[list[Any]]:
+    """The first sheet of an .xlsx/.xlsm file as rows of cell values, streamed with openpyxl's read-only mode.
+
+    The shape is bounded *while* reading (SEC-1): a cell right of column ``max_columns`` raises
+    ``table_too_many_columns`` at once, and rows x the widest row passing ``max_cells`` raises
+    ``table_too_large`` -- ``pd.read_excel`` pads every row to the widest one first, so one cell in column XFD
+    per row turned a 30 KB file into a 16,384-column frame of 1.2 GB.  Rows are trimmed of trailing empty
+    cells, trailing empty rows are dropped and every row is padded to the same width with ``""``, exactly
+    as pandas' openpyxl reader does, so :func:`_grid_frame` gives what ``pd.read_excel`` gave."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise DataError(msg("excel_needs_pkg", what=what, pkg="openpyxl")) from None
+    try:
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True, keep_links=False)
+    except (ValueError, zipfile.BadZipFile, KeyError, OSError, TypeError) as exc:
+        raise DataError(msg("excel_unreadable", what=what, error=str(exc))) from None
+    except Exception as exc:  # noqa: BLE001 - engine-specific parse errors
+        raise DataError(msg("excel_unreadable_engine", what=what, error=f"{type(exc).__name__}: {exc}")) from None
+    rows: list[list[Any]] = []
+    width = 0
+    last = -1
+    try:
+        if not wb.worksheets:
+            return []
+        ws = wb.worksheets[0]
+        if hasattr(ws, "reset_dimensions"):   # the <dimension> tag may be missing or wrong (pandas does the same)
+            ws.reset_dimensions()
+        for r in ws.iter_rows(values_only=True):
+            n = len(r)
+            if max_columns is not None and n > max_columns:
+                tail = r[max_columns:]
+                if tail.count(None) != len(tail):
+                    far = n - next(i for i, v in enumerate(reversed(r)) if v is not None)
+                    raise DataError(msg("table_too_many_columns", n=int(far), max=int(max_columns)))
+                n = max_columns
+            while n and (r[n - 1] is None or r[n - 1] == ""):
+                n -= 1
+            if n == 0:
+                rows.append(_NO_ROW)       # one shared object: a sheet of 10**6 empty rows costs 8 MB
+                continue
+            width = max(width, n)
+            last = len(rows)
+            _check_cells(last + 1, width, max_cells)
+            rows.append([_xl_value(v) for v in r[:n]])
+    except DataError:
+        raise
+    except (ValueError, KeyError, OSError, TypeError, zipfile.BadZipFile) as exc:
+        raise DataError(msg("excel_unreadable", what=what, error=str(exc))) from None
+    except Exception as exc:  # noqa: BLE001 - engine-specific parse errors (a broken sheet XML, ...)
+        raise DataError(msg("excel_unreadable_engine", what=what, error=f"{type(exc).__name__}: {exc}")) from None
+    finally:
+        wb.close()
+    rows = rows[:last + 1]
+    return [list(r) + [""] * (width - len(r)) for r in rows]
+
+
+def _pandas_excel_rows(raw: bytes, what: str, max_columns: Optional[int],
+                       max_cells: Optional[int]) -> list[list[Any]]:
+    """.xls / .ods (and any other workbook) through ``pd.read_excel(header=None)`` as rows of cell values,
+    then the same shape limits (checked after reading: these engines expose no streaming API)."""
+    engine_pkg = "xlrd" if raw.startswith(_EXCEL_SIGNATURES[1]) else "odfpy" if _is_ods(raw) else "openpyxl"
+    try:
+        df = pd.read_excel(io.BytesIO(raw), sheet_name=0, header=None)
+    except ImportError:
+        raise DataError(msg("excel_needs_pkg", what=what, pkg=engine_pkg)) from None
+    except (ValueError, zipfile.BadZipFile, KeyError, OSError, TypeError) as exc:
+        raise DataError(msg("excel_unreadable", what=what, error=str(exc))) from None
+    except Exception as exc:  # noqa: BLE001 - engine-specific parse errors (xlrd.XLRDError, MemoryError ...)
+        raise DataError(msg("excel_unreadable_engine", what=what, error=f"{type(exc).__name__}: {exc}")) from None
+    if max_columns is not None and df.shape[1] > max_columns:
+        raise DataError(msg("table_too_many_columns", n=int(df.shape[1]), max=int(max_columns)))
+    _check_cells(df.shape[0], df.shape[1], max_cells)
+
+    def cell(v: Any) -> Any:
+        if v is None or (isinstance(v, float) and v != v) or v is pd.NaT:
+            return ""
+        if isinstance(v, (float, np.floating)) and float(v).is_integer():
+            return int(v)
+        if isinstance(v, np.integer):
+            return int(v)
+        return v
+
+    return [[cell(v) for v in row] for row in df.astype(object).itertuples(index=False, name=None)]
+
+
+def _is_ods(raw: bytes) -> bool:
+    """An OpenDocument spreadsheet (a zip with ``content.xml`` and no ``xl/`` part)."""
+    if not raw.startswith(_EXCEL_SIGNATURES[0]):
+        return False
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            names = zf.namelist()
+    except (zipfile.BadZipFile, OSError, ValueError):
+        return False
+    return "content.xml" in names and not any(n.startswith("xl/") for n in names)
+
+
+def _grid_frame(rows: list[list[Any]], header: Optional[int], names: Optional[list[str]] = None) -> pd.DataFrame:
+    """Rows of cell values -> DataFrame with pandas' type inference, as ``pd.read_excel`` builds it (pandas'
+    ``TextParser``: ``header`` row -> labels, repeated labels ``a``, ``a.1``; blank -> NaN; whole numbers
+    with blanks -> floats)."""
+    from pandas.io.parsers import TextParser
+
+    try:
+        return TextParser(rows, header=header, names=names, skip_blank_lines=False).read()
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+def _read_excel(raw: bytes, what: str, *, max_columns: Optional[int] = None, max_cells: Optional[int] = None,
+                header_row: Optional[int] = None, letters: bool = False) -> Optional[_Parsed]:
+    """The first sheet of an Excel file given as bytes (read in memory), cells with pandas' native types.
+
+    ``None`` for text behind an Excel extension (``excel_is_text``; the caller parses it as text).  The header
+    row is found as for text (:func:`_header_index`: a title above it is skipped) unless ``header_row``
+    (0-based sheet row) names it; a header row that reads as data (dates + numbers) makes the sheet
+    headerless (``date``, ``value`` ...).  ``letters``: blank header cells are named ``열 B``."""
     if not raw.startswith(_EXCEL_SIGNATURES):
         head = raw[:2000].lstrip().lower()
         if head.startswith((b"<!doctype html", b"<html", b"<table", b"<?xml")):
             raise DataError(msg("excel_is_html", what=what))
         _warn(msg("excel_is_text", what=what), DataNotice)
-        return pd.DataFrame()  # caller falls back to text parsing
-    engine_pkg = "xlrd" if raw.startswith(_EXCEL_SIGNATURES[1]) else "openpyxl"
-    try:
-        df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
-    except ImportError:
-        raise DataError(msg("excel_needs_pkg", what=what, pkg=engine_pkg)) from None
-    except (ValueError, zipfile.BadZipFile, KeyError, OSError, TypeError) as exc:
-        raise DataError(msg("excel_unreadable", what=what, error=str(exc))) from None
-    except Exception as exc:  # noqa: BLE001 - engine-specific parse errors (xlrd.XLRDError, ...)
-        raise DataError(msg("excel_unreadable_engine", what=what, error=f"{type(exc).__name__}: {exc}")) from None
-    if _header_is_data([str(c) for c in df.columns]):
-        try:
-            df = pd.read_excel(io.BytesIO(raw), sheet_name=0, header=None)
-        except Exception:  # noqa: BLE001 - already read once; keep the first result
-            return df
-        ncol = df.shape[1]
-        df.columns = ["date"] + (["value"] if ncol == 2 else [f"value{i}" for i in range(1, ncol)])
-    return df
+        return None  # caller falls back to text parsing
+    if raw.startswith(_EXCEL_SIGNATURES[0]) and not _is_ods(raw):
+        rows = _xlsx_rows(raw, what, max_columns, max_cells)
+    else:
+        rows = _pandas_excel_rows(raw, what, max_columns, max_cells)
+    if not rows:
+        return _Parsed(pd.DataFrame(), "", None, 0)
+    if header_row is None:
+        h = _header_index(rows)
+    else:
+        _check_header_row(header_row, rows)
+        h = int(header_row)
+    skipped = _skipped_rows(rows, h)
+    header = rows[h]
+    if _header_is_data([str(v) for v in header]):
+        ncol = len(header)
+        names = ["date"] + (["value"] if ncol == 2 else [f"value{i}" for i in range(1, ncol)])
+        _warn(msg("headerless", what=what), DataNotice)
+        return _Parsed(_grid_frame(rows[h:], None, names), "", None, 0)
+    if letters and any(_blank_cell(v) for v in header):
+        header = [_BLANK_LABEL.format(_col_letter(j)) if _blank_cell(v) else v for j, v in enumerate(header)]
+    df = _grid_frame([header] + rows[h + 1:], 0)
+    if skipped and header_row is None:
+        _warn(msg("title_rows_skipped", what=what, n=skipped, row=h + 1), DataNotice)
+    return _Parsed(df, "", h, skipped)
 
 
 # ---- Google Trends CSV exports
@@ -1367,8 +1758,12 @@ class RawTable:
     types for Excel (Timestamps, floats such as ``2020.0`` for integer columns with blanks) -- exactly what
     :func:`load_table` hands :func:`frame_to_series` -- with ``str`` column labels (header row applied,
     whitespace collapsed, repeats numbered; a Google Trends preamble skipped, its columns renamed to the
-    terms, ``'<1'`` -> ``'0.5'``, ``isPartial`` dropped).  Pass ``decimal_comma`` to
-    ``frame_to_series(prefer_decimal_comma=...)``."""
+    terms, ``'<1'`` -> ``'0.5'``, ``isPartial`` dropped; a title above the header skipped; a blank header
+    cell named after its column letter, ``열 B``).  Pass ``decimal_comma`` to
+    ``frame_to_series(prefer_decimal_comma=...)``.
+
+    ``header_row``: 0-based line (text) or sheet row (Excel) the column labels came from -- ``None`` for
+    JSON and for a file without a header row; ``title_rows``: non-blank rows skipped above it."""
 
     frame: pd.DataFrame
     filename: str
@@ -1376,6 +1771,8 @@ class RawTable:
     encoding: Optional[str]        # e.g. 'utf-8-sig', 'cp949'; None for Excel
     decimal_comma: bool
     google_trends: Optional[GoogleTrendsInfo]
+    header_row: Optional[int] = None
+    title_rows: int = 0
 
 
 def _next_line(text: str, pos: int) -> tuple[int, int, str]:
@@ -1464,62 +1861,108 @@ def _apply_google_trends(df: pd.DataFrame, category: Optional[str]) -> tuple[pd.
     return df, GoogleTrendsInfo(terms=terms, lt1_count=lt1, category=category)
 
 
-def read_table_bytes(raw: bytes, filename: str, *, max_columns: Optional[int] = None) -> RawTable:
+#: the cell limit of an upload (docs/WEB_SPEC.md B.3.4) -- what ``max_cells`` defaults to for Excel and JSON when
+#: ``max_columns`` marks the input as untrusted (their frames can be far larger than the file, SEC-1)
+UNTRUSTED_MAX_CELLS = 2_000_000
+
+
+def read_table_bytes(raw: bytes, filename: str, *, max_columns: Optional[int] = None,
+                     max_cells: Optional[int] = None, header_row: Optional[int] = None) -> RawTable:
     """Parse file bytes in memory (nothing is written to disk) into a :class:`RawTable`.
 
     The format comes from the extension of ``filename`` (.csv .tsv .txt .xlsx .xlsm .xls .ods .json;
     anything else: text with the separator sniffed); Excel is read from an in-memory buffer.  Emits
     the same :class:`DataNotice` / :class:`DataWarning` as :func:`load_table` (plus ``gt_detected`` /
-    ``gt_lt1_half`` for a Google Trends export) and raises :class:`DataError` for unreadable input.
-    ``max_columns``: for text formats the header row is split with the sniffed separator *before* the
-    full parse and more fields raise ``DataError(table_too_many_columns)``; for Excel / JSON the check
-    runs right after reading.  ``None`` = no limit."""
-    what = str(filename)
+    ``gt_lt1_half`` for a Google Trends export and ``title_rows_skipped`` for a title above the header) and
+    raises :class:`DataError` for unreadable input.
+
+    The limits are checked *before* the frame is built (SEC-1):
+
+    * ``max_columns``: text formats split the header row with the sniffed separator before the full
+      parse; .xlsx stops at the first cell right of the limit while streaming the sheet; JSON counts the
+      union of the record keys first.  More columns raise ``DataError(table_too_many_columns)``.
+    * ``max_cells``: rows x columns of the frame-to-be (text: non-blank lines below the header x header
+      fields; .xlsx: rows x widest row so far, while streaming; JSON: records x keys) above it raises
+      ``DataError(table_too_large)`` with ``n`` (for .xlsx the count when reading stopped) and ``max``.
+      ``None``: :data:`UNTRUSTED_MAX_CELLS` for Excel and JSON when ``max_columns`` is given, else no limit.
+    * ``header_row``: the 0-based line / sheet row that holds the column labels (rows above it are
+      skipped); ``None`` = automatic (the first non-blank row, or the row below a title).
+
+    Blank header cells get the column letter (``열 B``) instead of pandas' ``Unnamed: 1``; a .xls/.ods sheet
+    is read whole by its engine first (no streaming API) and checked right after reading."""
+    return _read_table(raw, str(filename), max_columns=max_columns, max_cells=max_cells,
+                       header_row=header_row, letters=True)
+
+
+def _read_table(raw: bytes, what: str, *, max_columns: Optional[int] = None, max_cells: Optional[int] = None,
+                header_row: Optional[int] = None, letters: bool = False) -> RawTable:
+    """:func:`read_table_bytes`; ``letters=False`` keeps pandas' ``Unnamed: N`` labels (the library loaders)."""
     if not raw.strip():
         raise DataError(msg("file_empty", what=what))
+    if header_row is not None and (isinstance(header_row, bool) or not isinstance(header_row, (int, np.integer))
+                                   or header_row < 0):
+        raise DataError(msg("header_row_invalid", row=str(header_row)))
+    dense_cells = max_cells if max_cells is not None else (UNTRUSTED_MAX_CELLS if max_columns is not None else None)
     suffix = Path(what).suffix.lower()
+    parsed: Optional[_Parsed] = None
     df: Optional[pd.DataFrame] = None
     fmt = ""
     encoding: Optional[str] = None
     decimal_comma = False
     gt: Optional[GoogleTrendsInfo] = None
-    if suffix in _EXCEL_SUFFIXES:
-        df = _read_excel(raw, what)
-        if df.empty and not raw.startswith(_EXCEL_SIGNATURES):
-            df = None  # text content behind an Excel extension: parse as CSV below
-        else:
-            fmt = _EXCEL_FORMATS[suffix]
-    elif suffix == ".json":
-        text, encoding = _decode(raw, what)
-        try:
-            obj = json.loads(text.lstrip("\ufeff"))
-        except json.JSONDecodeError as exc:
-            try:  # JSON Lines
-                obj = [json.loads(ln) for ln in text.lstrip("\ufeff").splitlines() if ln.strip()]
-            except json.JSONDecodeError:
-                raise DataError(msg("json_invalid", what=what, error=exc.msg, line=exc.lineno)) from None
-        try:
-            df = _json_to_frame(obj, what)
-        except (ValueError, TypeError, KeyError, AttributeError) as exc:
-            if isinstance(exc, DataError):
-                raise
-            raise DataError(msg("json_to_table", what=what, error=str(exc))) from None
-        fmt = "json"
-    if df is None:
-        if raw.startswith(_EXCEL_SIGNATURES):
-            raise DataError(msg("excel_wrong_ext", what=what))
-        text, encoding = _decode(raw, what)
-        trends = _detect_google_trends(text)
-        df, sep = _parse_text_table(trends[0] if trends else text, what, max_columns)
-        decimal_comma = sep == ";"
-        fmt = _TEXT_FORMATS.get(suffix) or ("tsv" if sep == "\t" else "txt" if sep == r"\s+" else "csv")
-        if trends:
-            df, gt = _apply_google_trends(df, trends[1])
-    elif max_columns is not None and df.shape[1] > max_columns:
-        raise DataError(msg("table_too_many_columns", n=int(df.shape[1]), max=int(max_columns)))
+    try:
+        if suffix in _EXCEL_SUFFIXES:
+            parsed = _read_excel(raw, what, max_columns=max_columns, max_cells=dense_cells, header_row=header_row,
+                                 letters=letters)
+            if parsed is not None:
+                df = parsed.frame
+                fmt = _EXCEL_FORMATS[suffix]
+        elif suffix == ".json":
+            text, encoding = _decode(raw, what)
+            try:
+                obj = json.loads(text.lstrip("\ufeff"))
+            except json.JSONDecodeError as exc:
+                try:  # JSON Lines
+                    obj = [json.loads(ln) for ln in text.lstrip("\ufeff").splitlines() if ln.strip()]
+                except json.JSONDecodeError:
+                    raise DataError(msg("json_invalid", what=what, error=exc.msg, line=exc.lineno)) from None
+            except RecursionError:
+                raise DataError(msg("json_shape", what=what)) from None
+            try:
+                df = _json_to_frame(obj, what, max_columns=max_columns, max_cells=dense_cells)
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                if isinstance(exc, DataError):
+                    raise
+                raise DataError(msg("json_to_table", what=what, error=str(exc))) from None
+            fmt = "json"
+        if df is None:
+            if raw.startswith(_EXCEL_SIGNATURES):
+                raise DataError(msg("excel_wrong_ext", what=what))
+            text, encoding = _decode(raw, what)
+            trends = _detect_google_trends(text) if header_row is None else None
+            parsed = _parse_text_table(trends[0] if trends else text, what, max_columns, max_cells=max_cells,
+                                       header_row=header_row, letters=letters)
+            df = parsed.frame
+            decimal_comma = parsed.sep == ";"
+            fmt = _TEXT_FORMATS.get(suffix) or ("tsv" if parsed.sep == "\t" else "txt" if parsed.sep == r"\s+"
+                                                else "csv")
+            if trends:
+                df, gt = _apply_google_trends(df, trends[1])
+                if parsed.header_row is not None:   # count the preamble lines above the header row too
+                    full = text.lstrip("\ufeff")
+                    preamble = full[:len(full) - len(trends[0])]
+                    parsed.header_row += len(_LINE_BREAK.findall(preamble))
+        elif max_columns is not None and df.shape[1] > max_columns:
+            raise DataError(msg("table_too_many_columns", n=int(df.shape[1]), max=int(max_columns)))
+    except MemoryError:   # a parser bug must not take the process down (the limits above make this unlikely)
+        raise DataError(msg("table_out_of_memory", what=what)) from None
     df.columns = _clean_labels(df.columns)
+    if letters and fmt == "json" and any(c == "" for c in df.columns):
+        df.columns = _clean_labels(_BLANK_LABEL.format(_col_letter(j)) if c == "" else c
+                                   for j, c in enumerate(df.columns))
     return RawTable(frame=df, filename=what, format=fmt, encoding=encoding, decimal_comma=decimal_comma,
-                    google_trends=gt)
+                    google_trends=gt, header_row=parsed.header_row if parsed is not None else None,
+                    title_rows=parsed.skipped if parsed is not None else 0)
 
 
 def load_table_bytes(raw: bytes, filename: str, date_col: Optional[str] = None,
@@ -1527,8 +1970,9 @@ def load_table_bytes(raw: bytes, filename: str, date_col: Optional[str] = None,
     """:func:`read_table_bytes` + :func:`frame_to_series`: file bytes -> ``{name: raw series}``.
 
     For a Google Trends export every series also gets ``attrs['trendai'] |= {'source':
-    'google_trends_upload', 'term', 'region', 'value_kind': 'relative_index_gt'}``."""
-    table = read_table_bytes(raw, filename)
+    'google_trends_upload', 'term', 'region', 'value_kind': 'relative_index_gt'}``.  Blank header cells keep
+    pandas' ``Unnamed: N`` labels here (what ``--value-col`` and existing scripts name)."""
+    table = _read_table(raw, str(filename))
     out = frame_to_series(table.frame, date_col=date_col, value_cols=value_cols,
                           prefer_decimal_comma=table.decimal_comma)
     if table.google_trends is not None:

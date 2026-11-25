@@ -257,6 +257,24 @@ test('axisLabel rules (D.1.6 axis ticks)', () => {
   assert.equal(fmt.axisLabel(ms('2026-11-25'), 'day', true, 'en'), 'Nov 25, 2026');
 });
 
+test('compactTicks: one unit per axis once a tick reaches 1만 / 10K (UX-15)', () => {
+  assert.deepEqual(fmt.compactTicks([0, 5000, 10000, 15000], 'ko'), ['0', '0.5만', '1만', '1.5만']);
+  assert.deepEqual(fmt.compactTicks([0, 5000, 10000, 15000], 'en'), ['0', '5K', '10K', '15K']);
+  assert.deepEqual(fmt.compactTicks([0, 20000, 40000, 60000], 'ko'), ['0', '2만', '4만', '6만']);
+  assert.deepEqual(fmt.compactTicks([0, 2500, 5000, 7500, 10000], 'ko'), ['0', '0.25만', '0.5만', '0.75만', '1만']);
+  assert.deepEqual(fmt.compactTicks([0, 1e7, 2e7, 3e7], 'ko'), ['0', '1,000만', '2,000만', '3,000만']);
+  assert.deepEqual(fmt.compactTicks([0, 5e7, 1e8, 1.5e8], 'ko'), ['0', '0.5억', '1억', '1.5억']);
+  assert.deepEqual(fmt.compactTicks([1e6, 1.02e6, 1.04e6], 'en'), ['1M', '1.02M', '1.04M']);
+  assert.deepEqual(fmt.compactTicks([-10000, 0, 10000], 'ko'), ['−1만', '0', '1만']);
+  // not applicable: below 10,000 (9,999.4 rounds to 9,999), a 4th significant digit, decades apart, ×10ⁿ range
+  assert.equal(fmt.compactTicks([0, 5000, 9999.4], 'ko'), null);
+  assert.equal(fmt.compactTicks([100000, 100100, 100200], 'ko'), null);
+  assert.equal(fmt.compactTicks([100, 1000, 10000, 100000], 'ko'), null);
+  assert.equal(fmt.compactTicks([0, 1e16, 2e16], 'ko'), null);
+  assert.equal(fmt.compactTicks([], 'ko'), null);
+  assert.equal(fmt.compactTicks([0, null, 20000], 'ko'), null);
+});
+
 test('any lang other than en is Korean', () => {
   assert.equal(fmt.compact(12345, 'fr'), '1.2만');
   assert.equal(fmt.dateLabel('2026-11-17', 'W', undefined), '2026.11.17 주');

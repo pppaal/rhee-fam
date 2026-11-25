@@ -3,6 +3,11 @@
 // read-only shared link, which shows no AI button at all, only the ai_block_text (F.6.11). While the AI job
 // runs the rule text stays and a status line says so; the result replaces the body with the AI badge + note, and
 // `규칙 기반 해석 보기` toggles back. Owner: WP3-app.
+//
+// The rule-based text is always the default (brief M10, UX-9): an AI version stored with a shared or cached result
+// (someone else's request) is offered through `AI 해석 보기`, never shown by itself; only the AI text this visitor
+// just asked for replaces the rule text at once. When the AI text arrives, focus moves to the toggle that replaced
+// the pressed button and the status line says it is done (A11Y-4).
 
 import * as api from '../api.js';
 import { clear, h } from '../dom.js';
@@ -21,7 +26,7 @@ import { errorCard } from './errorcard.js';
 export function createNarrative(vm, opts) {
   const n = vm.narrative;
   let ai = n.ai || null;
-  let mode = ai ? 'ai' : 'rule';
+  let mode = 'rule';
   let controller = null;
 
   const badgeSlot = h('span', { class: 'narrative-badge' });
@@ -62,6 +67,7 @@ export function createNarrative(vm, opts) {
 
   function setMode(next) {
     mode = next;
+    status.textContent = '';
     render();
   }
 
@@ -73,10 +79,12 @@ export function createNarrative(vm, opts) {
     status.textContent = t('detail.narrative.ai_running');
     try {
       ai = await api.narrative(opts.resultId, vm.index, getLang(), { signal: controller.signal });
-      status.textContent = '';
+      const hadFocus = document.activeElement === aiButton;
       aiButton.remove();
       mode = 'ai';
       render();
+      status.textContent = t('detail.narrative.ai_done');
+      if (hadFocus || document.activeElement === document.body) toggle.focus({ preventScroll: true });
     } catch (err) {
       if (err && err.name === 'AbortError') return;
       status.textContent = '';

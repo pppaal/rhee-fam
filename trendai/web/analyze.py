@@ -9,10 +9,12 @@ step 3). Nothing derived from an upload is written before the job finishes (E.7)
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime as _dt
 import hashlib
 import json
 import logging
+import math
 import re
 import threading
 import unicodedata
@@ -21,19 +23,20 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Sequence
 
 from .. import __version__, data
 from ..connectors import NAVER_EARLIEST, WIKI_EARLIEST, ConnectorError, NaverGroup, naver_cache_key, period_bounds
-from . import exports, fmt, viewmodel
-from .errors import REQUEST_CLASS, WebError, encode_series, error_object, from_connector_error, from_data_error, \
-    series_error
+from . import exports, fmt, texts, viewmodel
+from .errors import REQUEST_CLASS, WebError, catalog_code, encode_series, error_object, from_connector_error, \
+    from_data_error, series_error
 from .jobs import JobCancelled, JobContext, JobTimeout
-from .log import log_exception
-from .store import parse_iso, utc_iso
+from .log import log_exception, short_id
+from .store import Store, iso_date, parse_iso, utc_iso
 
 if TYPE_CHECKING:  # pragma: no cover
     import pandas as pd
 
-__all__ = ["AnalyzeQuery", "normalize", "display_names", "result_cache_key", "naver_groups", "naver_key",
-           "canonical_json", "run_analyze_job", "SingleFlight", "HORIZON_MAX", "MAX_COMPARE", "MAX_KEYWORDS",
-           "MAX_TERM_LENGTH"]
+__all__ = ["AnalyzeQuery", "normalize", "display_names", "sample_display_names", "result_cache_key", "inflight_key",
+           "naver_groups", "naver_key", "canonical_json", "run_analyze_job", "SingleFlight", "HORIZON_MAX",
+           "MAX_COMPARE", "MAX_KEYWORDS", "MAX_TERM_LENGTH", "MAX_SERIES_POINTS", "MAX_REQUEST_POINTS",
+           "TRANSIENT_CODES"]
 
 LOG = logging.getLogger("trendai.web.jobs")
 
@@ -53,6 +56,16 @@ _SHORT_DATA = 8
 _UPLOAD_HORIZON_LIMIT = 10_000
 _NAVER_FRESH_TTL_S = 24 * 3600.0
 _WIKI_TTL_S = {"monthly": 24 * 3600.0, "daily": 6 * 3600.0, "weekly": 6 * 3600.0}
+#: work budget of an upload analysis: points of one prepared series, and of all series of one request. Above them the
+#: job's run time, memory (two VMs + two JSON exports per series) and stored result size grow without bound, so an
+#: upload within the file limits could time out or fill memory/disk (``422 upload_too_large_table``).
+MAX_SERIES_POINTS = 20_000
+MAX_REQUEST_POINTS = 60_000
+_DAYS_PER = {"D": 1.0, "W": 7.0, "M": 30.44, "Q": 91.3, "Y": 365.25}
+#: failure codes of a series that a retry can fix: a result holding one is never put in the result cache, so the
+#: error card's "retry" re-runs the query instead of serving the same failure for up to 24 h
+TRANSIENT_CODES = frozenset({"wiki_rate", "naver_rate", "naver_server", "source_timeout", "source_unreachable",
+                             "source_bad_response", "series_failed_web", "job_timeout", "internal_error"})
 
 
 def canonical_json(obj: Any) -> str:
@@ -72,7 +85,7 @@ class AnalyzeQuery:
 
     source: str
     series: tuple[tuple[str, ...], ...]        # terms per series; uploads: ((column,), ...)
-    names: tuple[str, ...]                     # display names (E.6.1)
+    names: tuple[str, ...]                     # display names (E.6.1; the Korean VM, pipeline.run, rank_trends)
     range: str = "5y"
     unit: Optional[str] = None                 # date | week | month (naver, wiki)
     freq: Optional[str] = None                 # D/W/M (naver, wiki), M (sample), upload: requested or None (auto)
@@ -89,6 +102,7 @@ class AnalyzeQuery:
     value_cols: Optional[tuple[str, ...]] = None
     unit_label: Optional[str] = None
     filename: Optional[str] = None
+    names_en: Optional[tuple[str, ...]] = None  # English display names when they differ (samples), else ``names``
 
     @property
     def size(self) -> int:
@@ -136,6 +150,14 @@ def display_names(series_terms: Sequence[Sequence[str]]) -> list[str]:
         taken.add(name)
         out.append(name)
     return out
+
+
+def sample_display_names(ids: Sequence[str], lang: str) -> list[str]:
+    """E.6.1 for samples: the sample title of G.13 in the VM language (``growing`` -> ``성장형`` / ``Growing``), the
+    same text the gallery and ``/api/samples`` show, never the internal id -- the id stays in ``terms`` (URL ``q``,
+    cache keys)."""
+    table = texts.SAMPLE_TITLES_EN if lang == "en" else texts.SAMPLE_TITLES
+    return display_names([(table.get(i, i),) for i in ids])
 
 
 def _terms(raw_series: Any, source: str) -> list[tuple[str, ...]]:
@@ -204,8 +226,10 @@ def normalize(body: Mapping[str, Any], *, today_kst: _dt.date, today_utc: _dt.da
         for terms in series:
             if len(terms) != 1 or terms[0] not in known:
                 raise WebError("unknown_sample", params={"name": " + ".join(terms)})
-        return AnalyzeQuery(source="sample", series=tuple(series), names=tuple(t[0] for t in series),
-                            freq="M", h=_horizon(body.get("h", "auto"), "M"))
+        ids = [t[0] for t in series]
+        return AnalyzeQuery(source="sample", series=tuple(series), names=tuple(sample_display_names(ids, "ko")),
+                            names_en=tuple(sample_display_names(ids, "en")), freq="M",
+                            h=_horizon(body.get("h", "auto"), "M"))
 
     rng = body.get("range", "5y")
     rng = "5y" if rng is None else rng
@@ -253,8 +277,12 @@ def normalize(body: Mapping[str, Any], *, today_kst: _dt.date, today_utc: _dt.da
 
 def _normalize_upload(body: Mapping[str, Any], upload_cache: Any, max_series: int) -> AnalyzeQuery:
     uid = body.get("upload_id")
-    entry = upload_cache.get(uid) if isinstance(uid, str) and re.match(r"^[A-Za-z0-9_-]{22}$", uid) else None
+    valid = isinstance(uid, str) and re.match(r"^[A-Za-z0-9_-]{22}$", uid) is not None
+    entry = upload_cache.get(uid) if valid else None
     if entry is None:
+        if valid and getattr(upload_cache, "evicted", None) is not None and upload_cache.evicted(uid):
+            # dropped for space seconds ago, not 30 minutes: say so (until the catalog has the text, the expiry one)
+            raise WebError(catalog_code("upload_evicted", "upload_expired"), 410)
         raise WebError("upload_expired")
     frame_cols = [str(c) for c in entry.raw.frame.columns]
     date_col = body.get("date_col")
@@ -297,9 +325,29 @@ def _normalize_upload(body: Mapping[str, Any], upload_cache: Any, max_series: in
         unit_label = _CONTROL_RX.sub("", unicodedata.normalize("NFC", unit_label)).strip() or None
         if unit_label is not None and len(unit_label) > MAX_UNIT_LABEL:
             raise _bad("unit_label")
+    _check_upload_budget(entry, len(names), freq_req, date_col)
     return AnalyzeQuery(source="upload", series=tuple((n,) for n in names), names=names, freq=freq_req, h=h,
                         upload_id=uid, date_col=date_col, value_cols=tuple(value_cols) if value_cols else None,
                         unit_label=unit_label, filename=entry.filename)
+
+
+def _too_large(n: int, limit: int) -> WebError:
+    return WebError("upload_too_large_table", params={"n": int(n), "max": int(limit)}, source_kind="upload")
+
+
+def _check_upload_budget(entry: Any, n_series: int, freq_req: Optional[str], date_col: Optional[str]) -> None:
+    """Refuse, before queueing, an upload analysis whose estimated work is above the budget (C.5): points per series
+    (distinct dates of the detected date column, scaled to a coarser requested frequency) x series. The job checks
+    the real prepared lengths again (:meth:`_Job._prepare`)."""
+    points = int(getattr(entry, "n_points", 0) or 0)
+    if points <= 0 or (date_col is not None and date_col not in (getattr(entry, "date_cols", None) or [])):
+        return             # nothing detected, or another date column: only the in-job check applies
+    detected = getattr(entry, "freq", None)
+    if freq_req in _DAYS_PER and detected in _DAYS_PER and _DAYS_PER[freq_req] > _DAYS_PER[detected]:
+        points = int(points * _DAYS_PER[detected] / _DAYS_PER[freq_req]) + 1
+    limit = min(MAX_REQUEST_POINTS, MAX_SERIES_POINTS * max(1, n_series))
+    if points * n_series > limit:
+        raise _too_large(points * n_series, limit)
 
 
 def naver_groups(q: AnalyzeQuery) -> list[NaverGroup]:
@@ -311,8 +359,19 @@ def naver_key(q: AnalyzeQuery) -> str:
     return naver_cache_key(naver_groups(q), q.start, q.end, q.unit, q.dev or None, q.gender or None, q.ages)
 
 
+def inflight_key(q: AnalyzeQuery) -> Optional[str]:
+    """The in-flight index key (C.5 joins): the result-cache key, and for uploads a key of the upload and the column
+    selection -- so repeating one upload analysis while it runs joins the running job instead of queueing copies
+    (uploads are still never put in the result cache)."""
+    if q.source != "upload":
+        return result_cache_key(q)
+    return _sha256({"engine": __version__, "vm_schema": viewmodel.WEB_VM_SCHEMA, "source": "upload",
+                    "upload_id": q.upload_id, "date_col": q.date_col, "names": list(q.names), "freq": q.freq,
+                    "h": q.h, "unit_label": q.unit_label})
+
+
 def result_cache_key(q: AnalyzeQuery) -> Optional[str]:
-    """E.10 result-cache key (``None`` for uploads, which are never cached or joined)."""
+    """E.10 result-cache key (``None`` for uploads, which are never cached)."""
     if q.source == "upload":
         return None
     return _sha256({"engine": __version__, "vm_schema": viewmodel.WEB_VM_SCHEMA, "source": q.source,
@@ -364,14 +423,19 @@ class _Item:
     freq: Optional[str] = None
     h: Optional[int] = None
     notices: dict = field(default_factory=lambda: {"ko": [], "en": []})
+    name_en: Optional[str] = None         # English display name when it differs (samples)
 
 
 def _num(v: Any) -> Optional[float]:
+    """A stored data-cache number: 15 significant digits, ``None`` for missing / non-finite values and for bools
+    (the same rule as the VM's numbers)."""
+    if isinstance(v, bool):
+        return None
     try:
         f = float(v)
     except (TypeError, ValueError):
         return None
-    return float(f"{f:.15g}") if f == f and f not in (float("inf"), float("-inf")) else None
+    return float(f"{f:.15g}") if math.isfinite(f) else None
 
 
 def _series_from(dates: Sequence[str], values: Sequence[Any], name: str) -> "pd.Series":
@@ -384,7 +448,13 @@ def _series_from(dates: Sequence[str], values: Sequence[Any], name: str) -> "pd.
 
 
 def _iso_dates(index: Any) -> list[str]:
-    return [f"{d.year:04d}-{d.month:02d}-{d.day:02d}" for d in index]
+    return [iso_date(d) for d in index]
+
+
+def _renamed(report: Any, name: str) -> Any:
+    """A shallow copy of a ``TrendReport`` under another display name (the English sample title): the numbers are
+    shared, only ``report.name`` / ``analysis.name`` -- read by the narrative, the VM and the JSON export -- change."""
+    return dataclasses.replace(report, name=name, analysis=dataclasses.replace(report.analysis, name=name))
 
 
 class _Job:
@@ -403,6 +473,7 @@ class _Job:
         self.naver_endpoint: Optional[str] = None
         self.gt_category: Optional[str] = None
         self.source_kind = q.source
+        self.points = 0                    # prepared points so far (upload work budget)
 
     # ---------------------------------------------------------------- helpers
     def _expiry(self, when: Optional[_dt.datetime]) -> None:
@@ -531,8 +602,9 @@ class _Job:
     def _sample(self) -> list[_Item]:
         from ..samples import sample
 
+        names_en = self.q.names_en or self.q.names
         return [_Item(index=k, name=name, terms=terms, raw=sample(terms[0]), as_of=self.as_of_now, kind="sample",
-                      value_kind="raw", meta_extra={"synthetic": True})
+                      value_kind="raw", meta_extra={"synthetic": True}, name_en=names_en[k])
                 for k, (terms, name) in enumerate(zip(self.q.series, self.q.names, strict=True))]
 
     def _upload(self) -> list[_Item]:
@@ -593,6 +665,15 @@ class _Job:
                 self._fail(item, series_error(exc, n_obs=n_obs))
                 return
         prepared.attrs.update(item.raw.attrs)
+        n_points = int(len(prepared))
+        if q.source == "upload":         # the work budget (C.5): the real lengths after regularisation
+            if n_points > MAX_SERIES_POINTS:
+                self._fail(item, _too_large(n_points, MAX_SERIES_POINTS))
+                return
+            if self.points + n_points > MAX_REQUEST_POINTS:
+                self._fail(item, _too_large(self.points + n_points, MAX_REQUEST_POINTS))
+                return
+            self.points += n_points
         item.prepared, item.freq = prepared, f
         k = item.index
         for w in notes:
@@ -635,7 +716,6 @@ class _Job:
     # ---------------------------------------------------------------- run
     def run(self, ctx: JobContext) -> None:
         from .. import compare as compare_mod
-        from .. import narrative, pipeline
 
         app, q = self.app, self.q
         n_total = q.size
@@ -657,47 +737,25 @@ class _Job:
                 self._prepare(item)
         ctx.set_notices(self.result_notices)
 
-        ai_enabled = app.ai_enabled()
-        xlsx = exports.xlsx_available()
-        is_naver = self.source_kind == "naver"
         done: dict[int, dict] = {}
         failed_errors: dict[int, WebError] = {}
         failed_entries: list[dict] = []
+        timed_out = False
         for item in items:
             k = item.index
-            if item.error is None:
-                ctx.check()
-                ctx.set_stage("series", {"index": k, "name": item.name, "step": "analyze"})
+            if item.error is None and timed_out:
+                self._fail(item, WebError(ctx.job.timeout_code))
+            elif item.error is None:
                 try:
-                    with data.collect_notices():   # everything run() emits is discarded by code (E.6 step 3)
-                        report = pipeline.run(item.prepared, name=item.name, freq=item.freq, horizon=item.h,
-                                              lang="ko", on_stage=lambda st: (ctx.check(), ctx.set_step(st)))
-                        en_text = narrative.generate_narrative(report.analysis, report.forecast, report.outlook,
-                                                               lang="en")[0]
-                    meta = self._meta(item, report)
-                    inp = viewmodel.SeriesInput(
-                        index=k, name=item.name, report=report, source=meta,
-                        narratives={"ko": report.narrative, "en": en_text}, notices=item.notices,
-                        request_size=n_total, ai_enabled=ai_enabled, xlsx_available=xlsx,
-                        slot=viewmodel.provisional_slot(k, n_total))
-                    vm_ko = viewmodel.build_series_vm(inp, "ko")
-                    vm_en = viewmodel.build_series_vm(inp, "en")
-                    json_ko = exports.build_series_json(report, vm_ko["source"], "ko")
-                    json_en = exports.build_series_json(report, vm_en["source"], "en", narrative=en_text)
-                    llm = None if is_naver else narrative.build_llm_payload(report.analysis, report.forecast,
-                                                                            report.outlook)
-                    html = None if is_naver else exports.render_series_html(report, vm_ko["source"]["line"])
-                except (JobCancelled, JobTimeout):
-                    raise
-                except data.DataError as exc:
-                    self._fail(item, series_error(exc, n_obs=len(item.prepared)))
-                except Exception as exc:  # noqa: BLE001 - one bad series must not fail the others
-                    log_exception(LOG, f"series={k} of job failed", exc, code="series_failed_web")
-                    self._fail(item, WebError("series_failed_web"))
-                else:
-                    done[k] = {"item": item, "report": report, "input": inp, "vm": {"ko": vm_ko, "en": vm_en},
-                               "json": {"ko": json_ko, "en": json_en}, "llm": llm, "html": html}
-                    ctx.add_series(k, {"ko": vm_ko, "en": vm_en})
+                    self._series(ctx, item, n_total, done)
+                except JobTimeout:
+                    if not done:
+                        raise
+                    # some series are finished: keep them (finish below) and fail this one and the rest with
+                    # job_timeout instead of throwing every finished series away (the timeout is from the start)
+                    timed_out = True
+                    ctx.allow_overrun()
+                    self._fail(item, WebError(ctx.job.timeout_code))
             if item.error is not None:
                 if item.error.source_kind is None and self.source_kind in ("upload", "google_trends_upload"):
                     item.error.source_kind = self.source_kind
@@ -708,14 +766,68 @@ class _Job:
                 ctx.add_failed(entry)
             ctx.series_finished()
 
+        if done:
+            ctx.allow_overrun()     # stage finish is bounded work: never lose finished series to the time limit
         ctx.check()
         ctx.set_stage("finish")
         if not done:
             raise failed_errors[min(failed_errors)] if failed_errors else WebError("data_too_short",
                                                                                       params={"n": 0})
-        self._finish(ctx, done, failed_entries, compare_mod)
+        self._finish(ctx, done, failed_entries, failed_errors, compare_mod)
 
-    def _finish(self, ctx: JobContext, done: dict, failed_entries: list, compare_mod: Any) -> None:
+    def _series(self, ctx: JobContext, item: _Item, n_total: int, done: dict) -> None:
+        """Stage ``series`` of one prepared series: ``pipeline.run``, the VMs, exports, LLM payload and HTML. A
+        failure is recorded on the item (``JobCancelled`` / ``JobTimeout`` propagate)."""
+        from .. import narrative, pipeline
+
+        app = self.app
+        k = item.index
+        ctx.check()
+        current = {"index": k, "name": item.name, "step": "analyze"}
+        if item.name_en and item.name_en != item.name:
+            current["name_en"] = item.name_en          # the progress line in English (jobs.analyze_snapshot)
+        ctx.set_stage("series", current)
+        is_naver = self.source_kind == "naver"
+        try:
+            with data.collect_notices():   # everything run() emits is discarded by code (E.6 step 3)
+                report = pipeline.run(item.prepared, name=item.name, freq=item.freq, horizon=item.h,
+                                      lang="ko", on_stage=lambda st: (ctx.check(), ctx.set_step(st)))
+                # the English surfaces use the English display name when it differs (sample titles, E.6.1)
+                report_en = report if not item.name_en or item.name_en == item.name else _renamed(report,
+                                                                                                    item.name_en)
+                en_text = narrative.generate_narrative(report_en.analysis, report_en.forecast, report_en.outlook,
+                                                       lang="en")[0]
+            meta = self._meta(item, report)
+            inp = viewmodel.SeriesInput(
+                index=k, name=item.name, report=report, source=meta,
+                narratives={"ko": report.narrative, "en": en_text}, notices=item.notices,
+                request_size=n_total, ai_enabled=app.ai_enabled(), xlsx_available=exports.xlsx_available(),
+                slot=viewmodel.provisional_slot(k, n_total))
+            inp_en = inp if report_en is report else dataclasses.replace(inp, name=report_en.name, report=report_en)
+            vm_ko = viewmodel.build_series_vm(inp, "ko")
+            vm_en = viewmodel.build_series_vm(inp_en, "en")
+            json_ko = exports.build_series_json(report, vm_ko["source"], "ko")
+            json_en = exports.build_series_json(report_en, vm_en["source"], "en", narrative=en_text)
+            # stored as encoded bytes right away: far smaller in memory than the object graph until stage finish
+            llm = None if is_naver else Store.encode(narrative.build_llm_payload(report.analysis, report.forecast,
+                                                                                 report.outlook))
+            html = None if is_naver else exports.render_series_html(report, vm_ko["source"]["line"])
+        except (JobCancelled, JobTimeout):
+            raise
+        except data.DataError as exc:
+            self._fail(item, series_error(exc, n_obs=len(item.prepared)))
+        except Exception as exc:  # noqa: BLE001 - one bad series must not fail the others
+            log_exception(LOG, f"job={short_id(self.rid)} series={k} failed", exc, rid=self.request_id,
+                          code="series_failed_web")
+            self._fail(item, WebError("series_failed_web"))
+        else:
+            done[k] = {"item": item, "report": report, "input": inp, "input_en": inp_en,
+                       "vm": {"ko": vm_ko, "en": vm_en}, "json": {"ko": json_ko, "en": json_en}, "llm": llm,
+                       "html": html}
+            ctx.add_series(k, {"ko": vm_ko, "en": vm_en})
+
+    def _finish(self, ctx: JobContext, done: dict, failed_entries: list, failed_errors: Mapping[int, WebError],
+                compare_mod: Any) -> None:
         app, q = self.app, self.q
         n_total = q.size
         view = q.view
@@ -735,8 +847,9 @@ class _Job:
                 viewmodel.set_slot(done[k]["vm"][lang], slots.get(k))
         compare_vm: dict[str, Optional[dict]] = {"ko": None, "en": None}
         if view == "compare":
-            members = [done[k]["input"] for k in order]
             for lang in ("ko", "en"):
+                # ranking rows are looked up by index (name_to_index), so the English members carry English names
+                members = [done[k]["input_en" if lang == "en" else "input"] for k in order]
                 compare_vm[lang] = viewmodel.build_compare_vm(members, {k: done[k]["vm"][lang] for k in order},
                                                               ranking, name_to_index, slots, failed_entries, lang)
         is_naver = self.source_kind == "naver"
@@ -748,16 +861,20 @@ class _Job:
                                            succeeded=len(order))
         now = app.clock()
         expires = now + _dt.timedelta(seconds=app.config.result_ttl_s)
+        # every file is encoded as soon as it is built (one document in memory at a time, not all of them)
         files: dict[str, Any] = {}
         for lang in ("ko", "en"):
             series_json = {k: done[k]["json"][lang] for k in order}
             result_json = exports.build_result_json(
                 [series_json[k] for k in order],
                 source_line=compare_vm[lang]["source_line"] if compare_vm[lang] is not None else None)
-            files[f"export-{lang}.json"] = exports.build_export_store(series_json, result_json)
-            files[f"vm-{lang}.json"] = {"series": [done[k]["vm"][lang] for k in order], "compare": compare_vm[lang],
-                                        "notices": self.result_notices[lang],
-                                        "exports": viewmodel.export_block(av, lang, level="result")}
+            files[f"export-{lang}.json"] = Store.encode(exports.build_export_store(series_json, result_json))
+            del series_json, result_json
+            for k in order:
+                done[k]["json"][lang] = None
+            files[f"vm-{lang}.json"] = Store.encode(
+                {"series": [done[k]["vm"][lang] for k in order], "compare": compare_vm[lang],
+                 "notices": self.result_notices[lang], "exports": viewmodel.export_block(av, lang, level="result")})
         html_series: list[Optional[str]] = [None] * n_total
         for k in order:
             if done[k]["html"] is not None:
@@ -787,8 +904,12 @@ class _Job:
         files["result.json"] = result
         ctx.check()
         app.store.save_dir("results", self.rid, files)
-        key = ctx.job.cache_key
-        if key is not None:
+        del files
+        key = result_cache_key(q)
+        transient = any(err.code in TRANSIENT_CODES for err in failed_errors.values())
+        if key is not None and not transient:
+            # a result with a series that failed for a passing reason (a 429, a timeout) is not cached: the same
+            # query must run again, or the error card's "retry" would serve the same failure until the cache expires
             until = expires if self.data_expiry is None else min(expires, self.data_expiry)
             app.store.cache_put("results", key, {"key": key, "result_id": self.rid, "expires_at": utc_iso(until)})
         ctx.set_final([{"index": k, "vm": done[k]["vm"]} for k in order],

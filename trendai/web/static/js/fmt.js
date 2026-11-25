@@ -265,6 +265,48 @@ export function compact(x, lang = 'ko') {
 }
 
 /**
+ * Axis tick labels in one compact unit (client only, D.1.1 units; JS-only like axisLabel(), no fmt.py twin): once
+ * the largest |tick| reaches 10,000 after rounding, every tick is written in that tick's unit with the fewest
+ * decimals (≤ 2) that write each tick exactly, trailing zeros stripped and 0 as '0': ko `0 · 0.5만 · 1만 · 1.5만`,
+ * `0.5억 · 1억`; en `0 · 5K · 10K · 15K`, `1M · 1.02M · 1.04M`. Mixed styles such as `5,000 · 1만 · 1.5만` read
+ * inconsistently (UX-15). Returns null (the caller falls back to compact() per tick) when the ticks stay below
+ * 10,000, reach the ×10ⁿ range (ko 1e16, en 1e12), include a non-zero tick under a tenth of the unit (log axes over
+ * several decades: `100 · 1,000 · 1만 · 10만` stay per tick), need more decimals, or a label would carry more than
+ * 3 significant digits (brief §4.4).
+ * @param {Array<number>} values  tick values (finite)
+ * @param {'ko'|'en'} [lang='ko']
+ * @returns {string[]|null}
+ */
+export function compactTicks(values, lang = 'ko') {
+  const vs = (values || []).map(finite);
+  if (!vs.length || vs.some((v) => v === null)) return null;
+  const key = isEn(lang) ? 'en' : 'ko';
+  const abs = vs.map((v) => exactAbs(v));
+  const top = abs.reduce((m, a) => (lt(m, a) ? a : m));
+  if (lt(quantize(top, 0), D_10K) || ge(top, COMPACT_SCI[key])) return null;
+  const units = UNITS[key];
+  let i = 0;
+  while (i + 1 < units.length && ge(top, scaleb(D_ONE, units[i + 1][0]))) i += 1;
+  const [power, suffix] = units[i];
+  if (abs.some((a) => !isZero(a) && lt(a, scaleb(D_ONE, power - 1)))) return null;
+  const scaled = abs.map((a) => scaleb(a, -power));
+  let places = 0;
+  while (places <= 2 && !scaled.every((u) => cmp(quantize(u, places), u) === 0)) places += 1;
+  if (places > 2) return null;
+  const labels = [];
+  for (let k = 0; k < vs.length; k += 1) {
+    if (isZero(abs[k])) {
+      labels.push('0');
+      continue;
+    }
+    const r = quantize(scaled[k], places);
+    if (r.c.toString().replace(/0+$/, '').length > 3) return null;
+    labels.push(signed(vs[k] < 0, groupDigits(stripZeros(plain(r))) + suffix));
+  }
+  return new Set(labels).size === labels.length ? labels : null;
+}
+
+/**
  * A data value by value kind (D.1.3): relative indexes → one fixed decimal ('71.3', '100.0'), never compacted;
  * other kinds → compact() when `isCompact`, else full(). Used by the crosshair read-out and table views
  * (append the VM's `source.unit_label` yourself).

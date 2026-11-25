@@ -3,18 +3,19 @@
 // 공유 — public sources (naver / wiki / sample): copy the page URL with an absolute period (`range` replaced by
 // `{query.period.start}~{query.period.end}`); uploads: the share-link dialog. 내보내기 ▾ — CSV, 엑셀 (hidden when the
 // export is unavailable), 이미지(PNG), HTML 리포트 (disabled with the export_naver_raw text for Naver), JSON, and
-// 요약 복사 (summary_line + ' — ' + the share URL or the absolute-period page URL). Downloads are plain
-// <a href download> links to the server exports with `?hl=`; the browser never builds a data file.
+// 요약 복사 (summary_line + ' — ' + the share URL or the absolute-period page URL; for a comparison a line built from
+// the ranking, FU-15). Downloads are plain <a href download> links to the server exports with `?hl=`; the browser
+// never builds a data file.
 
 import { h } from '../dom.js';
 import { getLang, t } from '../i18n.js';
 import { serialize, withState } from '../state.js';
 import * as store from '../store.js';
-import { absoluteUrl, copyText, exportHref, icon } from '../ui.js';
+import { absoluteUrl, exportHref, icon } from '../ui.js';
 import { exportPng, pngFilename } from '../chart/png.js';
 import { menuButton } from './popover.js';
 import { openShareDialog } from './sharedialog.js';
-import { toast } from './toast.js';
+import { copyWithToast, toast } from './toast.js';
 
 /** True when the result comes from an uploaded file (share links instead of page URLs, C.8). */
 export function isUploadResult(env) {
@@ -30,28 +31,30 @@ export function absolutePageUrl(env, state) {
   return absoluteUrl(serialize(withState(state, patch)));
 }
 
-/** The URL that travels with a copied summary, or null when there is none to give (an upload without a share). */
-export function summaryUrl(env, state) {
-  if (env && env.readonly) return window.location.origin + window.location.pathname;
-  if (isUploadResult(env)) {
-    const share = env.result_id ? store.getShare(env.result_id) : null;
-    return share ? absoluteUrl(share.url) : null;
-  }
-  return absolutePageUrl(env, state);
+/** A share link with the series the sender was looking at (`?focus=`, FU-9). */
+export function withFocus(url, focus) {
+  return focus ? `${url}${url.includes('?') ? '&' : '?'}focus=${encodeURIComponent(focus)}` : url;
 }
 
-async function copyLink(env, state) {
-  const ok = await copyText(absolutePageUrl(env, state));
-  toast(ok ? t('share.copied') : t('err.clipboard'), { kind: ok ? 'info' : 'error' });
+/** The URL that travels with a copied summary, or null when there is none to give (an upload without a share). */
+export function summaryUrl(env, state) {
+  if (env && env.readonly) return withFocus(window.location.origin + window.location.pathname, state && state.focus);
+  if (isUploadResult(env)) {
+    const share = env.result_id ? store.getShare(env.result_id) : null;
+    return share ? withFocus(absoluteUrl(share.url), state && state.focus) : null;
+  }
+  return absolutePageUrl(env, state);
 }
 
 /** Run the share action for a result (copy link, or the share dialog for uploads). */
 export function shareAction(env, ctx, opener) {
   if (isUploadResult(env)) {
-    if (env.result_id) openShareDialog({ resultId: env.result_id, opener, navigate: ctx.navigate });
+    if (env.result_id) {
+      openShareDialog({ resultId: env.result_id, opener, navigate: ctx.navigate, focus: ctx.state ? ctx.state.focus : null });
+    }
     return;
   }
-  copyLink(env, ctx.state);
+  copyWithToast(absolutePageUrl(env, ctx.state));
 }
 
 /**
@@ -106,12 +109,11 @@ export function exportMenu(opts) {
       link('html') ? { label: t('export.html'), href: link('html'), download: true }
         : { label: t('export.html'), disabled: true, hint: un.html ? un.html.text : null },
       { label: t('export.json'), href: link('json'), download: true, hidden: !link('json') },
-      opts.summary ? {
+      opts.summary && opts.summary.line ? {
         label: t('share.summary'),
-        onSelect: async () => {
+        onSelect: () => {
           const url = opts.summary.url();
-          const ok = await copyText(url ? `${opts.summary.line} — ${url}` : opts.summary.line);
-          toast(ok ? t('share.summary.copied') : t('err.clipboard'), { kind: ok ? 'info' : 'error' });
+          copyWithToast(url ? `${opts.summary.line} — ${url}` : opts.summary.line, 'share.summary.copied');
         },
       } : null,
     ],
@@ -121,12 +123,28 @@ export function exportMenu(opts) {
 }
 
 /**
- * The compare card's ⋯ menu (F.6.8): CSV · 이미지 저장 · 링크 복사.
- * @param {{env: Object, ctx: Object, png: Object}} opts
+ * A comparison's summary line for 요약 복사 (FU-15): the ranking in one line, e.g.
+ * '[trendai] 패딩 vs 선크림: 1위 선크림(성장기, 상승 확률 약 95%) · 2위 패딩(쇠퇴기, 상승 확률 약 10%)'.
+ * The server's compare.summary_line is used when it has one.
+ * @param {Object} compare  env.compare
+ * @param {string[]} names
  */
-export function compareMoreMenu(opts) {
+export function compareSummaryLine(compare, names) {
+  if (!compare) return null;
+  if (compare.summary_line) return compare.summary_line;
+  const items = (compare.ranking || []).slice().sort((a, b) => a.rank - b.rank).map((r) => t('compare.summary.item', {
+    rank: r.rank, name: r.name, phase: r.phase ? r.phase.name : '', prob: r.outlook && r.outlook.prob_text ? r.outlook.prob_text : '—',
+  }));
+  return t('compare.summary', { names: names.join(' vs '), items: items.join(' · ') });
+}
+
+/**
+ * The ⋯ menu of a chart card (F.6.8, and the detail chart card, UX-22): CSV · 이미지 저장 · 링크 복사.
+ * @param {{env: Object, ctx: Object, png: Object, csv?: string|null}} opts  csv: default env.exports.csv
+ */
+export function chartMoreMenu(opts) {
   const lang = getLang();
-  const csv = opts.env && opts.env.exports && opts.env.exports.csv;
+  const csv = opts.csv !== undefined ? opts.csv : opts.env && opts.env.exports && opts.env.exports.csv;
   return menuButton({
     label: [], icon: 'ui-more', ariaLabel: t('common.more'), className: 'icon-btn btn-ghost',
     items: () => [

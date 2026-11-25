@@ -3,24 +3,24 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import datetime as _dt
 import hashlib
 import hmac
 import importlib.util
-import json
 import secrets
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from .. import __version__
 from ..connectors import NAVER_EARLIEST, WIKI_EARLIEST, period_bounds
 from . import analyze, exports, narrative_ai, texts, uploads, viewmodel
 from .budget import kst_now
-from .errors import WebError
-from .http import Request, Response, json_response, valid_id
-from .jobs import analyze_snapshot, narrative_snapshot
+from .errors import WebError, catalog_code
+from .http import Request, Response, json_response, parse_json, valid_id
+from .jobs import analyze_snapshot, disk_series_needed, narrative_snapshot
 from .log import LOGGER, log_exception
-from .store import utc_iso
+from .store import MIN_FREE_BYTES, SHARE_QUOTA_RATIO, utc_iso
 
 __all__ = ["health", "get_config", "get_samples", "upload", "post_analyze", "get_job", "delete_job", "get_result",
            "post_share", "delete_share", "get_shared", "export_file", "export_values", "post_narrative",
@@ -46,6 +46,37 @@ def _rate(app: Any, bucket: str, key: Any) -> None:
 def _refuse_when_draining(app: Any) -> None:
     if app.draining:
         raise WebError("server_busy", retry_after=30)
+
+
+def _store_full() -> WebError:
+    """No room in the store (disk nearly full, share quota used up): ``store_full`` once the catalog has it."""
+    return WebError(catalog_code("store_full", "server_busy"), 503, retry_after=300)
+
+
+def _refuse_when_disk_full(app: Any) -> None:
+    free = app.store.free_bytes()
+    if free is not None and free < MIN_FREE_BYTES:
+        raise _store_full()
+
+
+@contextlib.contextmanager
+def _heavy(app: Any) -> Iterator[None]:
+    """One of the few slots for reading a stored VM document or building an export (``app.heavy_slots``): beyond
+    them a request waits a little, then gets ``503 server_busy`` instead of piling up CPU and memory."""
+    if not app.heavy_slots.acquire(timeout=app.heavy_wait_s):
+        raise WebError("server_busy", retry_after=5)
+    try:
+        yield
+    finally:
+        app.heavy_slots.release()
+
+
+def _dict(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value: Any) -> list:
+    return value if isinstance(value, list) else []
 
 
 # --------------------------------------------------------------------------- C.1 health
@@ -74,7 +105,7 @@ def _formats() -> list[str]:
 
 
 def get_config(app: Any, req: Request, rid: str) -> Response:
-    _rate(app, "read", req.client_key)
+    _rate(app, "config", req.client_key)
     configured = app.fetchers.naver is not None
     _count, _limit, budget_state = app.naver_budget.state()
     if not configured:
@@ -143,7 +174,7 @@ def build_samples() -> dict[str, list[dict]]:
 
 
 def get_samples(app: Any, req: Request, rid: str) -> Response:
-    _rate(app, "read", req.client_key)
+    _rate(app, "config", req.client_key)
     return json_response({"samples": app.samples[req.hl]}, cache="public, max-age=3600")
 
 
@@ -160,16 +191,18 @@ def upload(app: Any, req: Request, rid: str) -> Response:
     # 411 / 413 before reading (C.0); the body is read before a parse slot is taken, so a slow client cannot hold
     # one of the two slots while its bytes trickle in (E.17 bounds the *parse*: multipart decode -> detection)
     body = req.read_body(limit, max_mb=cfg.upload_max_mb)
-    if not app.parse_slots.acquire(blocking=False):
-        raise WebError("server_busy", retry_after=5)
+    client = req.client_key
+    with app.parse_lock:                 # one parse slot per client: one address cannot hold both
+        if client in app.parse_clients:
+            raise WebError("server_busy", retry_after=5)
+        if not app.parse_slots.acquire(blocking=False):
+            raise WebError("server_busy", retry_after=5)
+        app.parse_clients.add(client)
     try:
         if ctype == "multipart/form-data":
             filename, raw = uploads.parse_multipart(req.header("Content-Type"), body)
         else:
-            try:
-                obj = json.loads(body.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError):
-                raise WebError("bad_request") from None
+            obj = parse_json(body)
             text = obj.get("text") if isinstance(obj, dict) else None
             name = obj.get("filename", "paste.tsv") if isinstance(obj, dict) else None
             if not isinstance(text, str) or not text or not isinstance(name, (str, type(None))):
@@ -180,7 +213,7 @@ def upload(app: Any, req: Request, rid: str) -> Response:
         try:
             entry, result = uploads.analyse_upload(raw, filename, hl=req.hl, max_bytes=cfg.upload_max_bytes,
                                                    max_mb=cfg.upload_max_mb, created_at=created.timestamp(),
-                                                   request_id=rid)
+                                                   request_id=rid, client_key=client)
         except WebError:
             raise
         except Exception as exc:  # noqa: BLE001 - never a 500 with input-quoting text for an odd file (E.11)
@@ -188,7 +221,9 @@ def upload(app: Any, req: Request, rid: str) -> Response:
             raise WebError("upload_unreadable", params={"reason": "file_unreadable"}) from None
         del raw, body
     finally:
-        app.parse_slots.release()
+        with app.parse_lock:
+            app.parse_clients.discard(client)
+            app.parse_slots.release()
     upload_id = secrets.token_urlsafe(16)
     app.uploads.put(upload_id, entry)
     expires = created + _dt.timedelta(seconds=app.uploads.ttl_s)
@@ -214,33 +249,47 @@ def post_analyze(app: Any, req: Request, rid: str) -> Response:
                           max_series=app.config.upload_max_series)
     client = req.client_key
     _rate(app, "analyze", client)
-    key = analyze.result_cache_key(q)
-    if key is not None:
-        cached = app.store.cache_get("results", key)
-        if cached is not None:
-            rid_cached = cached.get("result_id")
-            if valid_id(rid_cached) and app.store.load_result(rid_cached) is not None:
-                return _accepted(rid_cached, status="done", cached=True, joined=False, position=0, code=200)
-            app.store.cache_delete("results", key)
-        joined = app.jobs.join(key)
-        if joined is not None:
-            return _accepted(joined, status=joined.status, cached=False, joined=True,
-                             position=app.jobs.queue_position(joined), code=202)
-    if q.source == "naver":
-        if app.fetchers.naver is None:
-            raise WebError("naver_unconfigured")
-        if app.store.cache_get("naver", analyze.naver_key(q)) is None:
-            _c, _l, state = app.naver_budget.state()
-            if state == "blocked":
-                raise WebError("naver_budget_exhausted")
-            refill = 5 if state != "ok" else app.config.naver_ip_per_hour
-            retry = app.limiter.take("naver", client, refill=refill)
-            if retry is not None:
-                raise WebError("naver_rate_limited", params={"limit": refill}, retry_after=retry)
-    job_id = app.jobs.new_id()
-    job, joined = app.jobs.submit_or_join(
-        "analyze", analyze.run_analyze_job(app, q, job_id, rid), cache_key=key, job_id=job_id, request_id=rid,
-        log_info={"source": q.source, "series": q.size, "naver": "-"}, view=q.view, series_total=q.size)
+    taken = ["analyze"]
+    try:
+        key = analyze.result_cache_key(q)
+        if key is not None:
+            cached = app.store.cache_get("results", key)
+            if cached is not None:
+                rid_cached = cached.get("result_id")
+                if valid_id(rid_cached) and app.store.load_result(rid_cached) is not None:
+                    return _accepted(rid_cached, status="done", cached=True, joined=False, position=0, code=200)
+                app.store.cache_delete("results", key)
+        flight = analyze.inflight_key(q)
+        joined_job = app.jobs.join(flight, client) if flight is not None else None
+        if joined_job is not None:
+            return _accepted(joined_job, status=joined_job.status, cached=False, joined=True,
+                             position=app.jobs.queue_position(joined_job), code=202)
+        # capacity before the Naver token (and the analyze token is given back below): a client that follows a
+        # 503's Retry-After must not run into a 429 for requests that never ran
+        app.jobs.check_capacity("analyze", client)
+        _refuse_when_disk_full(app)
+        if q.source == "naver":
+            if app.fetchers.naver is None:
+                raise WebError("naver_unconfigured")
+            if app.store.cache_get("naver", analyze.naver_key(q)) is None:
+                _c, _l, state = app.naver_budget.state()
+                if state == "blocked":
+                    raise WebError("naver_budget_exhausted")
+                refill = 5 if state != "ok" else app.config.naver_ip_per_hour
+                retry = app.limiter.take("naver", client, refill=refill)
+                if retry is not None:
+                    raise WebError("naver_rate_limited", params={"limit": refill}, retry_after=retry)
+                taken.append("naver")
+        job_id = app.jobs.new_id()
+        job, joined = app.jobs.submit_or_join(
+            "analyze", analyze.run_analyze_job(app, q, job_id, rid), cache_key=flight, job_id=job_id,
+            request_id=rid, client_key=client, log_info={"source": q.source, "series": q.size, "naver": "-"},
+            view=q.view, series_total=q.size)
+    except WebError as err:
+        if err.code in ("server_busy", "rate_limited", "store_full"):   # refused for capacity, not for the request
+            for bucket in taken:
+                app.limiter.give_back(bucket, client)
+        raise
     return _accepted(job, status=job.status, cached=False, joined=joined, position=app.jobs.queue_position(job),
                      code=202)
 
@@ -254,41 +303,67 @@ def _since(req: Request) -> int:
         return 0
 
 
-def _stored_snapshot(app: Any, result_id: str, hl: str) -> Optional[dict]:
-    result = app.store.load_result(result_id)
-    vms = app.store.read_item_json("results", result_id, f"vm-{hl}.json") if result is not None else None
-    if result is None or not isinstance(vms, dict):
+def _stored_vms(app: Any, result_id: str, hl: str, since: int) -> Optional[tuple[dict, list]]:
+    """``(vm document, series entries with index >= since)`` of a stored result, ``None`` when unreadable."""
+    vms = app.store.read_item_json("results", result_id, f"vm-{hl}.json")
+    if not isinstance(vms, dict):
         return None
-    total = len((result.get("available") or {}).get("series") or [])
+    series = [{"index": v["index"], "status": "done", "vm": v} for v in _list(vms.get("series"))
+              if isinstance(v, dict) and isinstance(v.get("index"), int) and v["index"] >= since]
+    return vms, series
+
+
+def _stored_snapshot(app: Any, result_id: str, hl: str, since: int = 0) -> Optional[dict]:
+    """C.6 for a job no longer in memory: synthesised from the stored result (``series`` filtered by ``since`` like a
+    live poll; ``since=0`` gives the full list)."""
+    result = app.store.load_result(result_id)
+    if result is None:
+        return None
+    with _heavy(app):
+        got = _stored_vms(app, result_id, hl, since)
+    if got is None:
+        return None
+    vms, series = got
+    total = len(_list(_dict(result.get("available")).get("series")))
     return {"job_id": result_id, "kind": "analyze", "status": "done", "stage": "done", "series_total": total,
-            "series_done": total, "current": None,
-            "series": [{"index": v["index"], "status": "done", "vm": v} for v in vms.get("series") or []],
-            "failed": (result.get("failed") or {}).get(hl, []), "notices": vms.get("notices") or [],
+            "series_done": total, "current": None, "series": series,
+            "failed": _list(_dict(result.get("failed")).get(hl)), "notices": _list(vms.get("notices")),
             "compare": vms.get("compare") if result.get("view") == "compare" else None,
             "view": result.get("view", "detail"), "error": None, "result_url": f"/api/results/{result_id}",
             "elapsed_ms": 0, "poll_after_ms": None}
 
 
 def get_job(app: Any, req: Request, rid: str, id: str) -> Response:   # noqa: A002 - route parameter name
-    retry = app.limiter.take("poll", (req.client_key, id))
-    if retry is not None:
-        raise WebError("rate_limited", params={"retry_after": retry}, retry_after=retry)
     job = app.jobs.get(id)
     now = app.clock().timestamp()
+    since = _since(req)
     if job is None:
-        snap = _stored_snapshot(app, id, req.hl)
+        # a client-level token, not a per-(client, id) bucket: polling random ids must neither create buckets
+        # without bound nor be a cheap way to re-read large stored VM documents
+        _rate(app, "read", req.client_key)
+        snap = _stored_snapshot(app, id, req.hl, since)
         if snap is None:
             raise WebError("job_not_found")
         return json_response(snap, cache="no-store")
+    retry = app.limiter.take("poll", (req.client_key, id))
+    if retry is not None:
+        raise WebError("rate_limited", params={"retry_after": retry}, retry_after=retry)
     if job.kind == "narrative":
         return json_response(narrative_snapshot(job, now=now, naver_available=app.naver_available()),
                              cache="no-store")
-    return json_response(analyze_snapshot(job, since=_since(req), hl=req.hl, now=now,
-                                          naver_available=app.naver_available()), cache="no-store")
+    body = analyze_snapshot(job, since=since, hl=req.hl, now=now, naver_available=app.naver_available())
+    if body["status"] == "done" and disk_series_needed(job, since):
+        # a done job keeps no VMs in memory: the series this poller has not seen yet come from the stored result
+        _rate(app, "read", req.client_key)
+        with _heavy(app):
+            got = _stored_vms(app, id, req.hl, since)
+        if got is not None:
+            body["series"] = got[1]
+    return json_response(body, cache="no-store")
 
 
 def delete_job(app: Any, req: Request, rid: str, id: str) -> Response:   # noqa: A002
-    res = app.jobs.unsubscribe(id)
+    res = app.jobs.unsubscribe(id, req.client_key)
     if res is None:
         if app.store.load_result(id) is not None:
             return json_response({"job_id": id, "status": "done"}, 200, cache="no-store")
@@ -317,23 +392,30 @@ def _ai_flags(vm: dict, source_kind: str, ai_on: bool) -> dict:
 
 
 def _envelope(app: Any, area: str, item_id: str, result: dict, hl: str, *, shared: Optional[dict]) -> dict:
-    vms = app.store.read_item_json(area, item_id, f"vm-{hl}.json")
+    with _heavy(app):
+        vms = app.store.read_item_json(area, item_id, f"vm-{hl}.json")
+    missing = WebError("share_not_found" if shared else "result_not_found")
     if not isinstance(vms, dict):
-        raise WebError("share_not_found" if shared else "result_not_found")
+        raise missing
     base = f"/api/export/s/{item_id}" if shared else f"/api/export/{item_id}"
-    available = result.get("available") or {}
-    flags_series = available.get("series") or []
+    # stored documents are written atomically by this app; a file with the right syntax but the wrong shape
+    # (external corruption) is treated as absent, never as a 500
+    available = _dict(result.get("available"))
+    flags_series = _list(available.get("series"))
     ai_on = app.ai_enabled()
     series = []
-    for vm in vms.get("series") or []:
+    for vm in _list(vms.get("series")):
+        if not isinstance(vm, dict) or isinstance(vm.get("index"), bool) or not isinstance(vm.get("index"), int):
+            LOGGER.warning("stored VM document of an %s item has an unexpected shape", area[:-1])
+            raise missing
         k = int(vm.get("index", 0))
         out = viewmodel.attach_ai(vm, app.store.read_ai(area, item_id, k, hl))
         if shared:
             out = viewmodel.make_shared_vm(out)
         else:
             out = _ai_flags(out, result.get("source_kind", ""), ai_on)
-        flags = flags_series[k] if k < len(flags_series) and flags_series[k] else {}
-        out["exports"] = viewmodel.link_exports(out.get("exports") or {}, flags, base, k)
+        flags = _dict(flags_series[k]) if 0 <= k < len(flags_series) else {}
+        out["exports"] = viewmodel.link_exports(_dict(out.get("exports")), flags, base, k)
         series.append(out)
     return {
         "result_id": None if shared else item_id,
@@ -341,12 +423,12 @@ def _envelope(app: Any, area: str, item_id: str, result: dict, hl: str, *, share
         "expires_at": shared["expires_at"] if shared else result.get("expires_at"),
         "readonly": bool(shared),
         "view": result.get("view", "detail"),
-        "query": copy.deepcopy(result.get("query") or {}),
+        "query": copy.deepcopy(_dict(result.get("query"))),
         "series": series,
-        "failed": copy.deepcopy((result.get("failed") or {}).get(hl, [])),
-        "compare": vms.get("compare"),
-        "notices": vms.get("notices") or [],
-        "exports": viewmodel.link_exports(vms.get("exports") or {}, available.get("result") or {}, base),
+        "failed": copy.deepcopy(_list(_dict(result.get("failed")).get(hl))),
+        "compare": vms.get("compare") if isinstance(vms.get("compare"), dict) else None,
+        "notices": _list(vms.get("notices")),
+        "exports": viewmodel.link_exports(_dict(vms.get("exports")), _dict(available.get("result")), base),
     }
 
 
@@ -369,23 +451,27 @@ def post_share(app: Any, req: Request, rid: str) -> Response:
         raise WebError("result_not_found")
     if result.get("source_kind") not in _UPLOAD_KINDS:
         raise WebError("share_not_needed")
+    # the snapshot hard-links the result's files (a second share of one result costs no second copy); shares are
+    # never size-evicted, so they have a quota of their own and need free disk space
+    _refuse_when_disk_full(app)
+    used, added = app.store.share_usage(result_id)
+    if used + added > SHARE_QUOTA_RATIO * app.config.store_max_mb * 1024 * 1024:
+        LOGGER.warning("share refused: shares use %d MB of their %d MB quota", int(used / 1024 / 1024),
+                       int(SHARE_QUOTA_RATIO * app.config.store_max_mb))
+        raise _store_full()
     share_id = secrets.token_urlsafe(16)
     token = secrets.token_urlsafe(16)
     now = app.clock()
     expires = now + _dt.timedelta(seconds=app.config.share_ttl_s)
     snapshot = {k: v for k, v in result.items() if k != "result_id"}
-    files: dict[str, Any] = {}
-    for name, content in app.store.item_files("results", result_id):
-        if name.startswith("llm-") or name == "result.json":
-            continue       # no LLM payloads in a share (C.8); result.json lives inside share.json
-        files[name] = content
-    for name, content in app.store.ai_files(result_id):
-        files[name] = content
-    files["share.json"] = {"schema": result.get("schema"), "share_id": share_id, "created_at": utc_iso(now),
-                           "expires_at": utc_iso(expires),
-                           "delete_token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
-                           "result": snapshot}
-    app.store.save_dir("shares", share_id, files)
+    # no LLM payloads in a share (C.8); result.json lives inside share.json
+    links = app.store.share_sources(result_id)
+    files: dict[str, Any] = {
+        "share.json": {"schema": result.get("schema"), "share_id": share_id, "created_at": utc_iso(now),
+                       "expires_at": utc_iso(expires),
+                       "delete_token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
+                       "result": snapshot}}
+    app.store.save_dir("shares", share_id, files, links=links)
     return json_response({"share_id": share_id, "url": f"/s/{share_id}", "expires_at": utc_iso(expires),
                           "delete_token": token}, 201, cache="no-store")
 
@@ -443,19 +529,25 @@ def _file_response(f: Any) -> Response:
 
 def _vm_doc(app: Any, area: str, item: str, hl: str) -> dict:
     doc = app.store.read_item_json(area, item, f"vm-{hl}.json")
-    if not isinstance(doc, dict):
+    if not isinstance(doc, dict) or not all(isinstance(v, dict) for v in _list(doc.get("series"))):
         raise WebError("not_found")
     return doc
 
 
-def _result_name(vms: list) -> str:
-    names = [str(v.get("name", "")) for v in sorted(vms, key=lambda v: int(v.get("index", 0)))]
-    return " vs ".join(names)[:80]
+def _result_name(vms: list, lang: str) -> str:
+    """The whole-result display name of HTML/JSON exports: the same rule as the CSV/XLSX ones (exports.py)."""
+    return exports._result_name(sorted(vms, key=lambda v: int(v.get("index", 0))), lang)
 
 
 def export_file(app: Any, req: Request, rid: str, fmt: str, id: Optional[str] = None,   # noqa: A002
                 sid: Optional[str] = None, k: Optional[str] = None) -> Response:
     _rate(app, "export", req.client_key)
+    with _heavy(app):
+        return _export_file(app, req, fmt, id, sid, k)
+
+
+def _export_file(app: Any, req: Request, fmt: str, id: Optional[str], sid: Optional[str],   # noqa: A002
+                 k: Optional[str]) -> Response:
     area, item, result = _export_source(app, id, sid)
     hl = req.hl
     available = result.get("available") or {}
@@ -506,9 +598,11 @@ def export_file(app: Any, req: Request, rid: str, fmt: str, id: Optional[str] = 
             html = app.store.read_item_text(area, item, name) if name else None
             if html is None:
                 raise WebError("not_found")
-            return _file_response(exports.html_export(html, file_id=item, k=None, display_name=_result_name(vms)))
+            return _file_response(exports.html_export(html, file_id=item, k=None,
+                                                      display_name=_result_name(vms, hl)))
         store_doc = app.store.read_item_json(area, item, f"export-{hl}.json") or {}
-        return _file_response(exports.json_export(store_doc, file_id=item, k=None, display_name=_result_name(vms)))
+        return _file_response(exports.json_export(store_doc, file_id=item, k=None,
+                                                  display_name=_result_name(vms, hl)))
     except exports.ExportUnavailable as exc:
         raise WebError(exc.code, exc.status) from None
 
@@ -519,13 +613,15 @@ def export_values(app: Any, req: Request, rid: str, id: Optional[str] = None,   
     area, item, result = _export_source(app, id, sid)
     if result.get("view") != "compare":
         raise WebError("not_found")
-    if not (result.get("available") or {}).get("result", {}).get("values_csv"):
+    if not _dict(_dict(result.get("available")).get("result")).get("values_csv"):
         raise _unavailable(result, "values_csv")
-    doc = _vm_doc(app, area, item, req.hl)
-    try:
-        return _file_response(exports.values_csv(list(doc.get("series") or []), doc.get("compare"), file_id=item))
-    except exports.ExportUnavailable as exc:
-        raise WebError(exc.code, exc.status) from None
+    with _heavy(app):
+        doc = _vm_doc(app, area, item, req.hl)
+        try:
+            return _file_response(exports.values_csv(list(doc.get("series") or []), doc.get("compare"),
+                                                     file_id=item))
+        except exports.ExportUnavailable as exc:
+            raise WebError(exc.code, exc.status) from None
 
 
 # --------------------------------------------------------------------------- C.11 narrative

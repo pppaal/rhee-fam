@@ -2852,3 +2852,97 @@ def test_intermittent_mean_and_probability_disagreement_is_explained():
     line_en = next(ln for ln in en.narrative.split("\n") if "Probability that" in ln)
     assert "큰 주문이 평균을 끌어올리므로" in line_ko
     assert "a few large orders lift the average" in line_en
+
+
+# --------------------------------------------------------------------------- plain wording for the web (FU-8)
+
+#: statistical jargon the web's reader must not meet in the narrative (brief §4.6; FU-8)
+_JARGON = ("Mann-Kendall", "τ", "p <", "p =", "z =", "z >", "z <", "MASE", "CAGR", "무작위 행보", "random walk",
+           "모델 ID", "model ids", "변동계수", "coefficient of variation", "%p", " pp", "변화 강도")
+_PHASE_PCT = re.compile(r"(?:판단 |단계\()신뢰도 [<>]?\d+%|\(confidence [<>]?\d+%|confidence [<>]?\d+%\)")
+
+
+def _plain_cases():
+    rng = np.random.default_rng(3)
+    walk = pd.Series(np.cumsum(rng.normal(0, 1, 120)) + 50,
+                     index=pd.date_range("2016-01-01", periods=120, freq="MS"), name="walk")
+    spiky = sample("seasonal").copy()
+    spiky.iloc[40] *= 3                                                        # an anomaly line with a z-score
+    inter = pd.Series(rng.choice([0, 0, 0, 1, 2, 9], 104).astype(float),
+                      index=pd.date_range("2022-01-02", periods=104, freq="W-SUN"), name="inter")
+    return {"growing": sample("growing"), "emerging": sample("emerging"), "volatile": sample("volatile"),
+            "walk": walk, "spiky": spiky, "inter": inter,
+            "short": pd.Series([1, 3, 2, 5, 6, 8.0], index=pd.date_range("2024-01-01", periods=6, freq="MS"))}
+
+
+@pytest.fixture(scope="module")
+def plain_reports():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from trendai import pipeline
+        return {k: pipeline.run(s, name=k) for k, s in _plain_cases().items()}
+
+
+def test_plain_language_removes_statistical_jargon(plain_reports):
+    for name, rep in plain_reports.items():
+        texts = {"ko": rep.narrative, "en": generate_narrative(*_parts(rep), lang="en")[0]}
+        for lang, text in texts.items():
+            plain = nv.plain_language(text, lang)
+            for line in plain.splitlines():
+                assert not [j for j in _JARGON if j in line], (name, lang, line)
+                assert not _PHASE_PCT.search(line), (name, lang, line)
+            # same structure: every heading and bullet survives, nothing else is rewritten
+            assert [ln[:2] for ln in plain.splitlines()] == [ln[:2] for ln in text.splitlines()], name
+    # the engine text itself (CLI, HTML report) is unchanged
+    assert "Mann-Kendall" in plain_reports["growing"].narrative
+
+
+def test_plain_language_rewrites():
+    ko = ("**한눈에 보기** — x: 현재 **성장기** 단계(신뢰도 57%)이며, 향후 12개월 동안 **+7.9%** 변화(상승)가 "
+          "예상됩니다. 상승 확률 99%, 예측 신뢰도 높음.\n"
+          "- Mann-Kendall 검정에서 통계적으로 유의한 **상승** 추세가 확인됩니다 (τ = 0.95, 자기상관 보정 p < 0.001). "
+          "장기 평균 기울기는 +0.71/월입니다.\n"
+          "- 현재 국면은 **성장기**입니다 (판단 신뢰도 95%).\n"
+          "- 근거: 변화가 누적되는 무작위 행보에 가까운 움직임이라, 추세처럼 보이는 등락도 우연일 수 있습니다.\n"
+          "- 2021-04: 실제 44.4, 예상 50.7 (−12.4%, z > +100) — 예상보다 크게 낮았던 일시적 급락\n"
+          "- 모멘텀(최근 기울기 − 장기 기울기, 현재 추세 수준 대비)은 +0.13%p/월이며, 장기 평균보다 빠른 속도로 "
+          "성장하고 있습니다 (가속).\n"
+          "- 정확도: 오차가 **약 55%** 작았습니다. (기술 참고: 백테스트 MASE 0.29 — 상대 오차입니다.)\n"
+          "- 예측 방법: 3개 모델 앙상블. (모델 ID: linear_trend, holt)")
+    assert nv.plain_language(ko, "ko").splitlines() == [
+        "**한눈에 보기** — x: 현재 **성장기** 단계(판단 확신도 보통)이며, 향후 12개월 동안 **+7.9%** 변화(상승)가 "
+        "예상됩니다. 상승 확률 99%, 예측 신뢰도 높음.",
+        "- 전체 기간에 걸친 **상승** 흐름이 우연으로 보기 어려울 만큼 꾸준합니다. 장기 평균 기울기는 +0.71/월입니다.",
+        "- 현재 국면은 **성장기**입니다 (판단 확신도 높음).",
+        "- 근거: 오르내림이 우연히 쌓여 생긴 움직임에 가까워, 추세처럼 보이는 등락도 우연일 수 있습니다.",
+        "- 2021-04: 실제 44.4, 예상 50.7 (−12.4%) — 예상보다 크게 낮았던 일시적 급락",
+        "- 모멘텀으로 보면 장기 평균보다 빠른 속도로 성장하고 있습니다 (가속).",
+        "- 정확도: 오차가 **약 55%** 작았습니다.",
+        "- 예측 방법: 3개 모델 앙상블.",
+    ]
+    en = ("**At a glance** — x: currently **Growing** (confidence 33%); over the next 12 months the level is "
+          "expected to change by **+7.9%** (upward). Probability of increase 99%, forecast confidence high.\n"
+          "- Evidence: The Mann-Kendall test finds no clear trend over the whole period (p = 0.41).\n"
+          "- From **2022-08**: growth accelerating (slope 0.63 → 0.82/mo, strength 0.10)")
+    assert nv.plain_language(en, "en").splitlines() == [
+        "**At a glance** — x: currently **Growing** (phase certainty: low); over the next 12 months the level is "
+        "expected to change by **+7.9%** (upward). Chance of rise 99%, forecast reliability high.",
+        "- Evidence: Over the whole period there is no clear direction.",
+        "- From **2022-08**: growth accelerating (slope 0.63 → 0.82/mo)",
+    ]
+    assert nv.plain_language("", "ko") == "" and nv.plain_language("평범한 문장입니다.", "ko") == "평범한 문장입니다."
+
+
+def test_phase_reason_kind_marks_caveats():
+    walk = "변화가 누적되는 무작위 행보에 가까운 움직임이라, 추세처럼 보이는 등락도 우연일 수 있습니다."
+    no_trend = "Mann-Kendall 검정에서 전체 기간의 뚜렷한 추세가 확인되지 않습니다 (p = 0.4)."
+    up = "Mann-Kendall 검정에서 전체 기간의 상승 추세가 유의합니다 (τ = 0.95, p < 0.001)."
+    assert nv.phase_reason_kind(walk, "growing") == "caveat"
+    assert nv.phase_reason_kind(walk, "volatile") == "support"
+    assert nv.phase_reason_kind(nv.translate_reason(walk), "declining") == "caveat"
+    assert nv.phase_reason_kind(no_trend, "growing") == "caveat"
+    assert nv.phase_reason_kind(no_trend, "stable") == "support"
+    assert nv.phase_reason_kind(up, "growing") == "support"
+    assert nv.phase_reason_kind(up, "declining") == "caveat"
+    assert nv.phase_reason_kind("관측치가 6개뿐이라 국면을 판단하기에 데이터가 부족합니다.", "stable") == "caveat"
+    assert nv.phase_reason_kind("최근 18개월 동안 추세가 +13.4% 변했습니다.", "growing") == "support"

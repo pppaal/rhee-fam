@@ -159,6 +159,7 @@ def test_naver_ip_limit(client, app):
         resp = client.post("/api/analyze", json=naver([f"단어{i}"]))
         assert resp.status == 202
         first = first or resp.json()["job_id"]
+        client.wait_job(resp.json()["job_id"])          # one client may own only 3 active jobs (SEC-5)
     resp = client.post("/api/analyze", json=naver(["단어9"]))
     assert resp.status == 429
     err = resp.json()["error"]
@@ -177,7 +178,9 @@ def test_naver_ip_limit_low_budget(make):
         app.naver_budget.reserve()
     c = TestClient(app)
     for i in range(5):
-        assert c.post("/api/analyze", json=naver([f"낮음{i}"])).status == 202
+        resp = c.post("/api/analyze", json=naver([f"낮음{i}"]))
+        assert resp.status == 202
+        c.wait_job(resp.json()["job_id"])
     err = c.post("/api/analyze", json=naver(["낮음9"])).json()["error"]
     assert err["code"] == "naver_rate_limited" and err["params"] == {"limit": 5}
 

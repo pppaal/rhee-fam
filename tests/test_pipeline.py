@@ -512,3 +512,22 @@ def test_json_prob_increase_follows_the_shared_rule():
         rep = pipeline.run(pd.Series(np.arange(36.0) + 10, index=idx), freq="M")
     out = json.loads(pipeline.report_to_json(rep))["outlook"]
     assert out["prob_increase"] == pytest.approx(rep.outlook.prob_increase) and out["prob_increase_undefined"] is None
+
+
+def test_run_keeps_the_interpolated_periods():
+    """FU-5: the periods prepare() filled are listed on analysis.series -- also when the series was prepared
+    before (the web app prepares, then runs the pipeline), so no surface shows them as observations."""
+    from trendai.data import INTERPOLATED_ATTR, collect_notices, prepare
+
+    g = sample("growing").copy()
+    g.iloc[[10, 50]] = np.nan
+    with collect_notices():
+        rep = pipeline.run(g, horizon=6)
+        prepared, freq = prepare(g)
+        again = pipeline.run(prepared, freq=freq, horizon=6)
+    want = [f"{g.index[10]:%Y-%m-%d}", f"{g.index[50]:%Y-%m-%d}"]
+    assert rep.analysis.series.attrs[INTERPOLATED_ATTR] == want
+    assert again.analysis.series.attrs[INTERPOLATED_ATTR] == want
+    with collect_notices():
+        clean = pipeline.run(sample("growing"), horizon=6)
+    assert clean.analysis.series.attrs[INTERPOLATED_ATTR] == []

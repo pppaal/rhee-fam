@@ -63,7 +63,7 @@ __all__ = [
 
 #: VM schema version (spec section 0). Part of every result-cache key (E.10) and stored in results/shares (E.7).
 #: WP1-vm bumps it whenever the output of any builder in this module changes in any way.
-WEB_VM_SCHEMA: int = 1
+WEB_VM_SCHEMA: int = 2
 
 LANGS: tuple[str, ...] = ("ko", "en")
 
@@ -127,6 +127,45 @@ _STATS_RX = re.compile(r"\s*\(([^()]*(?:τ|p\s*[<=>]|t\s*=|MK|Mann)[^()]*)\)\.?$
 _STRENGTH_EDGES = ((0.5, "large"), (0.2, "medium"))
 #: how many changepoints get a badge on the chart (the largest by magnitude, D.2.6)
 _CHART_CHANGEPOINTS = 5
+#: momentum (%p per period) below this size is float noise or invisibly small: printed ``0%p`` on the tile and the
+#: ranking (the narrative prints it ``0.00%p``), never ``−1.5×10⁻¹⁵%p`` (UX-5, CON-6)
+_MOMENTUM_ZERO = 0.005
+#: an anomaly whose actual and expected values differ by less than this share of the level is worded "slightly"
+#: (``평소보다 약간``) -- a near noise-free series flags sub-percent deviations (UX-23)
+_ANOMALY_SMALL_REL = 0.02
+#: a flat outlook whose raw forecast window moves this much (%) against the current level gets the seasonal context
+_SEASON_FLAT_PCT = 10.0
+#: raw table values of this size are printed compact (만/억/조, K/M/B) in the forecast table, like the scenario boxes
+_TABLE_COMPACT_FROM = 1e6
+#: phase reasons that argue *against* the call (``kind = "caveat"``, D.2.5): the random-walk caveat of
+#: ``analysis.py`` (ko original; the English text is its ``translate_reason`` output)
+_CAVEAT_MARKERS = ("무작위 행보", "random walk")
+#: "최근 39주 동안 추세가 …" (the phase-judgement window, analysis.phase_window) and its English translation
+_REASON_WINDOW_KO = re.compile(r"^(최근 [\d,]+(?:일|주|개월|분기|년)) (동안 추세)")
+_REASON_WINDOW_EN = re.compile(r"^(Over the last [\d,]+ (?:days?|weeks?|months?|quarters?|years?))(,? the trend)")
+#: rule-based narrative post-processing (UX-13, CON-9): the phase certainty is a word, never ``신뢰도 95%`` next to
+#: ``상승 확률``/``예측 신뢰도``; MASE notes, model ids and test statistics live in the 자세히 blocks, not the body
+_NARR_TENTATIVE_KO = re.compile(r"잠정 판단입니다\(신뢰도 [<>]?\d+%\)")
+_NARR_TENTATIVE_KO2 = re.compile(r", 신뢰도 [<>]?\d+%\)")
+_NARR_CONF_KO = re.compile(r"\((?:판단 )?신뢰도 [<>]?\d+%\)")
+_NARR_TENTATIVE_EN = re.compile(r"tentative call \(confidence [<>]?\d+%\)")
+_NARR_TENTATIVE_EN2 = re.compile(r"; confidence [<>]?\d+%\)")
+_NARR_CONF_EN = re.compile(r"\(confidence [<>]?\d+%\)")
+_NARR_DROP = (
+    re.compile(r"\s*\(기술 참고: 백테스트 MASE[^()]*\)"),
+    re.compile(r"\s*\(Technical note: backtest MASE[^()]*\)"),
+    re.compile(r"\s*\(모델 ID: [^()]*\)"),
+    re.compile(r"\s*\(model ids: [^()]*\)"),
+    re.compile(r"\s*\([^()]*(?:τ\s*=|\bp\s*[<=>]\s*\d)[^()]*\)"),
+)
+_NARR_WORDS = (
+    ("(잔차의 변동계수)", ""), (" (residual coefficient of variation)", ""),
+    ("Probability of increase", "Chance of rise"), ("forecast confidence", "forecast reliability"),
+    ("Forecast confidence", "Forecast reliability"),
+)
+#: 합니다체 endings of the engine's undefined-change sentences -> 해요체 (D.2.3: hero sentences are 해요체; CON-14)
+_HAEYO = (("않았습니다.", "않았어요."), ("없습니다.", "없어요."), ("있습니다.", "있어요."), ("됩니다.", "돼요."),
+          ("했습니다.", "했어요."), ("합니다.", "해요."))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -343,8 +382,20 @@ def make_notice(code: str, lang: str, *, params: Optional[Mapping[str, Any]] = N
         fix_list = [fix_object(a) for a in actions]
     else:
         fix_list = [copy.deepcopy(dict(f)) for f in fixes]
-    return {"code": code, "level": level, "text": _render(code, params, lang),
+    return {"code": code, "level": level, "text": _notice_text(code, params, lang),
             "series_index": series_index, "fixes": fix_list[:3]}
+
+
+def _notice_text(code: str, params: Optional[Mapping[str, Any]], lang: str) -> str:
+    """``messages.render_web`` text; ``horizon_long`` with a ``freq`` param names the horizon with the page's span
+    word (``예측 기간(36개월)``) instead of the catalog's ``36기간`` / ``36 periods`` (D.1.6; CON-14)."""
+    text = _render(code, params, lang)
+    p = dict(params or {})
+    if code == "horizon_long" and p.get("freq") in FREQS and _finite(p.get("horizon")) is not None:
+        h = int(p["horizon"])
+        generic = f"({h:,} periods)" if _lang(lang) == "en" else f"({h:,}기간)"
+        text = text.replace(generic, f"({fmt.span_label(h, str(p['freq']), _lang(lang))})", 1)
+    return text
 
 
 def notice_from_warning(warning: Warning, lang: str, *, series_index: Optional[int] = None) -> dict:
@@ -599,6 +650,83 @@ class _Facts:
         self.fc_dates = _isos(f.mean.index)
         self.phase_name = T.t(T.PHASE_SHORT, a.phase.label, lang) if a.phase.label in T.PHASE_SHORT \
             else str(a.phase.label)
+        self.adjust_note, self.season_shift = self._seasonal_adjustment()
+
+    # ---- seasonally adjusted outlook (FU-3) ------------------------------------------------------------------------
+    def _seasonal_adjustment(self) -> tuple[Optional[str], Optional[str]]:
+        """``(adjust_note, season_shift)``.
+
+        ``adjust_note``: why ``계절 보정한`` stands in the basis (a window covers only part of a season, so the engine
+        removed that window's average seasonal swing; ``report._adjustment_note`` in 해요체 / English), else ``None``.
+        ``season_shift``: ``"low"`` / ``"high"`` when the comparison is adjusted and the *raw* forecast window moves
+        against the call shown -- an up call while the drawn forecast falls into the off-season (``"low"``), a down
+        call while it climbs into the season (``"high"``), or a flat call while it moves by 10 % or more -- else
+        ``None``. The hero, the summary line and the rank card then say so, so the headline and the falling dashed
+        line no longer contradict each other."""
+        import numpy as np
+
+        from .. import report as R
+
+        try:
+            k_fut, k_cur, _h, period, adj_fut, adj_cur = R._outlook_windows(self.report, self.d)
+        except Exception:  # noqa: BLE001 - hand-made / partial reports: no adjustment to explain
+            return None, None
+        if period is None or not (adj_fut or adj_cur):
+            return None, None
+        lang = self.lang
+        def span(k: int) -> str:            # ko 26주; en 26-week (an adjective before "window")
+            if lang != "en":
+                return fmt.span_label(k, self.freq, lang)
+            return fmt.span_label(1, self.freq, "en").replace("1 ", f"{k:,}-", 1)
+
+        spans = list(dict.fromkeys(span(k) for k, adj in ((k_fut, adj_fut), (k_cur, adj_cur)) if adj))
+        note = T.t(T.SEASON_TEXTS, "adjust_note", lang,
+                   spans=T.t(T.SEASON_TEXTS, "spans_sep", lang).join(spans),
+                   window=T.t(T.SEASON_TEXTS, "window_one" if len(spans) == 1 else "window_many", lang),
+                   period=fmt.span_label(period, self.freq, lang))
+        if self.change is None or k_fut < 1 or k_cur < 1:
+            return note, None
+        fut = np.asarray(self.f.mean, dtype=float)[-k_fut:]
+        cur = np.asarray(self.a.series, dtype=float)[-k_cur:]
+        fut, cur = fut[np.isfinite(fut)], cur[np.isfinite(cur)]
+        if not len(fut) or not len(cur):
+            return note, None
+        fut_raw, cur_raw = float(np.mean(fut)), float(np.mean(cur))
+        if not cur_raw > 0:
+            return note, None
+        raw_pct = (fut_raw - cur_raw) / cur_raw * 100.0
+        direction = str(self.o.direction)
+        shift = None
+        if direction == "up" and not (self.flat_word or self.uncertain) and raw_pct < 0:
+            shift = "low"
+        elif direction == "down" and not (self.flat_word or self.uncertain) and raw_pct > 0:
+            shift = "high"
+        elif (self.flat_word or self.uncertain or direction == "flat") and abs(raw_pct) >= _SEASON_FLAT_PCT:
+            shift = "low" if raw_pct < 0 else "high"
+        return note, shift
+
+    def season_context(self) -> Optional[str]:
+        """The second hero sentence for :attr:`season_shift` (``None`` without one)."""
+        if self.season_shift is None:
+            return None
+        lang = self.lang
+        if self.flat_word:
+            flow = "flow_flat"
+        elif self.uncertain or str(self.o.direction) not in ("up", "down"):
+            flow = "flow_uncertain"
+        else:
+            flow = "flow_up" if str(self.o.direction) == "up" else "flow_down"
+        peak = ""
+        if self.peak is not None and not self.peak["weekday"]:
+            peak = T.t(T.SEASON_TEXTS, "peak", lang, peak=self.peak["peak"])
+        return T.t(T.SEASON_TEXTS, f"context_{self.season_shift}", lang, h=self.h_label,
+                   topic=_topic_particle(self.h_label), peak=peak, flow=T.t(T.SEASON_TEXTS, flow, lang))
+
+    def season_short(self) -> str:
+        """`` · 앞으로 계절적 비수기`` / `` · seasonal low ahead`` for the summary line and the rank card, or ``""``."""
+        if self.season_shift is None:
+            return ""
+        return T.t(T.SEASON_TEXTS, f"short_{self.season_shift}", self.lang)
 
     # ---- tile 2 / ranking: recent change -------------------------------------------------------------------------
     def recent_basis(self) -> str:
@@ -642,7 +770,10 @@ class _Facts:
         if self.momentum_undefined() is not None:
             return fmt.DASH
         unit = T.t(T.MOMENTUM_UNITS, self.freq, self.lang) if self.freq in T.MOMENTUM_UNITS else ""
-        return fmt.pp(self.a.metrics.momentum, self.lang) + unit
+        mom = _finite(self.a.metrics.momentum)
+        if mom is not None and abs(mom) < _MOMENTUM_ZERO:     # float noise / invisibly small: 0%p, as the narrative
+            mom = 0.0
+        return fmt.pp(mom, self.lang) + unit
 
     def momentum_word(self) -> str:
         import numpy as np
@@ -760,6 +891,7 @@ def _outlook_line(direction: str, word: str, prob: Optional[float], reason: Opti
     """The hero/ranking outlook line (D.2.3): the number in brackets is always P(rise) and says so."""
     lang = _lang(lang)
     arrow = {"up": "▲", "down": "▼"}.get(direction, "▶")
+    word = _cap(word, lang)                 # English: the first word after the arrow starts the line (CON-14)
     if prob is None:
         return T.t(T.HERO_TEXTS, "line_not_computed", lang, arrow=arrow, word=word, reason=reason or "")
     like = fmt.likelihood(prob, lang)
@@ -817,11 +949,15 @@ def _hero(fx: _Facts) -> dict:
     else:
         nc = fx.nochange
         if nc is not None:
-            sentence = nc.sentence + (f" ({nc.levels})" if nc.levels else "")
+            head = _haeyo(nc.sentence) if lang == "ko" else nc.sentence
+            sentence = head + (f" ({nc.levels})" if nc.levels else "")
             change_undefined = {"code": nc.code, "reason": nc.short, "levels": nc.levels or None}
         else:   # pragma: no cover - _change_undefined always explains a missing change
             sentence = fx.change_reason() or ""
             change_undefined = {"code": None, "reason": fx.change_reason(), "levels": None}
+    context = fx.season_context()
+    if context:                             # FU-3: the drawn forecast moves against the adjusted call
+        sentence = f"{sentence} {context}"
     confidence = str(fx.o.confidence) if fx.o.confidence in T.RELIABILITY_LABELS else "low"
     return {
         "title": fx.report.name,
@@ -831,24 +967,43 @@ def _hero(fx: _Facts) -> dict:
         "change_undefined": change_undefined,
         "reliability": {"level": confidence, "label": T.t(T.RELIABILITY_LABELS, confidence, lang)},
         "accuracy_line": _accuracy_line(fx.skill, fx.mase, lang),
-        "reference_note": (T.t(T.REFERENCE_NOTES, fx.display, lang) if fx.display != "normal" else None),
+        "reference_note": (T.t(T.REFERENCE_NOTES, _reference_key(fx), lang) if fx.display != "normal" else None),
     }
+
+
+def _reference_key(fx: _Facts) -> str:
+    """``REFERENCE_NOTES`` key: ``bands_only``; ``weak`` (low reliability) or ``weak_unverified`` (no backtest skill
+    although the reliability is not low -- "신뢰도가 낮아" would contradict the chip, CON-5)."""
+    if fx.display == "weak" and fx.skill is None and str(fx.o.confidence) != "low":
+        return "weak_unverified"
+    return fx.display
 
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Phase (D.2.5)
 # ---------------------------------------------------------------------------------------------------------------------
 
-def _reason_item(text: str, freq: str, lang: str) -> dict:
-    """A phase reason: ISO dates rewritten (no links), trailing test statistics moved to ``detail``."""
+def _reason_item(text: str, freq: str, lang: str, kind: str = "support") -> dict:
+    """A phase reason: ISO dates rewritten (no links), trailing test statistics moved to ``detail``, the window of
+    the "최근 N 동안 추세가 …" reason labelled as the phase-judgement window (FU-7) and ``kind`` ``"support"`` or
+    ``"caveat"`` (a reason that argues against the call, rendered without the ✓; UX-7)."""
     text, _ = localize_dates(text, freq, lang, ())
+    label = T.t(T.PHASE_TEXTS, "window_label", lang)
+    if lang == "en":
+        text = _REASON_WINDOW_EN.sub(lambda m: m.group(1) + label + m.group(2), text, count=1)
+    else:
+        text = _REASON_WINDOW_KO.sub(lambda m: m.group(1) + label + " " + m.group(2), text, count=1)
     m = _STATS_RX.search(text)
     if m is None:
-        return {"text": text, "detail": None}
+        return {"text": text, "detail": None, "kind": kind}
     head = text[:m.start()].rstrip()
     if m.group(0).endswith(".") and not head.endswith("."):
         head += "."
-    return {"text": head, "detail": m.group(1).strip()}
+    return {"text": head, "detail": m.group(1).strip(), "kind": kind}
+
+
+def _reason_kind(text: str) -> str:
+    return "caveat" if any(k in str(text) for k in _CAVEAT_MARKERS) else "support"
 
 
 def _phase(fx: _Facts, hero: dict) -> dict:
@@ -859,13 +1014,15 @@ def _phase(fx: _Facts, hero: dict) -> dict:
     ph = fx.a.phase
     label = str(ph.label)
     if lang == "en":
-        reasons = [r2 for r2 in (N.translate_reason(r) for r in ph.reasons) if r2]
-        items = [_reason_item(r, fx.freq, lang) for r in reasons] or [
-            {"text": T.t(T.PHASE_TEXTS, "reasons_fallback", "en"), "detail": None}]
+        pairs = [(r2, _reason_kind(r)) for r2, r in ((N.translate_reason(r), r) for r in ph.reasons) if r2]
+        items = [_reason_item(r, fx.freq, lang, kind) for r, kind in pairs] or [
+            {"text": T.t(T.PHASE_TEXTS, "reasons_fallback", "en"), "detail": None, "kind": "support"}]
         name_long = N.PHASE_EN.get(label, label)
     else:
-        items = [_reason_item(str(r), fx.freq, lang) for r in ph.reasons]
+        items = [_reason_item(str(r), fx.freq, lang, _reason_kind(r)) for r in ph.reasons]
         name_long = PHASE_KO.get(label, label)
+    # supporting reasons first, caveats after them (stable within each group)
+    items = [x for x in items if x["kind"] == "support"] + [x for x in items if x["kind"] == "caveat"]
     conf = _finite(ph.confidence) or 0.0
     if fx.tentative:
         level, cert_key = "low", "tentative"
@@ -923,8 +1080,11 @@ def _tiles(fx: _Facts, hero: dict, phase: dict) -> list[dict]:
     else:
         tiles.append(_tile("momentum", lang, fmt.DASH, sub="", undefined_reason=mom_why))
 
-    # 4 expected change
+    # 4 expected change (the tooltip explains a seasonally adjusted basis, FU-3)
     basis = hero["basis"]
+    help_text = T.t(T.TILE_HELP, "expected_change", lang)
+    if fx.adjust_note:
+        help_text += " " + fx.adjust_note
     if fx.change is not None:
         if fx.uncertain or fx.flat_word:
             value, tone = fmt.pct(fx.change), "neutral"
@@ -933,13 +1093,16 @@ def _tiles(fx: _Facts, hero: dict, phase: dict) -> list[dict]:
             value = fmt.pct_arrow(fx.change)
             tone = "neutral" if value == "0%" else ("up" if fx.change > 0 else "down")
             sub = basis
-        tiles.append(_tile("expected_change", lang, value, sub=sub + ref_suffix, tone=tone, value_raw=fx.change))
+        tiles.append(_tile("expected_change", lang, value, sub=sub + ref_suffix, tone=tone, tooltip=help_text,
+                           value_raw=fx.change))
     else:
-        tiles.append(_tile("expected_change", lang, fmt.DASH, sub=basis + ref_suffix,
+        tiles.append(_tile("expected_change", lang, fmt.DASH, sub=basis + ref_suffix, tooltip=help_text,
                            undefined_reason=fx.change_reason()))
 
     # 5 chance of rise
     help_text = T.t(T.TILE_HELP, "prob_increase", lang)
+    if fx.adjust_note:
+        help_text += " " + T.t(T.TILE_TEXTS, "prob_adjusted", lang)
     if fx.prob is not None:
         tooltip = help_text + " " + T.t(T.TILE_TEXTS, "prob_exact_suffix", lang,
                                         prob_exact=fmt.prob_exact(fx.prob, lang))
@@ -1052,14 +1215,15 @@ def _chart(fx: _Facts, hero: dict) -> dict:
         iso = _iso(an.date)
         z = _finite(an.zscore) or 0.0
         direction = "up" if z >= 0 else "down"
+        v_text, e_text = fmt.value_text(an.value, kind, lang), fmt.value_text(an.expected, kind, lang)
         anomalies.append({
             "date": iso, "date_label": fmt.date_short(iso, freq, lang), "value": _num(an.value),
             "expected": _num(an.expected), "direction": direction,
-            "text": T.t(T.CHART_TEXTS, "anomaly_text", lang,
-                        direction=T.t(T.CHART_TEXTS, f"anomaly_{direction}", lang),
-                        v=fmt.value_text(an.value, kind, lang),
+            "text": T.t(T.CHART_TEXTS, "anomaly_text_small" if _small_anomaly(an, v_text, e_text) else
+                        "anomaly_text", lang,
+                        direction=T.t(T.CHART_TEXTS, f"anomaly_{direction}", lang), v=v_text,
                         expected_word=T.t(T.CHART_TEXTS, "usual_size" if intermittent else "expected", lang),
-                        e=fmt.value_text(an.expected, kind, lang))})
+                        e=e_text)})
 
     start, end = (dates[0], dates[-1]) if dates else (fx.meta.start, fx.meta.end)
     end_shown = _iso(pd.Timestamp(end) + pd.Timedelta(days=6)) if freq == "W" else end
@@ -1089,6 +1253,18 @@ def _chart(fx: _Facts, hero: dict) -> dict:
     }
 
 
+def _small_anomaly(an: Any, v_text: str, e_text: str) -> bool:
+    """An anomaly whose actual and expected values print alike or differ by under 2 % of the level: worded
+    ``평소보다 약간 …`` instead of ``크게`` (a near noise-free series flags tiny deviations; UX-23)."""
+    if v_text == e_text:
+        return True
+    v, e = _finite(an.value), _finite(an.expected)
+    if v is None or e is None:
+        return False
+    level = max(abs(v), abs(e))
+    return level > 0 and abs(v - e) < _ANOMALY_SMALL_REL * level
+
+
 def _chart_desc(fx: _Facts, start: str, end: str) -> str:
     lang = fx.lang
     y0, y1 = start[:4].lstrip("0") or "0", end[:4].lstrip("0") or "0"
@@ -1108,6 +1284,23 @@ def _chart_desc(fx: _Facts, start: str, end: str) -> str:
 def _cap(text: str, lang: str) -> str:
     """Capitalise the first letter of an English phrase that starts a sentence."""
     return text[:1].upper() + text[1:] if lang == "en" and text else text
+
+
+def _topic_particle(word: str) -> str:
+    """Korean topic particle after ``word``: ``은`` after a final consonant (``6개월은``, ``5년은``), else ``는``
+    (``26주는``, ``8분기는``). Non-Hangul endings (digits) take ``는``."""
+    last = word[-1:] if word else ""
+    if "가" <= last <= "힣":
+        return "은" if (ord(last) - 0xAC00) % 28 else "는"
+    return "는"
+
+
+def _haeyo(sentence: str) -> str:
+    """The engine's 합니다체 sentence endings rewritten to 해요체 (``…계산하지 않았습니다.`` -> ``…않았어요.``)."""
+    out = sentence
+    for old, new in _HAEYO:
+        out = out.replace(old, new)
+    return out
 
 
 def _peak_phrase(peak: Mapping[str, Any], lang: str, where: str) -> str:
@@ -1188,12 +1381,15 @@ def _scenarios(fx: _Facts) -> Optional[dict]:
                     T.t(T.SCENARIO_TEXTS, "row_without_pct", lang, label=label, value_text=vtext))
         rows.append({"key": key, "label": label, "value_text": vtext, "pct_text": pct_text, "text": row_text})
     level = _interval_level(fx.f)
+    note = T.t(T.SCENARIO_TEXTS, "note", lang, level=level)
+    if fx.display == "bands_only":          # the base case is the centre line the chart withholds (CON-4)
+        note += T.t(T.SCENARIO_TEXTS, "note_bands_only", lang)
     return {
         "date_label": date_lab,
         "title": T.t(T.SCENARIO_TEXTS, "title", lang, date_label=date_lab),
         "reference": reference,
         "rows": rows,
-        "note": T.t(T.SCENARIO_TEXTS, "note", lang, level=level),
+        "note": note,
     }
 
 
@@ -1205,13 +1401,13 @@ def _interval_level(forecast: Any) -> int:
     return 80 if lv is None else int(lv)
 
 
-def _bound_text(v: Any, kind: str, lang: str, nonnegative: bool) -> str:
+def _bound_text(v: Any, kind: str, lang: str, nonnegative: bool, compact: bool = False) -> str:
     fv = _finite(v)
     if fv is None:
         return fmt.DASH
     if nonnegative and fv <= 0.0:
         return "0"
-    return fmt.value_text(fv, kind, lang)
+    return fmt.value_text(fv, kind, lang, compact=compact)
 
 
 def _future(fx: _Facts) -> dict:
@@ -1219,21 +1415,30 @@ def _future(fx: _Facts) -> dict:
 
     from .. import narrative as N
 
+    import numpy as np
+
     lang, f, freq, kind = fx.lang, fx.f, fx.freq, fx.value_kind
     frame = f.to_frame()
     nonneg = bool(f.nonnegative)
     sep = T.t(T.SCENARIO_TEXTS, "range_sep", lang)
+    # large raw values (won, page views): compact like the scenario boxes, never 4.22×10¹² next to 4.3조 (CON-13)
+    cols = [c for c in ("mean", "lo80", "hi80", "lo95", "hi95") if c in frame.columns]
+    vals = np.asarray(frame[cols], dtype=float).ravel() if cols else np.zeros(0)
+    vals = vals[np.isfinite(vals)]
+    compact = kind not in _INDEX_KINDS and bool(len(vals)) and float(np.max(np.abs(vals))) >= _TABLE_COMPACT_FROM
+    hide_mean = fx.display == "bands_only"  # the chart and its table view withhold the centre line (CON-4)
     rows = []
     def band(rec: Any, level: int) -> str:
         lo, hi = rec.get(f"lo{level}"), rec.get(f"hi{level}")
         if lo is None or hi is None:
             return fmt.DASH
-        return f"{_bound_text(lo, kind, lang, nonneg)}{sep}{_bound_text(hi, kind, lang, nonneg)}"
+        return (f"{_bound_text(lo, kind, lang, nonneg, compact)}{sep}"
+                f"{_bound_text(hi, kind, lang, nonneg, compact)}")
 
     for i, iso in enumerate(fx.fc_dates):
         rec = frame.iloc[i]
         rows.append({"date": iso, "date_label": fmt.date_label(iso, freq, lang),
-                     "mean": _bound_text(rec.get("mean"), kind, lang, nonneg),
+                     "mean": fmt.DASH if hide_mean else _bound_text(rec.get("mean"), kind, lang, nonneg, compact),
                      "range80": band(rec, 80), "range95": band(rec, 95)})
 
     if fx.mase is not None:
@@ -1419,10 +1624,56 @@ def ai_job_narrative(ai: Mapping[str, Any]) -> dict:
             "badge": ai.get("badge"), "model": ai.get("model"), "note": ai.get("note")}
 
 
+def _certainty_word(fx: _Facts) -> str:
+    """``판단 확신도 높음`` / ``phase certainty: high`` -- the phase tile's wording (D.2.5), for the narrative."""
+    conf = _finite(fx.a.phase.confidence) or 0.0
+    level = "high" if conf >= 0.75 else ("medium" if conf >= 0.5 else "low")
+    label = T.t(T.CERTAINTY_LABELS, level, fx.lang)
+    return label[:1].lower() + label[1:] if fx.lang == "en" else label
+
+
+def _tidy_rule_narrative(text: str, fx: _Facts) -> str:
+    """The web's post-processing of the frozen rule-based narrative (UX-13, CON-9, CON-7; spec D.2.9 amendment).
+
+    * Phase certainty as the tile's word, never a percentage beside ``상승 확률``/``예측 신뢰도`` (brief §4.6, R4):
+      ``(신뢰도 57%)`` / ``(판단 신뢰도 95%)`` -> ``(판단 확신도 보통)``; tentative calls drop the number;
+      English ``(confidence 57%)`` -> ``(phase certainty: medium)``, ``Probability of increase`` -> ``Chance of
+      rise``, ``forecast confidence`` -> ``forecast reliability`` (the cards' terms).
+    * The MASE note, the model ids and test statistics (``τ = 0.95, p < 0.001``) are dropped from the body: they
+      live in the 자세히 blocks (``future.accuracy.details``, ``future.models``, ``phase.reasons[].detail``).
+    * Weekly data: the analysed span ``X부터 Y까지`` / ``from X to Y`` ends on the last week's Sunday, like the
+      source line (D.1.6), instead of its Monday.
+    """
+    lang, out = fx.lang, str(text or "")
+    if fx.freq == "W" and len(fx.a.series):
+        import pandas as pd
+
+        last = _iso(fx.a.series.index[-1])
+        sunday = _iso(pd.Timestamp(last) + pd.Timedelta(days=6))
+        rx = (r"(from \d{4}-\d{2}-\d{2} to )" if lang == "en" else r"(\d{4}-\d{2}-\d{2}부터 )") + re.escape(last) + \
+            (r"\b" if lang == "en" else r"(?=까지)")
+        out = re.sub(rx, lambda m: m.group(1) + sunday, out, count=1)
+    word = _certainty_word(fx)
+    if lang == "en":
+        out = _NARR_TENTATIVE_EN.sub("tentative call", out)
+        out = _NARR_TENTATIVE_EN2.sub(")", out)
+        out = _NARR_CONF_EN.sub(f"({word})", out)
+    else:
+        out = _NARR_TENTATIVE_KO.sub("잠정 판단입니다", out)
+        out = _NARR_TENTATIVE_KO2.sub(")", out)
+        out = _NARR_CONF_KO.sub(f"({word})", out)
+    for rx_drop in _NARR_DROP:
+        out = rx_drop.sub("", out)
+    for old, new in _NARR_WORDS:
+        out = out.replace(old, new)
+    return out
+
+
 def _narrative(fx: _Facts, inp: SeriesInput, chart: dict) -> tuple[dict, dict]:
     lang = fx.lang
     dates = list(chart["dates"]) + list(chart["forecast"]["dates"])
-    body, caveats, links = _narrative_parts(str(inp.narratives.get(lang) or ""), fx.freq, lang, dates)
+    text = _tidy_rule_narrative(str(inp.narratives.get(lang) or ""), fx)
+    body, caveats, links = _narrative_parts(text, fx.freq, lang, dates)
     if fx.kind == "naver":
         reason, block = "naver_terms", _render("ai_naver_blocked", {}, lang)
     elif not inp.ai_enabled:
@@ -1460,9 +1711,15 @@ def _summary_line(fx: _Facts, source: Mapping[str, Any]) -> str:
         line += T.t(T.SUMMARY_TEXTS, "prob", lang, prob=fmt.prob_text(fx.prob, lang))
     if fx.peak is not None:
         line += _peak_phrase(fx.peak, lang, "summary")
+    line += fx.season_short()
     if fx.display in ("bands_only", "weak"):
         line += T.t(T.SUMMARY_TEXTS, fx.display, lang)
-    return line + T.t(T.SUMMARY_TEXTS, "as_of", lang, as_of=source["as_of_label"])
+    # D.2.2/D.4.1 wording of as_of: fetch time for Naver/Wikipedia, analysis time for uploads, none for samples
+    if fx.kind in ("naver", "wiki"):
+        line += T.t(T.SUMMARY_TEXTS, "as_of", lang, as_of=source["as_of_label"])
+    elif fx.kind in _UPLOAD_KINDS:
+        line += T.t(T.SUMMARY_TEXTS, "as_of_analysed", lang, as_of=source["as_of_label"])
+    return line
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1719,7 +1976,7 @@ def _ranking_row(rank: int, row: Mapping[str, Any], inp: SeriesInput, vm: Mappin
         "outlook": {"arrow": outlook["arrow"], "tone": outlook["tone"], "word": outlook["word"],
                     "likelihood": outlook["likelihood"], "prob_text": outlook["prob_text"], "line": outlook["line"]},
         "expected_change": {"text": fmt.pct(fx.change) if fx.change is not None else fmt.DASH,
-                            "basis": hero["basis"], "undefined_reason": fx.change_reason()},
+                            "basis": hero["basis"] + fx.season_short(), "undefined_reason": fx.change_reason()},
         "recent_change": {"text": fmt.pct(recent) if recent_why is None and recent is not None else fmt.DASH,
                           "basis": fx.recent_basis(), "undefined_reason": recent_why},
         "momentum": {"text": fx.momentum_text(), "word": fx.momentum_word() if mom_why is None else fmt.DASH,

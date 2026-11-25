@@ -4,6 +4,7 @@
 // cards in the same grid. Hover / focus on a card focuses the series on the chart. Owner: WP3-app.
 
 import { h } from '../dom.js';
+import { DASH, pct } from '../fmt.js';
 import { t } from '../i18n.js';
 import { sparkline } from '../chart/sparkline.js';
 import { arrowLine, phaseBadge, pill, swatch, toneClass } from '../ui.js';
@@ -26,17 +27,33 @@ export function sortRows(rows, key) {
   });
 }
 
-/** A provisional row built from a series VM while the job still runs (no rank and no score yet). */
+/** Season length per data frequency (the sparkline history of D.4.1 is min(len, 2 × season, 104) points). */
+const SEASON = { D: 7, W: 52, M: 12, Q: 4, Y: 1 };
+
+/** The ranking text of a change tile: signed % like the server's ranking rows (D.4.1), '—' when undefined. */
+function changeText(tile) {
+  if (!tile || tile.undefined_reason) return DASH;
+  return Number.isFinite(tile.value_raw) ? pct(tile.value_raw) : String(tile.value || DASH).replace(/^▲/, '+').replace(/^▼/, '−');
+}
+
+/**
+ * A provisional row built from a series VM while the job still runs (no rank and no score yet). It mirrors the
+ * server's ranking rows (D.4.1), so a card does not change when the final ranking replaces it (CON-15): signed %
+ * texts and a sparkline of min(len, 2 × season, 104) points.
+ */
 export function provisionalRow(vm) {
   const tile = (key) => (vm.tiles || []).find((x) => x.key === key) || {};
-  const history = (vm.chart.actual || []).slice(-104);
+  const actual = vm.chart.actual || [];
+  const season = SEASON[vm.chart.freq] || 12;
+  const k = Math.min(actual.length, 2 * season, 104);
+  const history = k > 0 ? actual.slice(actual.length - k) : [];
   const display = vm.chart.display || 'normal';
   return {
     rank: null, index: vm.index, name: vm.name, slot: vm.slot, icon: vm.icon,
     phase: { label: vm.phase.label, name: vm.phase.name, icon: vm.phase.icon, tentative: vm.phase.tentative },
     outlook: { ...vm.hero.outlook },
-    expected_change: { text: tile('expected_change').value, basis: vm.hero.basis, undefined_reason: tile('expected_change').undefined_reason },
-    recent_change: { text: tile('recent_change').value, basis: (tile('recent_change').sub || '').replace(/^[^·]*·\s*/, ''), undefined_reason: tile('recent_change').undefined_reason },
+    expected_change: { text: changeText(tile('expected_change')), basis: vm.hero.basis, undefined_reason: tile('expected_change').undefined_reason },
+    recent_change: { text: changeText(tile('recent_change')), basis: (tile('recent_change').sub || '').replace(/^[^·]*·\s*/, ''), undefined_reason: tile('recent_change').undefined_reason },
     confidence: vm.hero.reliability,
     spark: { history, forecast: display === 'bands_only' ? [] : ((vm.chart.forecast && vm.chart.forecast.mean) || []).slice(0, 52) },
     display,

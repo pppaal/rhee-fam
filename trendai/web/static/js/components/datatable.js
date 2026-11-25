@@ -1,21 +1,52 @@
 // Table views (spec F.6.8, F.7.1, F.9 item 5): every chart has one. Below 640 px the tables render as stacked cards
-// (CSS card mode, each cell labelled through data-label); wider tables scroll inside their own container, never the
-// page. Values are formatted client-side with fmt.js (D.6). No copy-to-clipboard control exists here (A.3).
-// Owner: WP3-app.
+// (CSS card mode); wider tables scroll inside their own container, never the page. Values are formatted client-side
+// with fmt.js (D.6). No copy-to-clipboard control exists here (A.3). Owner: WP3-app.
+//
+// Card mode keeps the table semantics (A11Y-15): every element carries its explicit ARIA role (table / rowgroup / row
+// / columnheader / rowheader / cell), because restyled table elements lose them in WebKit, and the per-cell label
+// shown in card mode is a real aria-hidden span (not CSS generated content), so it is never read twice with the
+// column header. Empty cells ('—') are hidden in card mode (UX-32).
 
 import { h } from '../dom.js';
-import { dateLabel, valueText } from '../fmt.js';
+import { DASH, dateLabel, valueText } from '../fmt.js';
 import { t } from '../i18n.js';
 import { exportHref, swatch } from '../ui.js';
 
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
-function table(caption, cols, rows, opts = {}) {
-  return h('div', { class: 'table-scroll', tabindex: '0', role: 'region', 'aria-label': caption },
-    h('table', { class: ['data-table', opts.cards !== false && 'data-table-cards', opts.className] },
+/**
+ * A body cell of a card-mode table: a row header (`th`) or a data cell (`td`) with its column label.
+ * @param {'th'|'td'} tag
+ * @param {string} label  the column header (shown before the value in card mode only)
+ * @param {Node|string} content
+ * @param {Object} [attrs]
+ */
+export function cardCell(tag, label, content, attrs = {}) {
+  const empty = content == null || content === '' || content === DASH;
+  return h(tag, {
+    ...attrs, role: tag === 'th' ? 'rowheader' : 'cell', scope: tag === 'th' ? 'row' : null,
+    class: [attrs.class, empty && 'is-empty'],
+  }, h('span', { class: 'cell-label', 'aria-hidden': 'true' }, label), h('span', { class: 'cell-value' }, content));
+}
+
+/** A row of a card-mode table. */
+export function cardRow(cells, attrs = {}) {
+  return h('tr', { ...attrs, role: 'row' }, cells);
+}
+
+/**
+ * A table (card mode below 640 px unless opts.cards === false) in its own scroll region.
+ * @param {string} caption
+ * @param {string[]} cols
+ * @param {Node[]} rows  cardRow()s
+ * @param {{cards?: boolean, className?: string, regionLabel?: string}} [opts]
+ */
+export function table(caption, cols, rows, opts = {}) {
+  return h('div', { class: 'table-scroll', tabindex: '0', role: 'region', 'aria-label': opts.regionLabel || caption },
+    h('table', { class: ['data-table', opts.cards !== false && 'data-table-cards', opts.className], role: 'table' },
       h('caption', { class: 'sr-only' }, caption),
-      h('thead', null, h('tr', null, cols.map((c) => h('th', { scope: 'col' }, c)))),
-      h('tbody', null, rows)));
+      h('thead', { role: 'rowgroup' }, h('tr', { role: 'row' }, cols.map((c) => h('th', { scope: 'col', role: 'columnheader' }, c)))),
+      h('tbody', { role: 'rowgroup' }, rows)));
 }
 
 /**
@@ -27,29 +58,29 @@ export function seriesTable(vm, lang) {
   const c = vm.chart;
   const kind = c.value_kind || vm.source.value_kind;
   const unit = vm.source.unit_label;
-  const fmt = (v) => (isNum(v) ? valueText(v, kind, lang) + (unit ? ` ${unit}` : '') : '—');
-  const range = (lo, hi) => (isNum(lo) && isNum(hi) ? `${valueText(lo, kind, lang)}${lang === 'en' ? '–' : '~'}${valueText(hi, kind, lang)}` : '—');
+  const fmt = (v) => (isNum(v) ? valueText(v, kind, lang) + (unit ? ` ${unit}` : '') : DASH);
+  const range = (lo, hi) => (isNum(lo) && isNum(hi) ? `${valueText(lo, kind, lang)}${lang === 'en' ? '–' : '~'}${valueText(hi, kind, lang)}` : DASH);
   const cols = t('detail.table.cols').split(',');
   const rows = [];
   (c.dates || []).forEach((iso, i) => {
-    rows.push(h('tr', null,
-      h('th', { scope: 'row', 'data-label': cols[0] }, dateLabel(iso, c.freq, lang)),
-      h('td', { 'data-label': cols[1] }, fmt(c.actual[i])),
-      h('td', { 'data-label': cols[2] }, fmt(c.trend ? c.trend[i] : null)),
-      h('td', { 'data-label': cols[3] }, '—'),
-      h('td', { 'data-label': cols[4] }, '—'),
-      h('td', { 'data-label': cols[5] }, '—')));
+    rows.push(cardRow([
+      cardCell('th', cols[0], dateLabel(iso, c.freq, lang)),
+      cardCell('td', cols[1], fmt(c.actual[i])),
+      cardCell('td', cols[2], fmt(c.trend ? c.trend[i] : null)),
+      cardCell('td', cols[3], DASH),
+      cardCell('td', cols[4], DASH),
+      cardCell('td', cols[5], DASH)]));
   });
   const f = c.forecast || {};
   const bandsOnly = c.display === 'bands_only';
   (f.dates || []).forEach((iso, j) => {
-    rows.push(h('tr', { class: 'is-forecast' },
-      h('th', { scope: 'row', 'data-label': cols[0] }, dateLabel(iso, c.freq, lang)),
-      h('td', { 'data-label': cols[1] }, '—'),
-      h('td', { 'data-label': cols[2] }, '—'),
-      h('td', { 'data-label': cols[3] }, bandsOnly ? '—' : fmt(f.mean[j])),
-      h('td', { 'data-label': cols[4] }, range(f.lo80[j], f.hi80[j])),
-      h('td', { 'data-label': cols[5] }, range(f.lo95[j], f.hi95[j]))));
+    rows.push(cardRow([
+      cardCell('th', cols[0], dateLabel(iso, c.freq, lang)),
+      cardCell('td', cols[1], DASH),
+      cardCell('td', cols[2], DASH),
+      cardCell('td', cols[3], bandsOnly ? DASH : fmt(f.mean[j])),
+      cardCell('td', cols[4], range(f.lo80[j], f.hi80[j])),
+      cardCell('td', cols[5], range(f.lo95[j], f.hi95[j]))], { class: 'is-forecast' }));
   });
   return table(c.title || vm.name, cols, rows, { className: 'series-table' });
 }
@@ -61,15 +92,15 @@ export function seriesTable(vm, lang) {
  */
 export function rankingTable(rows) {
   const cols = t('compare.table.cols').split(',');
-  return table(t('compare.title'), cols, rows.map((r) => h('tr', null,
-    h('td', { 'data-label': cols[0] }, String(r.rank)),
-    h('th', { scope: 'row', 'data-label': cols[1] }, h('span', { class: 'name-cell' }, swatch(r.slot), r.name)),
-    h('td', { 'data-label': cols[2] }, r.phase.name),
-    h('td', { 'data-label': cols[3] }, r.expected_change.text),
-    h('td', { 'data-label': cols[4] }, r.outlook.prob_text),
-    h('td', { 'data-label': cols[5] }, r.recent_change.text),
-    h('td', { 'data-label': cols[6] }, r.momentum.text),
-    h('td', { 'data-label': cols[7] }, r.score.text))), { className: 'ranking-table' });
+  return table(t('compare.title'), cols, rows.map((r) => cardRow([
+    cardCell('td', cols[0], String(r.rank)),
+    cardCell('th', cols[1], h('span', { class: 'name-cell' }, swatch(r.slot), r.name)),
+    cardCell('td', cols[2], r.phase.name),
+    cardCell('td', cols[3], r.expected_change.text),
+    cardCell('td', cols[4], r.outlook.prob_text),
+    cardCell('td', cols[5], r.recent_change.text),
+    cardCell('td', cols[6], r.momentum.text),
+    cardCell('td', cols[7], r.score.text)])), { className: 'ranking-table' });
 }
 
 /**
@@ -95,10 +126,10 @@ export function valuesTable(vms, exports, slots, lang) {
   const freq = vms[0] ? vms[0].chart.freq : 'D';
   const cols = [t('compare.values_date'), ...vms.map((vm) => vm.name)];
   const rows = sorted.map((iso) => h('tr', null,
-    h('th', { scope: 'row', 'data-label': cols[0] }, dateLabel(iso, freq, lang)),
+    h('th', { scope: 'row' }, dateLabel(iso, freq, lang)),
     vms.map((vm, k) => {
       const v = maps[k].get(iso);
-      return h('td', { 'data-label': vm.name }, isNum(v) ? valueText(v, vm.chart.value_kind, lang) : '');
+      return h('td', null, isNum(v) ? valueText(v, vm.chart.value_kind, lang) : '');
     })));
   const csv = exports && exports.values_csv;
   const unavailable = exports && exports.unavailable && exports.unavailable.values_csv;

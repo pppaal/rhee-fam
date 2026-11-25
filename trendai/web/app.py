@@ -19,7 +19,7 @@ from . import api
 from .analyze import SingleFlight
 from .budget import AiBudget, NaverBudget
 from .config import WebConfig
-from .errors import WebError, error_envelope
+from .errors import WebError, error_envelope, store_error
 from .fetchers import Fetchers, default_fetchers
 from .http import HSTS, SECURITY_HEADERS, Request, Response, json_response, maybe_gzip, text_response
 from .jobs import JobManager
@@ -33,6 +33,11 @@ __all__ = ["TrendaiApp", "create_app", "ROUTES", "SWEEP_INTERVAL_S"]
 
 SWEEP_INTERVAL_S = 600.0
 _PARSE_SLOTS = 2
+#: concurrent heavy reads (stored VMs of results/shares/job snapshots, exports): beyond these a request waits up to
+#: :data:`_HEAVY_WAIT_S`, then gets ``503 server_busy`` -- one client cannot occupy every request thread with them
+_HEAVY_SLOTS = 4
+_HEAVY_WAIT_S = 10.0
+_METHOD_RX = re.compile(r"^[A-Z]{1,16}$")
 _MISSING_STATIC = "trendai: static files are missing"
 _ROBOTS = "User-agent: *\nDisallow: /api/\nDisallow: /r/\nDisallow: /s/\n"
 _ID = r"[A-Za-z0-9_-]{22}"
@@ -108,6 +113,12 @@ class TrendaiApp:
         self.ai_budget = AiBudget(self.store, clock, config.ai_daily_limit)
         self.uploads = UploadCache(clock)
         self.parse_slots = threading.BoundedSemaphore(_PARSE_SLOTS)
+        self.parse_clients: set[str] = set()          # clients holding a parse slot (one each, SEC: E.17)
+        self.parse_lock = threading.Lock()
+        self.heavy_slots = threading.BoundedSemaphore(_HEAVY_SLOTS)
+        self.heavy_wait_s = _HEAVY_WAIT_S
+        # a loopback-only server (no public_url, no proxy) accepts browser POST/DELETE only from loopback origins
+        self.loopback_only = not config.is_public() and not config.trust_proxy
         self.jobs = JobManager(clock, workers=config.workers, max_queued=config.max_queued,
                                timeout_s=config.job_timeout_s)
         self.naver_flight = SingleFlight()
@@ -177,15 +188,21 @@ class TrendaiApp:
     def __call__(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         rid = secrets.token_hex(4)
         started = time.monotonic()
-        req = Request(environ, trust_proxy=self.config.trust_proxy, public_url=self.config.public_url)
+        req = Request(environ, trust_proxy=self.config.trust_proxy, public_url=self.config.public_url,
+                      loopback_only=self.loopback_only)
+        # the method is the only free-form request text in the access line: control characters (ANSI escapes,
+        # BEL) never reach the log
+        method = req.method if _METHOD_RX.match(req.method) else "OTHER"
         holder = {"template": "-"}
         try:
             resp = self._dispatch(req, rid, holder)
         except WebError as err:
             resp = self._error(err, rid)
         except Exception as exc:  # noqa: BLE001 - every unexpected error is a 500 envelope, never a traceback
-            log_exception(LOGGER, f"request {req.method} {holder['template']}", exc, rid=rid)
-            resp = self._error(WebError("internal_error"), rid)
+            mapped = store_error(exc)
+            log_exception(LOGGER, f"request {method} {holder['template']}", exc, rid=rid,
+                          code=mapped.code if mapped is not None else "internal_error")
+            resp = self._error(mapped or WebError("internal_error"), rid)
         resp = maybe_gzip(resp, req.header("Accept-Encoding"))
         headers = list(resp.headers)
         if not resp.replaces_csp:      # only HTML exports bring their own (sandbox) CSP (C.10)
@@ -201,7 +218,7 @@ class TrendaiApp:
             body = b""
         start_response(resp.status_line, headers)
         ms = int((time.monotonic() - started) * 1000)
-        ACCESS_LOGGER.info("rid=%s ip=%s %s %s %d %dms %dB", rid, self.ip_hash(req.client_key), req.method,
+        ACCESS_LOGGER.info("rid=%s ip=%s %s %s %d %dms %dB", rid, self.ip_hash(req.client_key), method,
                            holder["template"], resp.status, ms, len(body))
         return [body]
 

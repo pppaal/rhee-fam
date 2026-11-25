@@ -12,6 +12,7 @@ every KST day. Unexpected exceptions are logged with the exception *type* and th
 from __future__ import annotations
 
 import datetime as _dt
+import errno
 import hashlib
 import logging
 import secrets
@@ -102,4 +103,10 @@ def log_exception(logger: logging.Logger, what: str, exc: BaseException, *, rid:
     texts may quote cell contents (E.11)."""
     frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ is not None else []
     stack = "\n".join(f'  File "{f.filename}", line {f.lineno}, in {f.name}' for f in frames)
-    logger.error("%s rid=%s error=%s exc=%s\n%s", what, rid or "-", code, type(exc).__name__, stack)
+    kind = type(exc).__name__
+    err_no = getattr(exc, "errno", None) if isinstance(exc, OSError) else None
+    if isinstance(err_no, int):
+        # the errno *name* (ENOSPC, EACCES, ...) tells a full disk from a permission problem; it never carries a
+        # path or data, unlike str(exc)
+        kind = f"{kind}({errno.errorcode.get(err_no, err_no)})"
+    logger.error("%s rid=%s error=%s exc=%s\n%s", what, rid or "-", code, kind, stack)

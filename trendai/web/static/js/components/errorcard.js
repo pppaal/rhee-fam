@@ -2,13 +2,17 @@
 //
 // A card shows an icon, the message (ApiError.text() in the current language) and up to 3 fix controls. Fix actions
 // run against a context object the page provides (navigation, retry, the current state, page-specific focus helpers);
-// a fix whose behaviour the context cannot provide is not shown.
+// a fix whose behaviour the context cannot provide is not shown. A Wikipedia title that is missing (or too short to
+// analyse) also gets "try the other wiki language" (FU-1).
 
 import { h } from '../dom.js';
 import { getLang, t } from '../i18n.js';
 import { reanalyzeSingleState, serialize, switchSourceState, withState } from '../state.js';
-import { copyText, exportHref, icon, srOnly } from '../ui.js';
-import { toast } from './toast.js';
+import { exportHref, icon, srOnly } from '../ui.js';
+import { copyWithToast } from './toast.js';
+
+/** The other wiki language offered by the switch_wiki_lang fix. */
+export const otherWikiLang = (wl) => (wl === 'en' ? 'ko' : 'en');
 
 /**
  * @typedef {Object} FixContext
@@ -21,6 +25,7 @@ import { toast } from './toast.js';
  * @property {() => void} [openPaste]               try_paste
  * @property {() => void} [focusDateSelect]         pick_columns
  * @property {string|null} [csvUrl]                 export_csv
+ * @property {string} [source]                      the source in effect (naver / wiki / sample / upload)
  */
 
 const RUNNERS = {
@@ -44,10 +49,9 @@ const RUNNERS = {
   try_paste: (ctx) => ctx.openPaste || (() => ctx.navigate('/upload#paste')),
   pick_columns: (ctx) => ctx.focusDateSelect || null,
   use_log: (ctx) => (ctx.state ? () => ctx.navigate(serialize(withState(ctx.state, { scale: 'log' })), { replace: true }) : null),
-  copy_link: () => async () => {
-    const ok = await copyText(window.location.href);
-    toast(ok ? t('share.copied') : t('err.clipboard'), { kind: ok ? 'info' : 'error' });
-  },
+  copy_link: () => () => copyWithToast(window.location.href),
+  switch_wiki_lang: (ctx, fix) => (ctx.state && ctx.state.route === 'explore' && fix.params && fix.params.wl
+    ? () => ctx.navigate(serialize(withState(ctx.state, { wl: fix.params.wl, focus: null }))) : null),
   reanalyze_single: (ctx, fix) => (ctx.state && fix.params && fix.params.term
     ? () => ctx.navigate(serialize(reanalyzeSingleState(ctx.state, fix.params.term))) : null),
 };
@@ -75,27 +79,53 @@ export function fixControl(fix, ctx, opts = {}) {
   const run = factory ? factory(ctx, fix) : null;
   if (!run) return null;
   const button = h('button', { type: 'button', class: cls, on: { click: () => run() } }, fix.label);
-  if (fix.action === 'retry_in') startCountdown(button, fix, run, opts);
+  if (fix.action === 'retry_in') startCountdown(button, fix, run, opts, opts.message || null);
   return button;
 }
 
-/** retry_in: count down from `retry_after`; at 0 retry automatically only when allowed (naver_rate, once per query). */
-function startCountdown(button, fix, run, opts) {
-  let left = Math.ceil(Number((fix.params && fix.params.seconds) || opts.retryAfter || 0));
-  if (!(left > 0)) return;
-  button.textContent = t('fix.retry_in_seconds', { seconds: left });
+/**
+ * The message of a retry_in card with its seconds counted down (UX-11): the number in the server text is replaced
+ * while it counts; at 0 the sentence holding it is dropped. Pure (exported for tests).
+ * @param {string} template  the server message, e.g. '요청이 너무 많아요. 28초 뒤에 다시 시도해 주세요.'
+ * @param {number} initial   the seconds the message was written with
+ * @param {number} left      seconds left now
+ * @returns {string}
+ */
+export function countdownMessage(template, initial, left) {
+  const needle = String(initial);
+  if (!template || template.split(needle).length !== 2) return template;
+  if (left > 0) return template.replace(needle, String(left));
+  const sentences = template.split(/(?<=[.!?。])\s+/);
+  const kept = sentences.filter((s) => !s.includes(needle));
+  return kept.length ? kept.join(' ') : template;
+}
+
+/**
+ * retry_in: one countdown model (UX-11). Automatic retry (naver_rate, once per query): the message counts down and
+ * the button retries at once. Otherwise the button is disabled while it counts ('N초 뒤 다시 시도') and becomes
+ * '다시 시도' at 0; the message counts down with it.
+ */
+function startCountdown(button, fix, run, opts, message) {
+  const initial = Math.ceil(Number((fix.params && fix.params.seconds) || opts.retryAfter || 0));
+  if (!(initial > 0)) return;
+  let left = initial;
+  const template = message ? message.textContent : '';
+  const paint = () => {
+    if (message) message.textContent = countdownMessage(template, initial, left);
+    if (opts.autoRetry) return;
+    button.disabled = left > 0;
+    button.textContent = left > 0 ? t('fix.retry_wait', { seconds: left }) : t('fix.retry');
+  };
+  paint();
   const timer = setInterval(() => {
     if (!button.isConnected) {
       clearInterval(timer);
       return;
     }
     left -= 1;
-    if (left > 0) {
-      button.textContent = t('fix.retry_in_seconds', { seconds: left });
-      return;
-    }
+    paint();
+    if (left > 0) return;
     clearInterval(timer);
-    button.textContent = fix.label;
     if (opts.autoRetry) run();
   }, 1000);
 }
@@ -122,24 +152,48 @@ export function localFixes(fixes, lang = getLang()) {
   }));
 }
 
+/** Client-side fixes an error card adds to the server's (FU-1: the other Wikipedia language). */
+export function clientFixes(err, ctx) {
+  const code = err && err.code;
+  const state = ctx && ctx.state;
+  if (!state || state.route !== 'explore') return [];
+  const wiki = code === 'wiki_not_found' || code === 'wiki_empty' || (code === 'data_too_short' && ctx.source === 'wiki');
+  if (!wiki) return [];
+  const wl = otherWikiLang(state.wl);
+  return [{ action: 'switch_wiki_lang', label: t('fix.wiki_lang', { lang: t(`wiki.lang.${wl}`) }), params: { wl } }];
+}
+
+let cardCounter = 0;
+
 /**
  * An error card.
  * @param {import('../api.js').ApiError} err
  * @param {FixContext} ctx
- * @param {{name?: string, compact?: boolean, autoRetry?: boolean, headingLevel?: number}} [opts]
- *        name: series name shown as the card title (per-series failures in a comparison, F.6.7)
+ * @param {{name?: string, compact?: boolean, autoRetry?: boolean, headingLevel?: number, extraFixes?: Array,
+ *          focusable?: boolean}} [opts]
+ *        name: series name shown as the card title (per-series failures in a comparison, F.6.7);
+ *        extraFixes: client fixes after the server's ({action, label, params}); focusable: tabindex=-1, labelled by
+ *        its message, so a page can move focus to it after it replaced the control the user used (A11Y-3)
  * @returns {HTMLElement}
  */
 export function errorCard(err, ctx, opts = {}) {
-  const fixes = err && typeof err.fixList === 'function' ? err.fixList() : [];
-  const message = err && typeof err.text === 'function' ? err.text() : String((err && err.message) || '');
+  const server = err && typeof err.fixList === 'function' ? err.fixList() : [];
+  const seen = new Set(server.map((f) => f.action));
+  const extra = [...clientFixes(err, ctx), ...(opts.extraFixes || [])].filter((f) => !seen.has(f.action) && seen.add(f.action));
+  const fixes = [...server, ...extra].slice(0, 3);
+  const text = err && typeof err.text === 'function' ? err.text() : String((err && err.message) || '');
+  const id = `error-msg-${++cardCounter}`;
   const head = opts.name ? h(`h${opts.headingLevel || 3}`, { class: 'error-card-title' }, opts.name) : null;
-  return h('section', { class: ['card', 'error-card', opts.compact && 'error-card-compact'], dataset: { code: err && err.code } },
-    h('div', { class: 'error-card-icon' }, icon('ui-error')),
-    h('div', { class: 'error-card-body' },
-      head,
-      h('p', { class: 'error-card-message' }, message),
-      fixRow(fixes, ctx, { autoRetry: opts.autoRetry, retryAfter: err && err.retryAfter })));
+  const message = h('p', { class: 'error-card-message', id }, text);
+  return h('section', {
+    class: ['card', 'error-card', opts.compact && 'error-card-compact'], dataset: { code: err && err.code },
+    tabindex: opts.focusable ? '-1' : null, 'aria-labelledby': opts.focusable ? id : null,
+  },
+  h('div', { class: 'error-card-icon' }, icon('ui-error')),
+  h('div', { class: 'error-card-body' },
+    head,
+    message,
+    fixRow(fixes, ctx, { autoRetry: opts.autoRetry, retryAfter: err && err.retryAfter, message })));
 }
 
 /**

@@ -2,10 +2,14 @@
 //
 // Supported, nothing else: `## ` headings (rendered as <h3>), `- ` bullets nested by 2-space indentation, blank-line
 // paragraphs, `**bold**`. Every exact occurrence of a `dateLinks` key (the VM's narrative.date_links, D.2.9: display
-// text → chart date; longest keys first) becomes <button class="datelink" data-date="…">. Text only ever becomes text
-// nodes, so markup in the input (e.g. `<script>`) stays visible text. md.js has no date regex of its own.
+// text → chart date; longest keys first) becomes <button class="datelink" data-date="…">, described by the page's one
+// sr-only hint #datelink-hint ("차트에서 이 시점 보기", A11Y-21). Text only ever becomes text nodes, so markup in the
+// input (e.g. `<script>`) stays visible text. md.js has no date regex of its own.
 //
 // parseMarkdown() builds a plain tree (testable without a DOM); md() renders it with a document.
+
+/** The id of the visually hidden text that says what a date link does (index.html, localised by app.js). */
+export const DATELINK_HINT_ID = 'datelink-hint';
 
 const BULLET_RE = /^( *)- (.*)$/;
 const HEADING_RE = /^## (.*)$/;
@@ -132,6 +136,7 @@ function render(node, doc) {
       btn.setAttribute('type', 'button');
       btn.setAttribute('class', 'datelink');
       btn.setAttribute('data-date', node.date);
+      btn.setAttribute('aria-describedby', DATELINK_HINT_ID);
       btn.appendChild(doc.createTextNode(node.text));
       return btn;
     }

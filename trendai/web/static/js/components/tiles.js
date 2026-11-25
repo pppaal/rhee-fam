@@ -7,6 +7,16 @@ import { arrowValue, icon, srOnly, toneClass } from '../ui.js';
 import { helpButton } from './help.js';
 
 /**
+ * True for a tile value set smaller so it stays on one line: long numbers (≥ 8 characters) and word values of 5 or
+ * more characters such as '뚜렷하지 않음' (UX-28). Pure.
+ * @param {string} value
+ */
+export function isLongValue(value) {
+  const s = String(value == null ? '' : value);
+  return s.length >= 8 || (!/\d/.test(s) && s.length >= 5);
+}
+
+/**
  * @param {Object} vm  D.2 series VM
  * @returns {HTMLElement}
  */
@@ -19,7 +29,7 @@ export function renderTiles(vm) {
         h('div', { class: 'tile-label' },
           h('span', null, tile.label),
           tile.tooltip ? helpButton(tile.label, tile.tooltip) : null),
-        h('p', { class: ['tile-value', toneClass(tile.tone), undefinedValue && 'is-undefined', String(tile.value || '').length >= 8 && 'is-long'] },
+        h('p', { class: ['tile-value', toneClass(tile.tone), undefinedValue && 'is-undefined', isLongValue(tile.value) && 'is-long'] },
           tile.icon ? icon(`ph-${tile.icon}`, { cls: ['phase-icon', `ph-${tile.icon}`] }) : null,
           undefinedValue ? [h('span', { 'aria-hidden': 'true' }, tile.value), srOnly(t('common.dash_reason', { reason: tile.undefined_reason }))]
             : arrowValue(tile.value)),

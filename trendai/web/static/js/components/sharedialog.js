@@ -1,16 +1,17 @@
 // Share-link dialog for upload results (spec F.6.12, C.8, M20): POST /api/share (or reuse the share stored for this
 // result in trendai.shares), show the absolute /s/… URL with a copy button and its expiry, and `링크 삭제` (DELETE with
-// the stored token, after a confirm step). Owner: WP3-app.
+// the stored token, after a confirm step). The link opens the series the sender was looking at (`?focus=`, FU-9).
+// Owner: WP3-app.
 
 import * as api from '../api.js';
 import { h } from '../dom.js';
 import { datetimeLabel } from '../fmt.js';
 import { getLang, t } from '../i18n.js';
 import * as store from '../store.js';
-import { absoluteUrl, copyText, icon } from '../ui.js';
+import { absoluteUrl, icon } from '../ui.js';
 import { confirmDialog, openSheet } from './sheet.js';
 import { errorCard } from './errorcard.js';
-import { toast } from './toast.js';
+import { copyWithToast, toast } from './toast.js';
 
 /** The stored share of `resultId`, or a new one (POST /api/share, then remembered). */
 export async function ensureShare(resultId) {
@@ -23,7 +24,8 @@ export async function ensureShare(resultId) {
 
 /**
  * Open the share dialog.
- * @param {{resultId: string, opener?: HTMLElement, navigate: Function}} opts
+ * @param {{resultId: string, opener?: HTMLElement, navigate: Function, focus?: string|null}} opts
+ *        focus: the series the sender is looking at (added to the link as ?focus=)
  */
 export async function openShareDialog(opts) {
   let info;
@@ -36,19 +38,15 @@ export async function openShareDialog(opts) {
     });
     return;
   }
-  const url = absoluteUrl(info.url);
+  const base = absoluteUrl(info.url);
+  const url = opts.focus ? `${base}${base.includes('?') ? '&' : '?'}focus=${encodeURIComponent(opts.focus)}` : base;
   const field = h('input', {
     id: 'share-url', type: 'text', class: 'input share-url', readonly: true, props: { value: url },
     on: { focus: (e) => e.target.select() },
   });
   const copy = h('button', {
     type: 'button', class: 'btn btn-primary',
-    on: {
-      click: async () => {
-        const ok = await copyText(url);
-        toast(ok ? t('share.copied') : t('err.clipboard'), { kind: ok ? 'info' : 'error' });
-      },
-    },
+    on: { click: () => copyWithToast(url) },
   }, icon('ui-copy'), t('share.copy_link'));
   const del = h('button', {
     type: 'button', class: 'btn btn-danger-quiet',

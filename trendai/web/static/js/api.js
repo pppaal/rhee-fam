@@ -5,7 +5,9 @@
 // or `failed`, VMs de-duplicated by index, poll interval = poll_after_ms clamped to 300–2,000 ms, 429 → wait
 // Retry-After, `done` → fetch result_url once (the authoritative envelope), `failed` → ApiError, `cancelled` →
 // {cancelled: true}. Aborting the signal stops polling and sends DELETE /api/jobs/<id> (keepalive) unless the job is
-// already terminal; a joined job keeps running for its other subscribers (C.6).
+// already terminal; a joined job keeps running for its other subscribers (C.6). A poll that fails on the way (a proxy
+// 502/503/504 or a network blip) is retried a few times with back-off before the error is shown (A11Y-20): the job
+// keeps running on the server meanwhile. A failed job's ApiError carries the snapshot's per-series `failed` list.
 
 import { getLang, t } from './i18n.js';
 import { toAnalyzeBody } from './state.js';
@@ -13,6 +15,13 @@ import { toAnalyzeBody } from './state.js';
 export const UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
 const POLL_MIN_MS = 300;
 const POLL_MAX_MS = 2000;
+const POLL_RETRIES = 4;                 // transient poll failures tolerated in a row
+const TRANSIENT_STATUS = new Set([502, 503, 504]);
+
+/** True for an error a later poll can get past: a proxy 502/503/504 or a failed connection (A11Y-20). */
+export function isTransient(err) {
+  return err instanceof ApiError && (err.code === 'client_network' || TRANSIENT_STATUS.has(err.status));
+}
 
 /** Client-side fallback labels for fixes of errors the server never saw (network failures). */
 const CLIENT_FIX_KEYS = { retry: 'fix.retry', reload: 'fix.reload', go_home: 'fix.go_home' };
@@ -177,6 +186,7 @@ export async function pollJob(jobId, opts = {}) {
   let failed = [];
   let since = 0;
   let terminal = false;
+  let transient = 0;
   const onAbort = () => {
     if (!terminal && opts.cancelOnAbort !== false) cancelJob(jobId);
   };
@@ -198,8 +208,14 @@ export async function pollJob(jobId, opts = {}) {
           await sleep(Math.max(1, err.retryAfter || 1) * 1000, signal);
           continue;
         }
+        if (isTransient(err) && transient < POLL_RETRIES) {
+          transient += 1;
+          await sleep(err.retryAfter ? err.retryAfter * 1000 : 500 * 2 ** transient, signal);
+          continue;
+        }
         throw err;
       }
+      transient = 0;
       for (const entry of snap.series || []) {
         if (entry && Number.isInteger(entry.index) && entry.vm) seen.set(entry.index, entry.vm);
       }
@@ -216,7 +232,9 @@ export async function pollJob(jobId, opts = {}) {
       }
       if (snap.status === 'failed') {
         terminal = true;
-        throw ApiError.fromObject(snap.error, 500);
+        const err = ApiError.fromObject(snap.error, 500);
+        err.failed = failed;                  // every series failed: one card per series (FU-2)
+        throw err;
       }
       if (snap.status === 'cancelled') {
         terminal = true;
@@ -255,20 +273,23 @@ export function startAnalyze(body, opts = {}) {
 }
 
 /**
- * POST /api/upload with a File (multipart) or pasted text (JSON) (C.4). Files over 10 MB are refused before
- * uploading with a `body_too_large` error (F.3 pre-check).
+ * POST /api/upload with a File (multipart) or pasted text (JSON) (C.4). Files over the server's limit
+ * (`config.sources.upload.max_mb`, passed as maxBytes; 10 MB when unknown) are refused before uploading with a
+ * `body_too_large` error (F.3 pre-check, OPS-12).
  * @param {File|Blob|string} input
- * @param {{signal?: AbortSignal, hl?: string, filename?: string}} [opts]
+ * @param {{signal?: AbortSignal, hl?: string, filename?: string, maxBytes?: number}} [opts]
  */
 export function upload(input, opts = {}) {
+  const maxBytes = Number.isFinite(opts.maxBytes) && opts.maxBytes > 0 ? opts.maxBytes : UPLOAD_MAX_BYTES;
   const path = withHl('/api/upload', opts.hl);
   if (typeof input === 'string') {
     const json = { text: input };
     if (opts.filename) json.filename = opts.filename;
     return request('POST', path, { json, signal: opts.signal });
   }
-  if (input && input.size > UPLOAD_MAX_BYTES) {
-    return Promise.reject(ApiError.client('body_too_large', 'err.file_too_large', { status: 413 }));
+  if (input && input.size > maxBytes) {
+    const mb = Math.round(maxBytes / (1024 * 1024));
+    return Promise.reject(ApiError.client('body_too_large', 'err.file_too_large', { status: 413, params: { mb } }));
   }
   const form = new FormData();
   form.append('file', input, input && input.name ? input.name : 'upload');

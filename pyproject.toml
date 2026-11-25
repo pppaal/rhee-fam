@@ -20,6 +20,12 @@ dev = ["pytest>=7"]
 [project.scripts]
 trendai = "trendai.cli:main"
 
+[tool.setuptools]
+# package data comes only from the explicit patterns below. With the default (true) setuptools also scans the
+# manifest and warns "Package 'trendai.web.static…' is absent from the `packages` configuration" once per static
+# sub-directory, although the wheel content is the same.
+include-package-data = false
+
 [tool.setuptools.packages.find]
 include = ["trendai*"]
 namespaces = false    # trendai/web/static/** is package data of trendai.web, not a tree of namespace packages

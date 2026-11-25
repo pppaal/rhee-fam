@@ -1,5 +1,6 @@
 // Recent analyses of this browser (spec F.6.20): trendai.recent, newest first, each with a × remove button; entries
-// whose expires_at has passed are greyed with `recent.expired` and no link. Owner: WP3-app.
+// whose expires_at has passed are greyed with `recent.expired` and no link. Owner: WP3-app. After a removal focus moves
+// to the next entry's ×, else the previous one, else the section heading (A11Y-4).
 
 import { clear, h } from '../dom.js';
 import { t } from '../i18n.js';
@@ -22,11 +23,22 @@ export function renderRecent(root, opts = {}) {
     return;
   }
   const now = Date.now();
-  root.appendChild(h('ul', { class: 'recent-list' }, list.map((entry) => {
+  root.appendChild(h('ul', { class: 'recent-list' }, list.map((entry, i) => {
     const expired = entry.expires_at && Date.parse(entry.expires_at) < now;
     const remove = h('button', {
       type: 'button', class: 'icon-btn recent-x', 'aria-label': `${t('home.recent.remove')}: ${entry.title}`,
-      on: { click: () => { store.removeRecent(entry.url); renderRecent(root, opts); } },
+      on: {
+        click: () => {
+          store.removeRecent(entry.url);
+          renderRecent(root, opts);
+          const xs = root.querySelectorAll('.recent-x');
+          const target = xs[Math.min(i, xs.length - 1)] || root.querySelector('.section-title');
+          if (target) {
+            if (!xs.length) target.setAttribute('tabindex', '-1');
+            target.focus();
+          }
+        },
+      },
     }, icon('ui-close'));
     return h('li', { class: ['recent-item', expired && 'is-expired'] },
       expired

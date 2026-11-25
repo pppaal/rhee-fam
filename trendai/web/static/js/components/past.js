@@ -3,10 +3,9 @@
 
 import { h } from '../dom.js';
 import { t } from '../i18n.js';
+import { DATELINK_HINT_ID } from '../md.js';
 import { cardHead } from '../ui.js';
-
-const CIRCLED = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳';
-const circled = (n) => (n >= 1 && n <= 20 ? CIRCLED[n - 1] : `(${n})`);
+import { circled } from '../chart/geom.js';
 
 /**
  * @param {Object} vm  D.2 series VM
@@ -30,7 +29,7 @@ export function createPast(vm, opts = {}) {
   const anList = anomalies.length
     ? h('ul', { class: 'anomaly-list' }, anomalies.map((a) => h('li', null,
       h('button', {
-        type: 'button', class: 'link-btn anomaly-date', dataset: { date: a.date },
+        type: 'button', class: 'link-btn anomaly-date', dataset: { date: a.date }, 'aria-describedby': DATELINK_HINT_ID,
         on: { click: () => opts.onDate && opts.onDate(a.date) },
       }, a.date_label),
       h('span', null, ` ${a.text}`))))

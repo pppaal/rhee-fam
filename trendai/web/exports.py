@@ -78,6 +78,12 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _NAME_MAX = 80
 _SHEET_MAX = 31
 _BODY_RX = re.compile(r"<body\b[^>]*>", re.IGNORECASE)
+#: separators a spreadsheet may split an unquoted comment line at (comma; semicolon in semicolon-locale Excel)
+_COMMENT_SPLIT = re.compile(r"([,;])")
+#: phase reasons that quote raw values (``analysis.py``'s short-series branch, ko and translated): not in Naver files
+_RAW_REASON = re.compile(r"^(?:관측 기간 동안 값이 |현재 값은 |Over the observed period the value |The current value is )")
+#: model outputs in CSV files keep this many significant digits of the series scale (FU-12)
+_MODEL_DIGITS = 6
 
 
 @dataclass(frozen=True)
@@ -155,6 +161,42 @@ def _csv_number(v: Any) -> str:
     return "0" if s in ("-0", "-0.0") else s
 
 
+def _rounded(v: Any, decimals: int) -> Any:
+    """``v`` rounded half away from zero to ``decimals`` places (``fmt.round_half_away``); non-numbers unchanged."""
+    from .fmt import round_half_away
+
+    f = _xlsx_number(v)
+    return v if f is None else float(round_half_away(f, decimals))
+
+
+def _prob_pct(p: Any) -> Optional[float]:
+    """P(rise) as a percentage with one decimal for files, never a false certainty: ``0.926547`` -> ``92.7``,
+    ``0.99999997`` -> ``99.9`` (not 100), ``2.7e-24`` -> ``0.1`` (not 2.7e-22 or 0); exact 0 and 1 stay."""
+    f = _xlsx_number(p)
+    if f is None:
+        return None
+    v = float(_rounded(f * 100.0, 1))
+    if 0.0 < f < 1.0:
+        v = min(max(v, 0.1), 99.9)
+    return v
+
+
+def _model_decimals(rows: Sequence[Sequence[Any]], first_col: int) -> int:
+    """Decimals that keep :data:`_MODEL_DIGITS` significant digits of the series scale (the largest finite
+    magnitude in the numeric columns from ``first_col``): 100 -> 3 (``31.363``), 2.7e6 -> 0, 0.002 -> 8."""
+    import math
+
+    scale = 0.0
+    for r in rows:
+        for v in r[first_col:]:
+            f = _xlsx_number(v)
+            if f is not None:
+                scale = max(scale, abs(f))
+    if scale <= 0:
+        return 3
+    return max(0, min(10, _MODEL_DIGITS - (math.floor(math.log10(scale)) + 1)))
+
+
 def _xlsx_number(v: Any) -> Optional[float]:
     if v is None or isinstance(v, bool):
         return None
@@ -173,11 +215,22 @@ def guard_text(value: str) -> str:
 
 
 def _comment(text: str) -> str:
-    """One ``# `` comment line, written as is (not quoted, so ``pandas.read_csv(comment="#")`` skips it). A
-    spreadsheet still splits it at commas, so every piece after a comma gets the formula guard too."""
-    flat = re.sub(r"[\r\n]+", " ", str(text))
-    pieces = flat.split(",")
-    return "# " + ",".join([pieces[0]] + [guard_text(p) for p in pieces[1:]])
+    """One ``# `` comment line, written as is (not quoted, so ``pandas.read_csv(comment="#")`` skips it).
+
+    A spreadsheet still splits it into cells at commas (semicolons in semicolon-locale Excel), so (SEC-3):
+    double quotes become ``”`` -- a piece starting with ``"`` would otherwise open a quoted cell whose value is
+    unguarded (``Sales,"=HYPERLINK(…)",Q4``) -- line breaks and tabs become spaces, and every piece after a
+    separator whose first non-blank character starts a formula gets the leading apostrophe."""
+    flat = re.sub(r"[\r\n\t]+", " ", str(text)).replace('"', "”")
+    parts = _COMMENT_SPLIT.split(flat)
+    out = [parts[0]]
+    for i in range(1, len(parts), 2):
+        piece = parts[i + 1]
+        stripped = piece.lstrip(" ")
+        if stripped.startswith(_FORMULA_STARTS):
+            piece = piece[:len(piece) - len(stripped)] + "'" + stripped
+        out += [parts[i], piece]
+    return "# " + "".join(out)
 
 
 def _write_csv(comments: Sequence[str], header: Sequence[str], rows: Sequence[Sequence[str]]) -> bytes:
@@ -316,25 +369,40 @@ def build_series_json(report: TrendReport, source_block: Mapping[str, Any], lang
         body["narrative"] = str(narrative)
     out: dict[str, Any] = {"source": copy.deepcopy(dict(source_block)), **body}
     if source_block.get("kind") == "naver":
-        out = strip_naver_raw(out)
+        out = strip_naver_raw(out, lang)
     return out
 
 
-def strip_naver_raw(export: Mapping[str, Any]) -> dict:
-    """Return a copy without raw Naver ratios (C.10, A.3): ``history`` removed; ``metrics.last_value``,
-    ``metrics.peak_value``, ``metrics.mean`` and every ``anomalies[].value`` removed; ``"raw_excluded": true`` added.
-    Model outputs (``trend``, ``forecast``, ``scenarios``, ...) stay."""
+def strip_naver_raw(export: Mapping[str, Any], lang: Optional[str] = None) -> dict:
+    """Return a copy without raw Naver ratios (C.10, A.3, CON-1): ``history`` removed; ``metrics.last_value``,
+    ``metrics.peak_value``, ``metrics.mean``, ``metrics.drawdown_pct`` (it rebuilds the last ratio: the query maximum
+    is 100) and every ``anomalies[].value`` removed; ``outlook.compared_levels`` removed (its ``current`` is the raw
+    average of the last season); phase reasons that quote raw values removed; ``narrative`` replaced by the
+    ``export.naver_narrative_excluded`` note in ``lang`` (the rule-based text prints the latest value, the peak, the
+    recent average, anomaly actuals and the scenario reference) with ``narrative_source = "excluded"``;
+    ``"raw_excluded": true`` added. Model outputs (``trend``, ``forecast``, ``scenarios``, ...) stay."""
     out = copy.deepcopy(dict(export))
     out.pop("history", None)
     metrics = out.get("metrics")
     if isinstance(metrics, dict):
-        for key in ("last_value", "peak_value", "mean"):
+        for key in ("last_value", "peak_value", "mean", "drawdown_pct"):
             metrics.pop(key, None)
     anomalies = out.get("anomalies")
     if isinstance(anomalies, list):
         for an in anomalies:
             if isinstance(an, dict):
                 an.pop("value", None)
+    outlook = out.get("outlook")
+    if isinstance(outlook, dict):
+        outlook.pop("compared_levels", None)
+    phase = out.get("phase")
+    if isinstance(phase, dict):
+        for key in ("reasons", "reasons_ko"):
+            if isinstance(phase.get(key), list):
+                phase[key] = [r for r in phase[key] if not _RAW_REASON.search(str(r))]
+    if "narrative" in out:
+        out["narrative"] = T.t(T.EXPORT_TEXTS, "naver_narrative_excluded", _lang(lang))
+        out["narrative_source"] = "excluded"
     out["raw_excluded"] = True
     return out
 
@@ -370,20 +438,39 @@ def insert_source_paragraph(html: str, source_line_ko: str) -> str:
     return html[:m.end()] + para + html[m.end():]
 
 
+def _no_web_fonts(html: str) -> str:
+    """Drop the frozen renderer's Google Fonts ``<link>`` tags (``report._FONT_LINK``): opening a downloaded report
+    must not contact a third party (the app itself is strictly ``'self'``; SEC-14). The page's CSS font stack falls
+    back to the system fonts the app uses."""
+    from ..report import _FONT_LINK
+
+    return str(html).replace(_FONT_LINK, "")
+
+
+def _weekly_note(freqs: Sequence[str]) -> str:
+    """The source paragraph's note for weekly data: its range ends on the last week's Sunday (D.1.6) while the frozen
+    report body dates every week by its Monday (CON-7)."""
+    return T.t(T.EXPORT_TEXTS, "weekly_dates_note", "ko") if freqs and all(f == "W" for f in freqs) else ""
+
+
 def render_series_html(report: TrendReport, source_line_ko: str) -> str:
     """``report.render_html(report)`` + :func:`insert_source_paragraph` with the series' Korean ``source.line``
-    (non-Naver only; Korean only). Stored as ``report-<k>.html``."""
+    (non-Naver only; Korean only), without the web-font links; weekly data add the week-start note to the paragraph.
+    Stored as ``report-<k>.html``."""
     from ..report import render_html
 
-    return insert_source_paragraph(render_html(report), source_line_ko)
+    line = str(source_line_ko) + _weekly_note([str(report.analysis.freq)])
+    return insert_source_paragraph(_no_web_fonts(render_html(report)), line)
 
 
 def render_result_html(reports: Sequence[TrendReport], ranking: pd.DataFrame, source_line_ko: str) -> str:
     """``report.render_compare_html(list(reports), ranking)`` + :func:`insert_source_paragraph` with the Korean
-    ``compare.source_line`` (non-Naver, 2+ successful series). Stored as ``compare.html``."""
+    ``compare.source_line`` (non-Naver, 2+ successful series), without the web-font links. Stored as
+    ``compare.html``."""
     from ..report import render_compare_html
 
-    return insert_source_paragraph(render_compare_html(list(reports), ranking), source_line_ko)
+    line = str(source_line_ko) + _weekly_note([str(r.analysis.freq) for r in reports])
+    return insert_source_paragraph(_no_web_fonts(render_compare_html(list(reports), ranking)), line)
 
 
 def _json_number(v: Any) -> Optional[float]:
@@ -468,10 +555,15 @@ def series_csv(vm: Mapping[str, Any], *, file_id: str) -> ExportFile:
 
 
 def _series_csv(vm: Mapping[str, Any], *, file_id: str, k: "int | str | None") -> ExportFile:
+    """Model outputs (trend, forecast, bands) are rounded to 6 significant digits of the series scale (FU-12: not
+    ``31.3625540402141``); the actual values are written exactly as analysed."""
     lang = _lang(vm)
     header, rows = _series_table(vm)
+    model_from = 1 if _is_naver(vm) else 2          # the first model column (Naver has no 실제값)
+    d = _model_decimals(rows, 1)
     body = _write_csv([_series_source_line(vm), _condition_line([vm], lang)], header,
-                      [[guard_text(r[0])] + [_csv_number(v) for v in r[1:]] for r in rows])
+                      [[guard_text(r[0])] + [_csv_number(v if i < model_from else _rounded(v, d))
+                                             for i, v in enumerate(r[1:], start=1)] for r in rows])
     return _file(body, "csv", file_id, k, str(vm.get("name", "")))
 
 
@@ -503,14 +595,22 @@ def result_csv(vms: Sequence[Mapping[str, Any]], compare: Optional[Mapping[str, 
     header = list(T.EXPORT_COLUMNS["ranking"][1 if lang == "en" else 0])
     table = []
     for row in sorted(rows or [], key=lambda r: int(r.get("rank", 0))):
-        phase, word, conf = _ranking_texts(by_index.get(int(row.get("index", -1))), lang, row)
-        prob = row.get("prob_increase")
+        vm = by_index.get(int(row.get("index", -1)))
+        phase, word, conf = _ranking_texts(vm, lang, row)
+        prob = _xlsx_number(row.get("prob_increase"))
+        mom = _xlsx_number(row.get("momentum"))
+        if mom is not None and abs(mom) < 0.0005:   # float noise (−1.5e-15) prints 0, as on screen
+            mom = 0.0
+        ref = ""
+        if vm is not None:
+            ref = T.t(T.EXPORT_TEXTS, "yes" if (vm.get("flags") or {}).get("reference_only") else "no", lang)
+        # FU-12: shown precision, not 92.6547325134124 / 2.7e-22; CON-3: the weak-forecast rule as a column
         table.append([
             _csv_number(row.get("rank")), guard_text(str(row.get("name", ""))), guard_text(phase),
-            guard_text(word), _csv_number(row.get("expected_change_pct")),
-            _csv_number(None if prob is None else float(prob) * 100.0),
-            _csv_number(row.get("recent_change_pct")), _csv_number(row.get("momentum")),
-            _csv_number(row.get("score")), guard_text(conf)])
+            guard_text(word), _csv_number(_rounded(row.get("expected_change_pct"), 2)),
+            _csv_number(_prob_pct(prob)),
+            _csv_number(_rounded(row.get("recent_change_pct"), 2)), _csv_number(_rounded(mom, 3)),
+            _csv_number(_rounded(row.get("score"), 1)), guard_text(conf), guard_text(ref)])
     body = _write_csv([str(compare.get("source_line") or ""), _condition_line(vms, lang)], header, table)
     return _file(body, "csv", file_id, None, _result_name(vms, lang))
 
@@ -570,6 +670,38 @@ def _xlsx_text(cell: Any, text: Any) -> None:
     cell.data_type = "s"
 
 
+#: XLSX date formats by frequency (FU-12: real date cells Excel can group and chart)
+_XLSX_DATE_FORMATS = {"D": "yyyy-mm-dd", "W": "yyyy-mm-dd", "M": "yyyy-mm", "Q": "yyyy-mm", "Y": "yyyy"}
+
+
+def _xlsx_date(cell: Any, iso: Any, freq: str) -> None:
+    """A real date cell (``yyyy-mm-dd`` / ``yyyy-mm`` / ``yyyy`` by frequency); text when it is not a date."""
+    import datetime as _dt
+
+    try:
+        s = str(iso)
+        value = _dt.datetime(int(s[0:4]), int(s[5:7]), int(s[8:10]))
+    except (TypeError, ValueError):
+        _xlsx_text(cell, iso)
+        return
+    cell.value = value
+    cell.number_format = _XLSX_DATE_FORMATS.get(freq, "yyyy-mm-dd")
+
+
+def _number_format(decimals: int) -> str:
+    return "#,##0" + ("." + "0" * decimals if decimals > 0 else "")
+
+
+def _data_decimals(values: Sequence[Any]) -> int:
+    """Decimals the data were given with (at most 4): ``1044115`` -> 0, ``12.5`` -> 1."""
+    best = 0
+    for v in values:
+        text = _csv_number(v)
+        if "." in text:
+            best = max(best, len(text.split(".", 1)[1]))
+    return min(best, 4)
+
+
 def _xlsx_data_sheet(ws: Any, vm: Mapping[str, Any]) -> None:
     lang = _lang(vm)
     for r, (label, value) in enumerate(_xlsx_conditions(vm, lang), start=1):
@@ -579,28 +711,43 @@ def _xlsx_data_sheet(ws: Any, vm: Mapping[str, Any]) -> None:
     for c, h in enumerate(header, start=1):
         _xlsx_text(ws.cell(row=9, column=c), h)
     index_kind = (vm.get("source") or {}).get("value_kind") in ("relative_index", "relative_index_gt")
+    freq = str((vm.get("chart") or {}).get("freq") or (vm.get("source") or {}).get("freq") or "D")
+    model_from = 2 if _is_naver(vm) else 3            # sheet column of the first model output
+    if index_kind:
+        formats = {"actual": "0.0", "model": "0.0"}
+    else:   # full precision stays in the cell; only the display is rounded (FU-12)
+        formats = {"actual": _number_format(_data_decimals([r[1] for r in rows] if not _is_naver(vm) else [])),
+                   "model": _number_format(max(0, min(4, _model_decimals(rows, 1) - 1)))}
     for r, row in enumerate(rows, start=10):
-        _xlsx_text(ws.cell(row=r, column=1), row[0])
+        _xlsx_date(ws.cell(row=r, column=1), row[0], freq)
         for c, v in enumerate(row[1:], start=2):
             num = _xlsx_number(v)
             if num is None:
                 continue
             cell = ws.cell(row=r, column=c)
             cell.value = num
-            if index_kind:
-                cell.number_format = "0.0"
+            cell.number_format = formats["model" if c >= model_from else "actual"]
     ws.column_dimensions["A"].width = 26
     ws.column_dimensions["B"].width = 18
 
 
-def _summary_row(vm: Mapping[str, Any], score_text: str) -> list[str]:
+def _summary_row(vm: Mapping[str, Any], score_text: str) -> list[Any]:
+    """The summary-sheet row: the VM's texts (tiles 4 and 5 with `` · 참고용`` when ``chart.display != "normal"``,
+    the weak-forecast rule of D.2.4; CON-3) and two numeric columns, expected change % and chance of rise %
+    (FU-12: numbers Excel can sort; ``None`` when undefined)."""
+    lang = _lang(vm)
     hero = vm.get("hero") or {}
     tiles = {t.get("key"): t for t in vm.get("tiles") or []}
+    weak = str((vm.get("chart") or {}).get("display") or "normal") != "normal"
+    suffix = T.t(T.TILE_TEXTS, "for_reference", lang) if weak else ""
+    change_tile, prob_tile = tiles.get("expected_change") or {}, tiles.get("prob_increase") or {}
+    change_text, prob_text = str(change_tile.get("value") or ""), str(prob_tile.get("value") or "")
     return [str(vm.get("name", "")), str((vm.get("phase") or {}).get("name") or ""),
             str((hero.get("outlook") or {}).get("word") or ""),
-            str((tiles.get("expected_change") or {}).get("value") or ""),
-            str((tiles.get("prob_increase") or {}).get("value") or ""),
-            str((hero.get("reliability") or {}).get("label") or ""), str(hero.get("accuracy_line") or ""), score_text]
+            change_text + (suffix if change_text and change_text != "—" else ""),
+            prob_text + (suffix if prob_text and prob_text != "—" else ""),
+            str((hero.get("reliability") or {}).get("label") or ""), str(hero.get("accuracy_line") or ""), score_text,
+            _xlsx_number(_rounded(change_tile.get("value_raw"), 2)), _prob_pct(prob_tile.get("value_raw"))]
 
 
 def _workbook(vms: Sequence[Mapping[str, Any]], compare: Optional[Mapping[str, Any]]) -> bytes:
@@ -624,8 +771,13 @@ def _workbook(vms: Sequence[Mapping[str, Any]], compare: Optional[Mapping[str, A
               for r in (compare or {}).get("ranking") or []}
     for r, vm in enumerate(vms, start=2):
         row = _summary_row(vm, scores.get(int(vm.get("index", -1)), "—"))
-        for c, text in enumerate(row, start=1):
-            _xlsx_text(summary.cell(row=r, column=c), text)
+        for c, value in enumerate(row, start=1):
+            cell = summary.cell(row=r, column=c)
+            if c <= 8:
+                _xlsx_text(cell, value)
+            elif value is not None:
+                cell.value = float(value)
+                cell.number_format = "0.0"
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

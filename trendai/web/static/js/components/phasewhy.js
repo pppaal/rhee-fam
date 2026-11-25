@@ -3,7 +3,7 @@
 
 import { h } from '../dom.js';
 import { t } from '../i18n.js';
-import { cardHead, icon, pill } from '../ui.js';
+import { cardHead, disclosure, icon, pill } from '../ui.js';
 import { helpButton } from './help.js';
 
 let counter = 0;
@@ -20,15 +20,7 @@ export function renderPhaseWhy(vm) {
     if (r.detail) {
       const id = `reason-detail-${++counter}`;
       detail = h('p', { class: 'reason-detail', id, hidden: true }, r.detail);
-      toggle = h('button', {
-        type: 'button', class: 'link-btn small', 'aria-expanded': 'false', 'aria-controls': id,
-        on: {
-          click: () => {
-            detail.hidden = !detail.hidden;
-            toggle.setAttribute('aria-expanded', String(!detail.hidden));
-          },
-        },
-      }, t('detail.reason_detail'));
+      toggle = disclosure(h('button', { type: 'button', class: 'link-btn small' }, t('detail.reason_detail')), detail);
     }
     return h('li', null, icon('ui-check', { cls: 'reason-icon' }),
       h('div', null, h('span', null, r.text), toggle ? [' ', toggle] : null, detail));

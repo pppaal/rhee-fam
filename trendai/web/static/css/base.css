@@ -6,8 +6,12 @@
 html {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
-  scroll-padding-top: 120px;
+  /* --qb-h: the measured height of the sticky query bar (querybar.js); 0 on pages without one. A focused element
+     scrolled into view never ends up under the bar (WCAG 2.4.11). */
+  scroll-padding-top: calc(var(--qb-h, 0px) + 24px);
 }
+/* pages with a sticky bottom action bar (samples): keep focused controls clear of it */
+html:has(.sticky-action) { scroll-padding-bottom: 96px; }
 
 body {
   margin: 0;
@@ -39,8 +43,11 @@ a:hover { text-decoration-thickness: 2px; }
 
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 :focus:not(:focus-visible) { outline: none; }
-/* headings and regions focused by the router or a step change (tabindex=-1) get no ring */
-[tabindex="-1"]:focus { outline: none; }
+/* headings, regions and dialogs focused by the router or a step change (tabindex=-1) get no ring; roving
+   controls with tabindex=-1 (menu items, segments, radios) keep theirs */
+:is(h1, h2, h3, section, [role="dialog"], [role="status"], [role="region"], .error-card, .reading, #main)[tabindex="-1"]:focus {
+  outline: none;
+}
 
 ::selection { background: color-mix(in srgb, var(--accent) 22%, transparent); }
 

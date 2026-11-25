@@ -518,6 +518,8 @@ def test_message_catalog_renders_every_code_in_both_languages():
         # web app codes (docs/WEB_SPEC.md C.12)
         "param": "range", "group": "g1", "max_mb": 10, "retry_after": 30, "limit": 20, "fetched": "2026.11.25",
         "terms": "‘sunscreen’", "region": "KR", "span": MS.L("104주", "104 weeks"),
+        # upload reading (title rows, header row: FU-4) and filled gaps (FU-5)
+        "row": 3, "dates": "2023.06",
     }
     for code, (ko, en) in MS.MESSAGES.items():
         names = {f for t in (ko, en) for _, f, _, _ in __import__("string").Formatter().parse(t) if f}

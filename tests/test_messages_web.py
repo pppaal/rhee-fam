@@ -34,7 +34,8 @@ NEW_CODES = (
     "conn_naver_bad_response conn_naver_network conn_naver_timeout conn_naver_too_many_groups "
     "conn_naver_too_many_keywords conn_naver_bad_filter conn_bad_range conn_timeout table_too_many_columns "
     "naver_missing_filled naver_low_resolution mostly_zero_volume data_short horizon_clamped gt_detected "
-    "gt_lt1_half index_unavailable log_hint naver_cached"
+    "gt_lt1_half index_unavailable log_hint naver_cached "
+    "store_full upload_evicted wiki_not_found_no_naver gaps_filled"
 ).split()
 
 #: C.12.6 fix actions -> (ko, en) labels
@@ -57,7 +58,7 @@ NEW_PARAMS = {
     "param": "range", "max": 5, "group": "선크림", "name": "growing", "max_mb": 10, "n": 3, "col": "날짜",
     "retry_after": 30, "limit": 20, "title": "선크림", "status": 401, "error": "URLError: boom", "what": "device",
     "value": "'tv'", "terms": "‘선크림’", "region": "대한민국", "span": L("104주", "104 weeks"), "ratio": 20,
-    "fetched": "2026.11.25 09:12",
+    "fetched": "2026.11.25 09:12", "dates": "2023.06, 2024.07",
 }
 
 

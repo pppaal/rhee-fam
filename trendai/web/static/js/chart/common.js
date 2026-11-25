@@ -7,6 +7,64 @@ import { slotIconPath } from './geom.js';
 /** Container width from which the charts use the wide layout (F.7.1, F.10). */
 export const WIDE_PX = 640;
 
+/**
+ * Texts for catalog keys the charts started using after the catalog was written (UX-4, UX-14). uiText() uses them
+ * only while i18n's `t` returns the key itself (a missing key); the catalog stays the source of truth once it has
+ * the key.
+ */
+const FALLBACK_TEXTS = {
+  'chart.window_note': { ko: '최근 {span} 표시 중', en: 'Showing the last {span}' },
+  'chart.window_full': { ko: '전체 기간', en: 'Full period' },
+  'compare.bands_hint': {
+    ko: '{name}의 예측 범위예요. 다른 선을 가리키거나 누르면 바뀌어요.',
+    en: 'Forecast range of {name}. Point at or tap another line to switch.',
+  },
+};
+
+/**
+ * Catalog text through the chart's `t` option, with the FALLBACK_TEXTS entry while the catalog lacks `key`.
+ * @param {(key: string, params?: Object) => string} t
+ * @param {'ko'|'en'} lang
+ * @param {string} key
+ * @param {Object} [params]
+ * @returns {string}
+ */
+export function uiText(t, lang, key, params) {
+  const text = t(key, params);
+  if (text && text !== key) return text;
+  const fb = FALLBACK_TEXTS[key];
+  if (!fb) return text;
+  return (lang === 'en' ? fb.en : fb.ko).replace(/\{([A-Za-z0-9_]+)\}/g,
+    (m, name) => (params && params[name] != null ? String(params[name]) : m));
+}
+
+/**
+ * The "full period" toggle under a narrow chart whose history is windowed (scale.narrowWindow, UX-4):
+ * `div.chart-range > span.chart-range-note + button.chip.chip-toggle[aria-pressed]` (the page's toggle-chip style,
+ * 44 px tall below 640 px). Hidden while no window applies.
+ * @param {() => void} onToggle
+ * @returns {{el: HTMLElement, set: (state: {shown: boolean, full?: boolean, note?: string, label?: string}) => void}}
+ */
+export function rangeControl(onToggle) {
+  const note = h('span', { class: 'chart-range-note' });
+  const btn = h('button', {
+    type: 'button', class: 'chip chip-toggle chip-small chart-range-btn', 'aria-pressed': 'false',
+    on: { click: () => onToggle() },
+  });
+  const el = h('div', { class: 'chart-range', hidden: true }, note, btn);
+  return {
+    el,
+    set({ shown, full = false, note: noteText = '', label = '' }) {
+      el.hidden = !shown;
+      if (!shown) return;
+      note.textContent = full ? '' : noteText;
+      note.hidden = full || !noteText;
+      btn.textContent = label;
+      btn.setAttribute('aria-pressed', full ? 'true' : 'false');
+    },
+  };
+}
+
 let seq = 0;
 /** A document-unique id for <title>/<desc>/<clipPath> references. */
 export function uid(prefix) {
@@ -75,13 +133,15 @@ export function lineKey(style, cls) {
 }
 
 /**
- * A slot icon glyph (●◆⬢■✚ drawn as paths, so it also survives PNG export) for legends and read-outs.
+ * A slot icon glyph (●◆⬢■✚ drawn as paths, so it also survives PNG export) for legends and read-outs, 14 px: at
+ * 10–12 px on a 1× screen the slot-3 hexagon rendered as a dot, the same shape as slot 1's circle, and the icon is
+ * the colour-blind second cue (UX-29; geom.slotIconPath also draws the hexagon a quarter larger).
  * @param {string|null} icon  circle | diamond | hexagon | square | cross | null (null → a small dot)
  * @param {string|string[]} cls  colour class (chart-slot-N / chart-grey)
- * @param {number} [size=12]
+ * @param {number} [size=14]
  * @returns {SVGSVGElement}
  */
-export function slotGlyph(icon, cls, size = 12) {
+export function slotGlyph(icon, cls, size = 14) {
   const r = icon ? size * 0.36 : size * 0.22;
   return svg('svg', {
     class: ['chart-glyph', cls], width: size, height: size, viewBox: `0 0 ${size} ${size}`,

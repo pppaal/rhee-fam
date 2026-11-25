@@ -137,8 +137,7 @@
 
 .chart-glyph-shape {
   fill: var(--series, var(--c-hist));
-  stroke: var(--surface);
-  stroke-width: 1;
+  stroke: none;                        /* a surface outline would eat the corners that tell ⬢ from ● at 1× (UX-29) */
 }
 
 /* ------------------------------------------------------------------------------------------- axes and grid */
@@ -520,6 +519,29 @@
   margin: 0 0 var(--s-2);
   font-size: var(--fs-cap);
   color: var(--ink-3);
+}
+
+/* whose band 예측 범위 보기 shows (UX-14): under the plot, so its text changing never moves the chart */
+.chart-band-hint {
+  margin: var(--s-2) 0 0;
+  color: var(--ink-2);
+}
+
+/* narrow charts: the history window note and the 전체 기간 toggle (UX-4); the button is the page's .chip-toggle */
+.chart-range {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-2);
+  margin: var(--s-2) 0 0;
+  font-size: var(--fs-cap);
+  color: var(--ink-2);
+}
+
+.chart-range[hidden],
+.chart-range-note[hidden] {
+  display: none;
 }
 
 @media (max-width: 639px) {

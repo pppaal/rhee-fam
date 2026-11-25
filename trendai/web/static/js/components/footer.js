@@ -1,4 +1,5 @@
-// Footer (spec F.6.18, G.7): disclaimers, links, 광고 없음, version. Owner: WP3-app.
+// Footer (spec F.6.18, G.7): disclaimers, links, 광고 없음, version. Owner: WP3-app. The first disclaimer is hidden
+// while a detail view shows the same sentence in 주의할 점 (html.has-disclaimer, UX-27).
 
 import { clear, h } from '../dom.js';
 import { t } from '../i18n.js';
@@ -13,7 +14,7 @@ export function renderFooter(root, opts) {
     t('footer.links.settings'));
   root.appendChild(h('div', { class: 'footer-inner' },
     h('div', { class: 'footer-text' },
-      h('p', null, t('footer.disclaimer')),
+      h('p', { class: 'footer-disclaimer' }, t('footer.disclaimer')),
       h('p', null, t('footer.not_advice'))),
     h('nav', { class: 'footer-links', 'aria-label': t('footer.nav') },
       h('a', { href: '/method' }, t('footer.links.method')),

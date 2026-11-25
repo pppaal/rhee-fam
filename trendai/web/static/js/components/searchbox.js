@@ -6,7 +6,9 @@
 // focuses the last chip; Backspace/Delete on a chip removes it; × removes it; clicking a Naver chip opens the chip
 // editor. 분석 (or Enter on an empty input with at least one chip) submits. A 6th series is refused with a toast;
 // Wikipedia refuses '+' groups; terms are at most 50 characters. For `sample` the input is replaced by the sample
-// chips (multi-select, up to 5).
+// chips (multi-select, up to 5). Refusals are 'warning' toasts (UX-12); the hint line hides while an error says the
+// same thing (UX-27). Only Naver chips have a focusable name (it opens the editor); other chips are reached through
+// their × button, which also takes Backspace / Delete (A11Y-21).
 
 import { h, clear } from '../dom.js';
 import { t } from '../i18n.js';
@@ -19,15 +21,17 @@ import { toast } from './toast.js';
 let counter = 0;
 
 /**
- * @param {{source: 'naver'|'wiki'|'sample', series?: string[][], samples?: Array<{name: string, title: string}>,
+ * @param {{source: 'naver'|'wiki'|'sample', wikiLang?: string, series?: string[][],
+ *          samples?: Array<{name: string, title: string}>,
  *          onSubmit: (series: string[][]) => void, onChange?: (series: string[][]) => void,
  *          onFocusChange?: (focused: boolean) => void}} opts
- * @returns {{el: HTMLElement, setSource: (s: string) => void, setSamples: (list: Array) => void,
- *            getSeries: () => string[][], focus: () => void, submit: () => void}}
+ * @returns {{el: HTMLElement, setSource: (s: string) => void, setWikiLang: (wl: string) => void,
+ *            setSamples: (list: Array) => void, getSeries: () => string[][], focus: () => void, submit: () => void}}
  */
 export function createSearchBox(opts) {
   const id = `search-${++counter}`;
   let source = opts.source;
+  let wikiLang = opts.wikiLang || 'ko';
   let series = (opts.series || []).map((terms) => [...terms]);
   let samples = opts.samples || null;
   let composing = false;
@@ -64,6 +68,7 @@ export function createSearchBox(opts) {
 
   function setError(message) {
     error.textContent = message || '';
+    hint.hidden = Boolean(message);
     if (message) input.setAttribute('aria-invalid', 'true');
     else input.removeAttribute('aria-invalid');
   }
@@ -98,7 +103,7 @@ export function createSearchBox(opts) {
       return true;
     }
     if (series.length >= MAX_SERIES) {
-      toast(t('search.too_many'));
+      toast(t('search.too_many'), { kind: 'warning' });
       return false;
     }
     series.push(terms);
@@ -128,7 +133,7 @@ export function createSearchBox(opts) {
     }
     if (e.key === 'Backspace' && !input.value && series.length) {
       e.preventDefault();
-      const last = chipList.querySelector('li:last-child .chip-main');
+      const last = chipList.querySelector('li:last-child button.chip-main, li:last-child .chip-x');
       if (last) last.focus();
     }
   }
@@ -150,8 +155,10 @@ export function createSearchBox(opts) {
     series.splice(i, 1);
     changed();
     if (refocus) {
-      const chips = chipList.querySelectorAll('.chip-main');
-      if (chips.length) chips[Math.min(i, chips.length - 1)].focus();
+      const chips = chipList.querySelectorAll('li');
+      const li = chips.length ? chips[Math.min(i, chips.length - 1)] : null;
+      const target = li ? li.querySelector('button.chip-main, .chip-x') : null;
+      if (target) target.focus();
       else input.focus();
     }
   }
@@ -161,19 +168,18 @@ export function createSearchBox(opts) {
     series.forEach((terms, i) => {
       const name = seriesName(terms);
       const editable = source === 'naver';
-      const main = h(editable ? 'button' : 'span', {
-        type: editable ? 'button' : null, class: 'chip-main', tabindex: editable ? null : '0',
-        'aria-label': editable ? t('search.edit_chip', { name }) : null,
-        on: {
-          click: editable ? (e) => editAt(i, e.currentTarget) : null,
-          keydown: (e) => {
-            if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); removeAt(i); }
-          },
-        },
-      }, name);
+      const onKey = (e) => {
+        if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); removeAt(i); }
+      };
+      const main = editable
+        ? h('button', {
+          type: 'button', class: 'chip-main', 'aria-label': t('search.edit_chip', { name }),
+          on: { click: (e) => editAt(i, e.currentTarget), keydown: onKey },
+        }, name)
+        : h('span', { class: 'chip-main' }, name);
       const remove = h('button', {
         type: 'button', class: 'chip-x', 'aria-label': t('a11y.remove', { name }),
-        on: { click: () => removeAt(i) },
+        on: { click: () => removeAt(i), keydown: onKey },
       }, icon('ui-close'));
       chipList.appendChild(h('li', { class: 'chip chip-series' }, main, remove));
     });
@@ -203,7 +209,7 @@ export function createSearchBox(opts) {
             const i = series.findIndex((terms) => terms[0] === s.name);
             if (i >= 0) series.splice(i, 1);
             else if (series.length >= MAX_SERIES) {
-              toast(t('samples.max'));
+              toast(t('samples.max'), { kind: 'warning' });
               return;
             } else series.push([s.name]);
             if (opts.onChange) opts.onChange(series.map((x) => [...x]));
@@ -214,13 +220,18 @@ export function createSearchBox(opts) {
     }
   }
 
+  function placeholder() {
+    if (source !== 'wiki') return t('search.placeholder.naver');
+    return t(wikiLang === 'en' ? 'search.placeholder.wiki_en' : 'search.placeholder.wiki');
+  }
+
   function applySource() {
     form.dataset.mode = source;
     const sample = source === 'sample';
     input.hidden = sample;
     chipList.hidden = sample;
     sampleBox.hidden = !sample;
-    input.placeholder = t(`search.placeholder.${source === 'wiki' ? 'wiki' : 'naver'}`);
+    input.placeholder = placeholder();
     hint.textContent = sample ? t('search.placeholder.sample') : t(source === 'wiki' ? 'search.hint.wiki' : 'search.hint');
     setError('');
     renderChips();
@@ -248,6 +259,10 @@ export function createSearchBox(opts) {
       if (next === 'wiki') series = series.map((terms) => terms.slice(0, 1));
       applySource();
       if (opts.onChange) opts.onChange(series.map((s) => [...s]));
+    },
+    setWikiLang(wl) {
+      wikiLang = wl;
+      input.placeholder = placeholder();
     },
     setSamples(list) {
       samples = list;

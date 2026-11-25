@@ -22,7 +22,7 @@ __all__ = [
     "SAMPLE_TITLES", "SAMPLE_TITLES_EN", "SAMPLE_DESCRIPTIONS_EN", "NAVER_AGE_LABELS",
     "TILE_LABELS", "TILE_HELP", "TILE_TEXTS", "MOMENTUM_WORDS", "MOMENTUM_UNITS", "VOLATILITY_WORDS", "PEAK_TEXTS",
     "PHASE_SHORT", "LIKELIHOOD_WORDS", "PROB_TEXTS", "CERTAINTY_LABELS", "RELIABILITY_LABELS", "HERO_TEXTS",
-    "ACCURACY_TEXTS", "REFERENCE_NOTES", "PHASE_TEXTS",
+    "ACCURACY_TEXTS", "REFERENCE_NOTES", "PHASE_TEXTS", "SEASON_TEXTS",
     "SOURCE_LABELS", "SOURCE_SHORT", "WIKI_LANG_NAMES", "SOURCE_LINE_TEXTS", "VALUE_KIND_LABELS",
     "VALUE_KIND_NOTES", "VALUE_WORDS", "INDEX_UNIT_WORDS", "FILTER_LABELS",
     "CHART_TEXTS", "STRENGTH_WORDS", "PAST_TEXTS", "SCENARIO_TEXTS", "FUTURE_TEXTS",
@@ -100,9 +100,10 @@ TILE_HELP: dict[str, tuple[str, str]] = {
     "momentum": ("최근 기울기와 장기 기울기의 차이예요(현재 추세 수준 대비 %p). +면 장기 평균보다 빨리 오르는 중이에요.",
                  "Recent slope minus long-run slope, in percentage points of the current trend level. Positive "
                  "means rising faster than usual."),
-    "expected_change": ("예측 마지막 한 주기의 평균을 최근 한 주기의 평균과 비교한 값이에요. 특정 시점 한 값의 변화가 아니에요.",
-                        "The average of the last forecast cycle compared with the average of the last observed "
-                        "cycle — not the change of a single point."),
+    "expected_change": ("예측 기간의 평균(예측이 한 주기보다 길면 마지막 한 주기)을 최근 한 주기의 평균과 비교한 값이에요. "
+                        "특정 시점 한 값의 변화가 아니에요.",
+                        "The average over the forecast (its last cycle when the forecast is longer than one cycle) "
+                        "compared with the average of the last observed cycle — not the change of a single point."),
     "prob_increase": ("같은 두 평균에서 미래 평균이 더 높을 확률이에요.",
                       "The chance that the future average is higher than the recent one (same two averages)."),
     "peak_season": ("계절 성분이 가장 높은 시기와 오르기 시작하는 시기예요. 계절성이 뚜렷할 때만 보여 드려요.",
@@ -127,6 +128,8 @@ TILE_TEXTS: dict[str, tuple[str, str]] = {
     "tentative_suffix": ("(잠정)", " (tentative)"),
     "volatility_sub": ("잔차 변동 {cv}%", "residual CV {cv}%"),
     "not_computed": ("계산하지 않음", "not computed"),
+    "prob_adjusted": ("이번에는 계절 높낮이를 뺀 평균끼리 비교했어요.",
+                      "Here the averages are compared with the seasonal swing removed."),
 }
 
 #: Momentum word key -> (ko, en) (D.2.4).
@@ -224,6 +227,34 @@ HERO_TEXTS: dict[str, tuple[str, str]] = {
     "seasonal_note": ("계절성 뚜렷", "strongly seasonal"),
 }
 
+#: Seasonal adjustment of the outlook (FU-3): the forecast window covers only part of a season, so the engine compares
+#: seasonally adjusted averages (``report._change_basis`` prefix ``계절 보정한``). ``adjust_note`` explains it (tile
+#: tooltips); ``context_*`` is the second hero sentence when the raw forecast line moves against the adjusted call;
+#: ``short_*`` is the summary-line / rank-card suffix. ``{topic}`` is the 은/는 particle after ``{h}``.
+SEASON_TEXTS: dict[str, tuple[str, str]] = {
+    "adjust_note": ("{spans} 구간은 계절 주기({period})를 다 채우지 못해, 그 구간의 평균적인 계절 높낮이를 빼고 비교했어요.",
+                    "The {spans} {window} only part of the seasonal cycle ({period}), so the average seasonal "
+                    "swing of that window was removed before comparing."),
+    "window_one": ("", "window covers"),
+    "window_many": ("", "windows cover"),
+    "spans_sep": ("·", " and "),
+    "context_low": ("다만 앞으로 {h}{topic} 계절적으로 낮은 시기라 예측선은 내려가요{peak}. 계절 높낮이를 빼고 보면 {flow} "
+                    "흐름이에요.",
+                    "That said, the next {h} are a seasonal low, so the forecast line falls{peak}; with the seasonal "
+                    "swing removed, the trend is {flow}."),
+    "context_high": ("다만 앞으로 {h}{topic} 계절적으로 높은 시기라 예측선은 올라가요{peak}. 계절 높낮이를 빼고 보면 {flow} "
+                     "흐름이에요.",
+                     "That said, the next {h} are a seasonal high, so the forecast line rises{peak}; with the "
+                     "seasonal swing removed, the trend is {flow}."),
+    "peak": (" (보통 {peak} 정점)", " (usually peaks in {peak})"),
+    "flow_up": ("오르는", "rising"),
+    "flow_down": ("내리는", "falling"),
+    "flow_flat": ("큰 변화 없는", "roughly flat"),
+    "flow_uncertain": ("방향이 뚜렷하지 않은", "without a clear direction"),
+    "short_low": (" · 앞으로 계절적 비수기", " · seasonal low ahead"),
+    "short_high": (" · 앞으로 계절적 성수기", " · seasonal high ahead"),
+}
+
 #: Accuracy lines and the MASE note (D.2.3, D.2.8).
 ACCURACY_TEXTS: dict[str, tuple[str, str]] = {
     "better": ("과거 데이터 검증: 단순 예측보다 오차 약 {g}% 작음",
@@ -246,14 +277,18 @@ ACCURACY_TEXTS: dict[str, tuple[str, str]] = {
 
 #: Display -> (ko, en) ``hero.reference_note`` (D.2.3).
 REFERENCE_NOTES: dict[str, tuple[str, str]] = {
-    "bands_only": ("예측력이 낮아 범위만 참고용으로 보여 드려요.",
+    "bands_only": ("단순 예측보다 낫지 않아 범위만 참고용으로 보여 드려요.",
                    "The forecast did not beat a naive one, so only the range is shown, for reference."),
     "weak": ("예측 신뢰도가 낮아 중앙선은 참고용이에요.", "Low reliability: treat the centre line as a rough guide."),
+    "weak_unverified": ("정확도를 검증하지 못해 중앙선은 참고용이에요.",
+                        "Accuracy could not be checked, so treat the centre line as a rough guide."),
 }
 
-#: Phase texts (D.2.5): the single English reason used when no phase reason survives ``translate_reason``.
+#: Phase texts (D.2.5): the single English reason used when no phase reason survives ``translate_reason``, and the
+#: label of the phase-judgement window in the "최근 N 동안 추세가 …" reason (FU-7: three windows were all "최근").
 PHASE_TEXTS: dict[str, tuple[str, str]] = {
     "reasons_fallback": ("국면 판단 규칙은 방법 페이지에서 볼 수 있어요.", "See the method page for the rules."),
+    "window_label": ("(국면 판단 구간)", " (the phase-judgement window)"),
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -359,6 +394,8 @@ CHART_TEXTS: dict[str, tuple[str, str]] = {
                "This term is small relative to the query's maximum (100), so the vertical axis is zoomed in."),
     "anomaly_text": ("평소보다 크게 {direction} · 실제 {v} / {expected_word} {e}",
                      "Far {direction} the usual range · actual {v} / {expected_word} {e}"),
+    "anomaly_text_small": ("평소보다 약간 {direction} · 실제 {v} / {expected_word} {e}",
+                           "Slightly {direction} the usual range · actual {v} / {expected_word} {e}"),
     "anomaly_up": ("높음", "above"),
     "anomaly_down": ("낮음", "below"),
     "expected": ("예상", "expected"),
@@ -402,6 +439,8 @@ SCENARIO_TEXTS: dict[str, tuple[str, str]] = {
              "‘Expected change’ above (average vs. average)."),
     "floor": ("0(하한)", "0 (floor)"),
     "range_sep": ("~", "–"),
+    "note_bands_only": (" 단순 예측보다 낫지 않아 가운데 값(기준)은 참고용이에요.",
+                        " The forecast did not beat a naive one, so the base value is only a rough guide."),
 }
 
 #: Future phase and peak texts (D.2.8).
@@ -429,8 +468,10 @@ NARRATIVE_TEXTS: dict[str, tuple[str, str]] = {
     "badge_ai": ("AI 해석 · Claude", "AI · Claude"),
     "ai_note": ("AI가 작성한 해석이에요. 수치는 위 분석 결과를 근거로 해요.",
                 "Written by AI. The figures are based on the analysis above."),
-    "ai_privacy_note": ("계산된 요약 수치(JSON)만 Anthropic으로 보내요. 원본 데이터는 보내지 않아요.",
-                        "Only the computed summary figures (JSON) are sent to Anthropic, never the original data."),
+    "ai_privacy_note": ("‘AI로 다시 쓰기’를 누르면 계산된 수치와 함께 시계열 값 일부(최대 60개, 짧은 데이터는 전부)와 이름을 "
+                        "Anthropic으로 보내요. 파일 자체는 보내지 않아요.",
+                        "‘Rewrite with AI’ sends Anthropic the computed figures plus up to 60 values of the series "
+                        "(all of them for short series) and its name — never the file itself."),
     "disclaimer": ("예측은 과거 패턴이 이어진다고 가정해요. 갑작스러운 사건이나 외부 변수(가격·광고·휴일)는 반영하지 못해요.",
                    "Forecasts assume past patterns continue. Sudden events and outside factors (prices, ads, "
                    "holidays) are not included."),
@@ -446,6 +487,7 @@ SUMMARY_TEXTS: dict[str, tuple[str, str]] = {
     "bands_only": (" (참고용: 단순 예측보다 낫지 않음)", " (for reference: did not beat a naive forecast)"),
     "weak": (" (참고용 예측)", " (forecast for reference only)"),
     "as_of": (" (데이터 기준 {as_of})", " (data as of {as_of})"),
+    "as_of_analysed": (" (분석 {as_of})", " (analysed {as_of})"),
 }
 
 #: Compare texts (D.4).
@@ -494,6 +536,13 @@ EXPORT_TEXTS: dict[str, tuple[str, str]] = {
     "conf_high": ("높음", "high"),
     "conf_medium": ("보통", "medium"),
     "conf_low": ("낮음", "low"),
+    "yes": ("예", "yes"),
+    "no": ("아니요", "no"),
+    "weekly_dates_note": (" · 아래 보고서의 주별 날짜는 각 주의 시작일(월요일)이에요",
+                          " · weekly dates in the report below are each week's start (Monday)"),
+    "naver_narrative_excluded": ("해석 문장은 네이버 원본 값(ratio)을 인용하므로 이용약관상 포함하지 않았어요.",
+                                 "The narrative quotes raw Naver values (ratio), so it is excluded under its terms of "
+                                 "use."),
 }
 
 #: Column-header lists, each a ``(ko_list, en_list)`` pair (C.10, G.8).
@@ -501,14 +550,15 @@ EXPORT_COLUMNS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "series": (("날짜", "실제값", "추세", "예측값", "80% 하한", "80% 상한", "95% 하한", "95% 상한"),
                ("date", "actual", "trend", "forecast", "lo80", "hi80", "lo95", "hi95")),
     "ranking": (("순위", "이름", "국면", "전망", "예측 변화(%)", "상승 확률(%)", "최근 변화(%)", "모멘텀(%p/기간)",
-                 "상승 점수", "예측 신뢰도"),
+                 "상승 점수", "예측 신뢰도", "참고용 예측"),
                 ("rank", "name", "phase", "outlook", "expected change (%)", "chance of rise (%)",
-                 "recent change (%)", "momentum (pp/period)", "rising score", "reliability")),
+                 "recent change (%)", "momentum (pp/period)", "rising score", "reliability", "reference only")),
     "values": (("날짜",), ("date",)),
     "xlsx_conditions": (("출처", "검색어 그룹/열", "기간", "단위", "조건(기기·성별·연령)", "데이터 기준", "값의 성격"),
                         ("Source", "Groups/columns", "Period", "Unit", "Filters (device · gender · age)",
                          "Data as of", "Value kind")),
-    "summary_sheet": (("이름", "국면", "전망", "예측 변화", "상승 확률", "예측 신뢰도", "정확도", "상승 점수"),
+    "summary_sheet": (("이름", "국면", "전망", "예측 변화", "상승 확률", "예측 신뢰도", "정확도", "상승 점수",
+                       "예측 변화(%)", "상승 확률(%)"),
                       ("Name", "Phase", "Outlook", "Expected change", "Chance of rise", "Reliability", "Accuracy",
-                       "Rising score")),
+                       "Rising score", "Expected change (%)", "Chance of rise (%)")),
 }

@@ -1,7 +1,10 @@
 // Detail view of one series (spec F.6.9, brief §3.5) — fixed card order: header (← 비교로 when focused, swatch + name,
 // 가상 데이터 badge, 공유, 내보내기 ▾, 표) · source line + notices · hero · tiles · chart card (80% / 95% / 추세선 /
 // 이상치 toggles, fan chart or its table, band legend, caption, y_note, value-kind note) · 현재 · 과거 · 미래 · 해석 ·
-// 주의할 점. The first Naver result shows a one-time explainer card. Owner: WP3-app.
+// 주의할 점. The first Naver result shows a one-time explainer card — after the hero and tiles, so the first screen on
+// a phone always holds the phase badge and the outlook (UX-3). The chart card has the same head as the comparison's
+// (title · ? · ⋯ with CSV / 이미지 / 링크 복사, UX-22); in table mode the chart-only toggles and legend are hidden
+// (UX-32). While the view shows the caveats disclaimer, the footer's identical line is hidden (UX-27). Owner: WP3-app.
 
 import { h, clear } from '../dom.js';
 import { getLang, t } from '../i18n.js';
@@ -11,12 +14,13 @@ import { createFanChart } from '../chart/fanchart.js';
 import { createCaveats } from '../components/caveats.js';
 import { seriesTable } from '../components/datatable.js';
 import { renderFuture } from '../components/future.js';
+import { helpButton } from '../components/help.js';
 import { renderHero } from '../components/hero.js';
 import { createNarrative } from '../components/narrative.js';
 import { noticeList } from '../components/notices.js';
 import { createPast } from '../components/past.js';
 import { renderPhaseWhy } from '../components/phasewhy.js';
-import { exportMenu, shareButton, summaryUrl } from '../components/sharemenu.js';
+import { chartMoreMenu, exportMenu, shareButton, summaryUrl } from '../components/sharemenu.js';
 import { noteLine, sourceLine } from '../components/sourceline.js';
 import { renderTiles } from '../components/tiles.js';
 
@@ -30,7 +34,18 @@ export function naverExplainer() {
       h('p', null, t('naver_explainer.body')),
       h('button', {
         type: 'button', class: 'btn btn-secondary btn-small',
-        on: { click: () => { store.dismissNaverExplainer(); card.remove(); } },
+        on: {
+          click: () => {
+            store.dismissNaverExplainer();
+            // the button goes with the card: keep focus at that place in the page
+            const next = card.nextElementSibling;
+            card.remove();
+            if (next) {
+              next.setAttribute('tabindex', next.getAttribute('tabindex') || '-1');
+              next.focus({ preventScroll: true });
+            }
+          },
+        },
       }, t('naver_explainer.ok'))));
   return card;
 }
@@ -81,14 +96,23 @@ export function createDetailView(opts) {
   const t95 = toggle(t('detail.toggle.band95'), b95, () => setBand());
   const tTrend = toggle(t('detail.toggle.trend'), true, (on) => { toggles.trend = on; if (chart) chart.setToggles({ trend: on }); });
   const tAnom = toggle(t('detail.toggle.anomalies'), true, (on) => { toggles.anomalies = on; if (chart) chart.setToggles({ anomalies: on }); });
-  const chartCard = h('section', { class: 'card chart-card', id: 'chart-card', 'aria-labelledby': 'chart-title' },
-    cardHead({ title: t('detail.chart.title'), id: 'chart-title', actions: [h('div', { class: 'toggle-row', role: 'group', 'aria-label': t('detail.chart.title') }, t80, t95, tTrend, tAnom)] }),
-    chartBox,
-    tableBox,
+  const toggleRow = h('div', { class: 'toggle-row', role: 'group', 'aria-label': t('detail.chart.title') }, t80, t95, tTrend, tAnom);
+  const pngOpts = { getChart: () => chart, title: vm.chart.title || vm.name, footer: vm.source.line, name: vm.name };
+  // chart-only parts: hidden while the table is shown (UX-32)
+  const chartOnly = [
     h('p', { class: 'chart-legend-line' },
       h('span', { class: 'band-key band-key-80', 'aria-hidden': 'true' }), h('span', { class: 'band-key band-key-95', 'aria-hidden': 'true' }),
       t('chart.legend_bands')),
     h('p', { class: 'chart-caption muted small' }, t('chart.band_caption')),
+  ];
+  const chartCard = h('section', { class: 'card chart-card', id: 'chart-card', 'aria-labelledby': 'chart-title' },
+    cardHead({
+      title: t('detail.chart.title'), id: 'chart-title', help: helpButton(t('detail.chart.title'), t('help.bands')),
+      actions: [toggleRow, env ? chartMoreMenu({ env, ctx, csv: vm.exports && vm.exports.csv, png: pngOpts }) : null].filter(Boolean),
+    }),
+    chartBox,
+    tableBox,
+    chartOnly,
     vm.chart.y_note ? h('p', { class: 'chart-caption muted small' }, vm.chart.y_note) : null,
     noteLine(vm.source.value_kind_note, { naver, className: 'muted small' }));
 
@@ -107,6 +131,8 @@ export function createDetailView(opts) {
     tableBtn.setAttribute('aria-pressed', String(table));
     chartBox.hidden = table;
     tableBox.hidden = !table;
+    toggleRow.hidden = table;
+    for (const node of chartOnly) node.hidden = table;
     if (table && !tableBox.firstChild) tableBox.appendChild(seriesTable(vm, lang));
   }
 
@@ -133,17 +159,20 @@ export function createDetailView(opts) {
   const el = h('div', { class: 'view detail-view' },
     head,
     opts.banner || null,
-    naver ? naverExplainer() : null,
     sourceLine(vm.source.line, { naver }),
     noticeList(notices, fixCtx),
     renderHero(vm),
     renderTiles(vm),
+    naver ? naverExplainer() : null,
     chartCard,
     renderPhaseWhy(vm),
     past.el,
     renderFuture(vm),
     narrative.el,
     caveats.el);
+
+  const disclaimer = Boolean(vm.caveats && vm.caveats.disclaimer);
+  if (disclaimer) document.documentElement.classList.add('has-disclaimer');
 
   // the chart needs a laid-out container: create it once the view is in the document
   requestAnimationFrame(() => {
@@ -166,6 +195,7 @@ export function createDetailView(opts) {
       applyView();
     },
     destroy() {
+      if (disclaimer) document.documentElement.classList.remove('has-disclaimer');
       narrative.destroy();
       if (chart) chart.destroy();
       clear(chartBox);

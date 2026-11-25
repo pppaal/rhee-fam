@@ -4,6 +4,7 @@
 import { h } from '../dom.js';
 import { getLang, t } from '../i18n.js';
 import * as store from '../store.js';
+import { radioList } from '../ui.js';
 import { openSheet } from './sheet.js';
 
 /** Apply a theme choice ('system' | 'light' | 'dark') to <html> and storage. */
@@ -26,23 +27,15 @@ export function currentTheme() {
   return store.getTheme() || 'system';
 }
 
-let counter = 0;
-
 function radioGroup(name, legend, options, value, onChange) {
-  const id = `${name}-${++counter}`;
   return h('fieldset', { class: 'field radio-group' },
     h('legend', { class: 'field-label' }, legend),
-    h('div', { class: 'radio-list' }, options.map(([v, label]) => h('label', { class: 'radio' },
-      h('input', {
-        type: 'radio', name: id, value: v, props: { checked: v === value },
-        on: { change: (e) => { if (e.target.checked) onChange(v); } },
-      }),
-      h('span', null, label)))));
+    radioList(name, options.map(([v, label]) => ({ value: v, label })), value, onChange));
 }
 
 /**
- * Open the settings dialog.
- * @param {{opener?: HTMLElement, onThemeChange?: (mode: string) => void}} [opts]
+ * Open the settings dialog. A theme change dispatches `trendai:theme` on document (app.js updates the top bar).
+ * @param {{opener?: HTMLElement|(() => HTMLElement|null), onThemeChange?: (mode: string) => void}} [opts]
  */
 export function openSettings(opts = {}) {
   const content = [

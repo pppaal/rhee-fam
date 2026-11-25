@@ -7,6 +7,9 @@
   under the root (``os.path.commonpath``).
 * Reads treat an expired file -- or a result/share stored with another ``WEB_VM_SCHEMA`` -- as absent and delete
   expired ones best-effort. Unreadable files are tolerated (treated as absent) and swept after an hour.
+* A share snapshot hard-links the result's files (one copy on disk however often a result is shared). Size eviction
+  counts results and caches only, against ``max`` minus what shares use (at most half of ``max``): shares can never
+  make the sweeper delete every result, and new shares are refused above the share quota (``api.post_share``).
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from typing import Any, Callable, Iterator, Mapping, Optional
 
 from .http import valid_id
 
-__all__ = ["Store", "utc_iso", "parse_iso", "SUBDIRS"]
+__all__ = ["Store", "utc_iso", "parse_iso", "iso_date", "SUBDIRS", "MIN_FREE_BYTES", "SHARE_QUOTA_RATIO"]
 
 LOG = logging.getLogger("trendai.web")
 
@@ -37,6 +40,11 @@ _LANGS = ("ko", "en")
 _CACHE_KINDS = ("naver", "wiki")
 _STALE_UNREADABLE_S = 3600.0
 _BUDGET_KEEP_DAYS = 400
+#: below this much free disk space the store counts as not writable (health ``degraded``, no new shares)
+MIN_FREE_BYTES = 50 * 1024 * 1024
+#: shares may use at most this share of ``store_max_mb`` (the rest is the results' budget)
+SHARE_QUOTA_RATIO = 0.5
+_AI_NAME_RX = re.compile(r"^(?:0|[1-9][0-9]?)-(?:ko|en)\.json$")
 
 
 def utc_iso(t: _dt.datetime) -> str:
@@ -44,6 +52,12 @@ def utc_iso(t: _dt.datetime) -> str:
     if t.tzinfo is None:
         t = t.replace(tzinfo=_dt.timezone.utc)
     return t.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def iso_date(ts: Any) -> str:
+    """``YYYY-MM-DD`` of a date / timestamp from its fields (no ``strftime``: years after 9999 are possible), the one
+    rule of the backend's stored dates (data caches, upload detection)."""
+    return f"{ts.year:04d}-{ts.month:02d}-{ts.day:02d}"
 
 
 def parse_iso(text: Any) -> Optional[_dt.datetime]:
@@ -97,15 +111,25 @@ class Store:
         os.chmod(path, 0o700)
 
     def writable(self) -> bool:
-        """Whether a file can be created in the root (``/api/health``)."""
+        """Whether results can be written (``/api/health``): a file can be created in the root *and* at least
+        :data:`MIN_FREE_BYTES` are free (creating an empty file still works on a full disk)."""
         probe = os.path.join(self.root, f".probe-{secrets.token_hex(6)}")
         try:
             fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
             os.unlink(probe)
-            return True
         except OSError:
             return False
+        free = self.free_bytes()
+        return free is None or free >= MIN_FREE_BYTES
+
+    def free_bytes(self) -> Optional[int]:
+        """Free bytes for an unprivileged writer on the store's file system, ``None`` when unknown."""
+        try:
+            st = os.statvfs(self.root)
+        except (OSError, AttributeError):
+            return None
+        return int(st.f_bavail) * int(st.f_frsize)
 
     def _path(self, *parts: str) -> str:
         path = os.path.join(self.root, *parts)
@@ -188,23 +212,40 @@ class Store:
             raise ValueError("invalid store file name")
         return self._path(area, item_id, name)
 
-    def save_dir(self, area: str, item_id: str, files: Mapping[str, Any]) -> None:
+    @staticmethod
+    def _target(tmp: str, name: str) -> str:
+        parts = name.split("/")
+        if len(parts) == 2 and parts[0] == "ai" and _AI_NAME_RX.match(parts[1]):
+            return os.path.join(tmp, "ai", parts[1])
+        if _FILE_RX.match(name):
+            return os.path.join(tmp, name)
+        raise ValueError("invalid store file name")
+
+    def save_dir(self, area: str, item_id: str, files: Mapping[str, Any], *,
+                 links: Optional[Mapping[str, str]] = None) -> None:
         """Write ``files`` (name -> ``bytes`` | ``str`` | JSON object) into a temp directory and move it into
-        place in one ``os.replace``: readers see the whole result/share or nothing (E.7)."""
+        place in one ``os.replace``: readers see the whole result/share or nothing (E.7). ``links`` (name -> path of
+        an existing store file, from :meth:`share_sources`) are hard-linked instead of copied (copied when the file
+        system refuses a link)."""
         final = self._dir(area, item_id)
         parent = self._path(area)
         self._makedirs(parent)
         tmp = os.path.join(parent, f".tmp-{item_id}-{secrets.token_hex(4)}")
         self._mkdir(tmp)
         try:
+            for name, source in (links or {}).items():
+                target = self._target(tmp, name)
+                real = os.path.realpath(source)
+                if os.path.commonpath([self.root, real]) != self.root:
+                    raise ValueError("store link source escapes the data directory")
+                self._makedirs(os.path.dirname(target))
+                try:
+                    os.link(real, target)
+                except OSError:
+                    with open(real, "rb") as fh:
+                        self._write_atomic(target, fh.read())
             for name, content in files.items():
-                parts = name.split("/")
-                if len(parts) == 2 and parts[0] == "ai" and re.match(r"^(?:0|[1-9][0-9]?)-(?:ko|en)\.json$", parts[1]):
-                    target = os.path.join(tmp, "ai", parts[1])
-                elif _FILE_RX.match(name):
-                    target = os.path.join(tmp, name)
-                else:
-                    raise ValueError("invalid store file name")
+                target = self._target(tmp, name)
                 if isinstance(content, bytes):
                     data = content
                 elif isinstance(content, str):
@@ -229,8 +270,12 @@ class Store:
         if self._expired(obj):
             self._rmtree(self._dir(area, item_id))
             return None
-        schema = obj.get("schema") if area == "results" else obj.get("schema", (obj.get("result") or {}).get("schema"))
+        schema = obj.get("schema")
+        if schema is None and area == "shares" and isinstance(obj.get("result"), dict):
+            schema = obj["result"].get("schema")
         if schema != _vm_schema():
+            return None
+        if area == "shares" and not isinstance(obj.get("result"), dict):
             return None
         return obj
 
@@ -269,6 +314,62 @@ class Store:
 
     def delete_item(self, area: str, item_id: str) -> None:
         self._rmtree(self._dir(area, item_id))
+
+    def share_sources(self, rid: str) -> dict[str, str]:
+        """``{store name: path}`` of the files a share snapshot of result ``rid`` links (C.8): every top-level file
+        except ``result.json`` (it lives inside ``share.json``) and the LLM payloads, plus the AI narratives."""
+        directory = self._dir("results", rid)
+        out: dict[str, str] = {}
+        for name in self._listdir(directory):
+            if _FILE_RX.match(name) and name != "result.json" and not name.startswith("llm-"):
+                out[name] = os.path.join(directory, name)
+        for name in self._listdir(os.path.join(directory, "ai")):
+            if _AI_NAME_RX.match(name):
+                out[f"ai/{name}"] = os.path.join(directory, "ai", name)
+        return out
+
+    # ------------------------------------------------------------------ sizes (hard links counted once)
+    @staticmethod
+    def _walk_files(path: str) -> Iterator[os.stat_result]:
+        for dirpath, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    yield os.lstat(os.path.join(dirpath, name))
+                except OSError:
+                    continue
+
+    def area_bytes(self, *areas: str) -> int:
+        """Bytes under the given sub-directories (``"results"``, ``"shares"``, ``"cache"``), each inode once."""
+        seen: set[tuple[int, int]] = set()
+        total = 0
+        for area in areas:
+            for st in self._walk_files(self._path(area)):
+                key = (st.st_dev, st.st_ino)
+                if key not in seen:
+                    seen.add(key)
+                    total += st.st_size
+        return total
+
+    def share_usage(self, rid: Optional[str] = None) -> tuple[int, int]:
+        """``(bytes the shares use, bytes a new share of result rid would add)`` -- a share links the result's
+        files, so a second share of the same result adds (almost) nothing."""
+        seen: set[tuple[int, int]] = set()
+        total = 0
+        for st in self._walk_files(self._path("shares")):
+            key = (st.st_dev, st.st_ino)
+            if key not in seen:
+                seen.add(key)
+                total += st.st_size
+        added = 0
+        if rid is not None:
+            for path in self.share_sources(rid).values():
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if (st.st_dev, st.st_ino) not in seen:
+                    added += st.st_size
+        return total, added
 
     # AI narratives (results/<id>/ai/<k>-<lang>.json)
     def _ai_path(self, rid: str, k: int, lang: str) -> str:
@@ -344,6 +445,10 @@ class Store:
     def budget_read(self, name: str) -> Optional[dict]:
         obj = self._read_json_file(self._budget_path(name))
         return obj if isinstance(obj, dict) else None
+
+    def budget_exists(self, name: str) -> bool:
+        """Whether the counter file exists (an existing file that :meth:`budget_read` cannot read is corrupt)."""
+        return os.path.exists(self._budget_path(name))
 
     def budget_write(self, name: str, obj: Mapping[str, Any]) -> None:
         self.write_json(self._budget_path(name), dict(obj))
@@ -446,20 +551,29 @@ class Store:
         return removed
 
     def size_bytes(self) -> int:
+        """The whole store, each inode once."""
+        seen: set[tuple[int, int]] = set()
         total = 0
-        for dirpath, _dirs, files in os.walk(self.root):
-            for name in files:
-                try:
-                    total += os.lstat(os.path.join(dirpath, name)).st_size
-                except OSError:
-                    continue
+        for st in self._walk_files(self.root):
+            key = (st.st_dev, st.st_ino)
+            if key not in seen:
+                seen.add(key)
+                total += st.st_size
         return total
 
     def _evict(self, max_bytes: float) -> int:
-        total = self.size_bytes()
-        if total <= max_bytes:
+        """Delete the oldest results until results + caches are under 90 % of their budget: ``max_bytes`` minus what
+        shares use, capped at :data:`SHARE_QUOTA_RATIO` of it. Shares themselves are never size-evicted (E.7), but
+        they can no longer push the results' budget to zero (which deleted every user's fresh result each sweep)."""
+        shares, _added = self.share_usage()
+        budget = max_bytes - min(shares, SHARE_QUOTA_RATIO * max_bytes)
+        if shares > SHARE_QUOTA_RATIO * max_bytes:
+            LOG.warning("shares use %d MB, above their quota of %d MB", int(shares / 1024 / 1024),
+                        int(SHARE_QUOTA_RATIO * max_bytes / 1024 / 1024))
+        total = self.area_bytes("results", "cache")
+        if total <= budget:
             return 0
-        target = 0.9 * max_bytes
+        target = 0.9 * budget
         base = self._path("results")
         dirs = []
         for name in self._listdir(base):
@@ -474,7 +588,7 @@ class Store:
         for _stamp, path in sorted(dirs):
             if total <= target:
                 break
-            size = sum(os.lstat(os.path.join(dp, f)).st_size for dp, _d, fs in os.walk(path) for f in fs)
+            size = sum(st.st_size for st in self._walk_files(path))
             self._rmtree(path)
             total -= size
             evicted += 1

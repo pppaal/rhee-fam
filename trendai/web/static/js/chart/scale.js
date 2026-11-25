@@ -5,13 +5,13 @@
 // Tick *values* are geometry and are cleaned of float noise with toPrecision; tick *labels* are display text and go
 // through fmt.js (roundHalfAway) in tickLabels().
 
-import { compact, roundHalfAway, MINUS } from '../fmt.js';
+import { compact, compactTicks, roundHalfAway, MINUS } from '../fmt.js';
 
 /**
  * @typedef {Object} Ticks
  * @property {number} min       domain minimum: rounded out to the tick grid (the first tick)
  * @property {number} max       domain maximum: the data maximum or the last tick, whichever is higher (niceTicks)
- * @property {number} step      tick step (1-2-5 × 10ⁿ)
+ * @property {number} step      tick step (1-2-5 × 10ⁿ, or 25 × 10ⁿ)
  * @property {number} decimals  decimals of the step itself (tick labels use exactly these; a relative index gets 0)
  * @property {number[]} values  tick values, ascending, min..max inclusive
  */
@@ -32,8 +32,14 @@ import { compact, roundHalfAway, MINUS } from '../fmt.js';
  */
 
 const DAY_MS = 86400000;
+const YEAR_MS = 365.25 * DAY_MS;
 const INDEX_KINDS = new Set(['relative_index', 'relative_index_gt']);
-const MANTISSAS = [1, 2, 5];
+/** Linear tick mantissas; 2.5 only from 25 up (25, 250 …), so tick labels stay integers (a relative index keeps
+ * `0 20 40 …`-style integer ticks) while 0–125 or 0–250 ranges get a grid line above the data (UX-15). */
+const MANTISSAS = [1, 2, 2.5, 5];
+/** Log tick mantissas per decade, densest last: used when 1-2-5 leaves fewer than `minTicks` ticks (a range inside
+ * one decade, e.g. 7,600–13,000 page views, would otherwise get only `5,000 · 1만`). */
+const LOG_MANTISSAS = [[1, 2, 5], [1, 1.5, 2, 3, 5, 7], [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 9]];
 
 /** Remove binary float noise from a computed tick value (3 × 0.1 → 0.3) and normalise −0 to 0. */
 const clean = (v) => {
@@ -73,23 +79,32 @@ export function tickCount(widthPx) {
   return widthPx >= 640 ? { min: 4, max: 6 } : { min: 3, max: 4 };
 }
 
-/** Decimals of a 1-2-5 step (0.5 → 1, 2 → 0, 0.02 → 2). */
+/** Decimals of a tick step (0.5 → 1, 2 → 0, 0.02 → 2, 25 → 0). */
 function stepDecimals(step) {
-  return Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
+  for (let d = 0; d < 12; d += 1) {
+    const scaled = step * 10 ** d;
+    if (Math.abs(scaled - Math.round(scaled)) <= 1e-9 * Math.max(1, scaled)) return d;
+  }
+  return 12;
 }
 
-/** Snap the top tick up to the next grid line when that leaves at most this share of the axis empty. */
+/** Log ticks: snap the top tick up to the next one when that leaves at most this share of the axis empty. */
 const SNAP_UP = 0.06;
+/** Weight of data above the top tick (unlabelled) against empty headroom above the data in niceTicks(). */
+const UNLABELLED_WEIGHT = 1.5;
 
 /**
- * Nice linear ticks with a 1-2-5 step whose count lies in [count.min, count.max] (closest to the upper bound
- * that fits). `lo == hi` widens the domain symmetrically (or to [0, 1] at 0).
+ * Nice linear ticks with a 1-2-5 step (or 25 × 10ⁿ) whose count lies in [count.min, count.max]. `lo == hi` widens
+ * the domain symmetrically (or to [0, 1] at 0).
  *
- * The bottom is rounded out to the tick grid (the baseline is always a labelled tick). The top tick is the last
- * grid line at or below `hi` (or the next one when it is within 6 % of the axis above `hi`), and the domain keeps
- * `hi` itself: rounding a 0–103 range out to 0–150 would leave a third of the plot empty, while 0, 20 … 100 over
- * 0–103 uses it fully. When no step gives a count inside the bounds, the densest step that does not exceed
- * count.max is used (labels never crowd).
+ * The bottom is rounded out to the tick grid (the baseline is always a labelled tick). For the top, every step
+ * offers two grids: the last grid line at or below `hi` (the data above it is unlabelled) and the first one at or
+ * above `hi` (the plot gets empty headroom). The grid that wastes the least share of the axis wins — unlabelled data
+ * counts 1.5 × as much as headroom, since the peak cannot be read off the axis — and among equal grids the denser
+ * one. So 0–103 keeps 0, 20 … 100 (3 % of the axis unlabelled) instead of stretching to 0–125, while 0–140 gets
+ * 0, 50, 100, 150 instead of 0, 50, 100 with the top 29 % unlabelled (UX-15), and 0–225 gets 0, 50 … 250.
+ * The domain is [first tick, max(hi, last tick)]. When no step gives a count inside the bounds, the densest grid
+ * that does not exceed count.max is used (labels never crowd).
  * @param {number} lo
  * @param {number} hi
  * @param {{min: number, max: number}} count
@@ -109,20 +124,34 @@ export function niceTicks(lo, hi, count) {
     }
   }
   const maxN = Math.max(2, count.max);
+  const minN = Math.max(2, Math.min(count.min, maxN));
   const span = b - a;
   const eps = 1e-9;
-  let chosen = null;
-  for (let e = Math.floor(Math.log10(span / (maxN - 1))) - 1; !chosen; e += 1) {
+  const grids = [];
+  const e0 = Math.floor(Math.log10(span / (maxN - 1))) - 1;
+  for (let e = e0; e <= e0 + 3; e += 1) {
     for (const m of MANTISSAS) {
+      if (m === 2.5 && e < 1) continue;
       const step = clean(m * 10 ** e);
       const i0 = Math.floor(a / step + eps);
-      let i1 = Math.floor(b / step + eps);
-      if (i1 * step < b - span * eps && (i1 + 1) * step - b <= SNAP_UP * (b - i0 * step)) i1 += 1;
-      if (i1 <= i0) i1 = i0 + 1;                 // at least two ticks
-      if (i1 - i0 + 1 <= maxN) {
-        chosen = { step, i0, i1 };
-        break;
+      const below = Math.max(i0 + 1, Math.floor(b / step + eps));
+      const above = Math.max(i0 + 1, Math.ceil(b / step - eps));
+      for (const i1 of below === above ? [below] : [below, above]) {
+        const top = i1 * step;
+        const bottom = i0 * step;
+        const axis = Math.max(b, top) - bottom;
+        const waste = ((top < b ? UNLABELLED_WEIGHT * (b - top) : top - b) + (a - bottom)) / axis;
+        grids.push({ step, i0, i1, n: i1 - i0 + 1, waste });
       }
+    }
+  }
+  const better = (g, best) => !best || g.waste < best.waste - 1e-9
+    || (Math.abs(g.waste - best.waste) <= 1e-9 && g.n > best.n);
+  let chosen = null;
+  for (const g of grids) if (g.n >= minN && g.n <= maxN && better(g, chosen)) chosen = g;
+  if (!chosen) {
+    for (const g of grids) {
+      if (g.n <= maxN && (!chosen || g.n > chosen.n || (g.n === chosen.n && g.waste < chosen.waste))) chosen = g;
     }
   }
   const { step, i0, i1 } = chosen;
@@ -133,15 +162,19 @@ export function niceTicks(lo, hi, count) {
 }
 
 /**
- * Log10 axis ticks with 1-2-5 per decade (F.7.2 `log` scale); lo must be > 0. When more than `maxTicks` values
- * would result, only the decades (1 × 10ⁿ) are kept (then every k-th decade). As in niceTicks(), the bottom is
- * rounded out to a tick and the top keeps `hi` unless the next tick is within 6 % of the axis (in log units).
+ * Log10 axis ticks with 1-2-5 per decade (F.7.2 `log` scale); lo must be > 0. When that leaves fewer than
+ * `minTicks` ticks (a range inside one decade), denser mantissas are used (1-1.5-2-3-5-7, then 1-1.2-1.5-2-2.5-3-4
+ * … 9), the first set that gives `minTicks` (UX-15: `0.7만 · 0.8만 · 0.9만 · 1만 · 1.2만` instead of `5,000 · 1만`).
+ * When more than `maxTicks` values would result, only the decades (1 × 10ⁿ) are kept (then every k-th decade). The
+ * bottom is rounded out to a tick and the top keeps `hi` unless the next tick is within 6 % of the axis (in log
+ * units).
  * @param {number} lo
  * @param {number} hi
  * @param {number} [maxTicks=9]
+ * @param {number} [minTicks=3]
  * @returns {{min: number, max: number, values: number[]}}
  */
-export function logTicks(lo, hi, maxTicks = 9) {
+export function logTicks(lo, hi, maxTicks = 9, minTicks = 3) {
   let a = Number(lo);
   let b = Number(hi);
   if (!(a > 0) || !isNum(a)) a = Math.min(1, b > 0 ? b : 1);
@@ -161,7 +194,13 @@ export function logTicks(lo, hi, maxTicks = 9) {
     if (next && (top <= min || Math.log10(next) - Math.log10(b) <= SNAP_UP * axis)) top = next;
     return { min, max: Math.max(b, top), values: all.filter((v) => v >= min && v <= top) };
   };
-  let ticks = build(MANTISSAS);
+  let ticks = build(LOG_MANTISSAS[0]);
+  for (const set of LOG_MANTISSAS.slice(1)) {
+    if (ticks.values.length >= minTicks) break;
+    const denser = build(set);
+    if (denser.values.length > maxTicks) break;
+    ticks = denser;
+  }
   if (ticks.values.length > maxTicks) ticks = build([1]);
   if (ticks.values.length > maxTicks) {         // many decades: every k-th decade from the bottom
     const k = Math.ceil((ticks.values.length - 1) / (maxTicks - 1));
@@ -285,6 +324,67 @@ export function timeTicks(startMs, endMs, maxTicks) {
   };
 }
 
+/** Share of the time axis below which a narrow chart windows its history (narrowWindow). */
+const NARROW_FC_SHARE = 0.2;
+
+/**
+ * Default x window of a narrow chart (< 640 px, UX-4). On a phone a 12-month forecast after 10 years of history,
+ * or 26 weeks after 5 years, gets ~20 px of the plot and the fan cannot be read. When the forecast takes less than a
+ * fifth of the time axis, the chart shows only the last part of the history: whole years for W/M/Q/Y data
+ * (at least 1, about three forecast spans: 26 weeks → 2 years, 12 months → 3 years) and days for daily data (at
+ * least 28, three forecast spans), so the forecast gets about a quarter of the plot. The scale stays uniform (no
+ * stretched forecast region, which would flatten its slope); the charts offer a "full period" toggle and the table
+ * and exports keep every row. Null when there is no forecast, the forecast already has room or the window would show
+ * the whole history anyway.
+ * @param {number} startMs  first time on the chart (UTC ms)
+ * @param {number} lastMs   last actual time — the seam
+ * @param {number} endMs    last forecast time
+ * @param {'D'|'W'|'M'|'Q'|'Y'} freq
+ * @returns {{startMs: number, n: number, unit: 'D'|'Y'}|null}  window start, and its length for the caption
+ *          (fmt.spanLabel(n, unit))
+ */
+export function narrowWindow(startMs, lastMs, endMs, freq) {
+  if (![startMs, lastMs, endMs].every(isNum)) return null;
+  const fc = endMs - lastMs;
+  const hist = lastMs - startMs;
+  if (!(fc > 0) || !(hist > 0) || fc / (hist + fc) >= NARROW_FC_SHARE) return null;
+  let out;
+  if (freq === 'D') {
+    const n = Math.max(28, Math.ceil((3 * fc) / DAY_MS - 1e-9));
+    out = { startMs: lastMs - n * DAY_MS, n, unit: 'D' };
+  } else {
+    const n = Math.max(1, Math.ceil((3 * fc) / YEAR_MS - 0.1));
+    const { y, m, d } = ymd(lastMs);
+    out = { startMs: Date.UTC(y - n, m, d), n, unit: 'Y' };
+  }
+  return out.startMs > startMs ? out : null;
+}
+
+/**
+ * Group line-end labels whose anchors coincide: same end time and pixel y within `tol`. Such lines end in one spot,
+ * so one label `A · B` with one leader reads better than two nudged labels whose leaders converge (UX-16). Returns
+ * groups of input indexes, each in input order, the groups ordered by their first member.
+ * Added by WP3-chart (pure).
+ * @param {Array<{ms: number, y: number}>} anchors
+ * @param {number} tol
+ * @returns {number[][]}
+ */
+export function groupAnchors(anchors, tol) {
+  const order = anchors.map((a, i) => i).sort((i, j) => anchors[i].ms - anchors[j].ms
+    || anchors[i].y - anchors[j].y || i - j);
+  const groups = [];
+  let cur = null;
+  for (const i of order) {
+    const prev = cur && anchors[cur[cur.length - 1]];
+    if (prev && prev.ms === anchors[i].ms && Math.abs(anchors[i].y - prev.y) <= tol) cur.push(i);
+    else {
+      cur = [i];
+      groups.push(cur);
+    }
+  }
+  return groups.map((g) => g.slice().sort((i, j) => i - j)).sort((g, h) => g[0] - h[0]);
+}
+
 /**
  * Y domain of the detail fan chart (F.7.1 "Y range", D.2.6 `y_hint`).
  * Starts from `yHint` (min/max incl. the 95 % band; 0 included when `include_zero`); anomalies whose inclusion
@@ -365,7 +465,7 @@ export function compareYDomain(args) {
 
   if (scale === 'log') {
     const ticks = logTicks(lo !== null && lo > 0 ? lo : 1, hi !== null && hi > 0 ? hi : 10,
-      Math.max(5, count.max + 3));
+      Math.max(5, count.max + 3), count.min);
     return { ticks, log: true };
   }
   if (scale !== 'index' && INDEX_KINDS.has(valueKind)) {
@@ -393,9 +493,11 @@ export function indexValues(values, base) {
 
 /**
  * Y tick labels (F.7.1): the step's own decimals (a relative index gets integers `0 20 40 …`); an axis whose ticks
- * reach 10,000 uses fmt.compact for every tick (one style per axis: `0 · 5,000 · 1만 · 1.5만`), falling back to
- * full digits when compact labels would repeat. Log ticks use each tick's own decimals. Never compacted for
- * relative indexes. Added by WP3-chart (pure; shared by the fan and comparison charts).
+ * reach 10,000 writes every tick in one compact unit (fmt.compactTicks: `0 · 0.5만 · 1만 · 1.5만`, en
+ * `0 · 5K · 10K · 15K`, UX-15), else — log ticks over several decades — fmt.compact per tick
+ * (`100 · 1,000 · 1만 · 10만`), falling back to full digits when compact labels would repeat. Log ticks use each
+ * tick's own decimals. Never compacted for relative indexes. Added by WP3-chart (pure; shared by the fan and
+ * comparison charts).
  * @param {number[]} values
  * @param {number} decimals  Ticks.decimals (ignored for log ticks)
  * @param {'ko'|'en'} lang
@@ -414,6 +516,8 @@ export function tickLabels(values, decimals, lang, opts = {}) {
   const plain = values.map((v) => (opts.log ? fixed(v, own(v)) : fixed(v, decimals)));
   const reaches = values.some((v) => Math.abs(v) >= 9999.5);
   if (INDEX_KINDS.has(opts.kind) || !reaches) return plain;
+  const unit = compactTicks(values, lang);
+  if (unit) return unit;
   // compact() prints full digits below 10,000 with its own decimal rule; keep the tick decimals there instead
   const short = values.map((v, i) => (Math.abs(v) >= 9999.5 ? compact(v, lang) : plain[i]));
   return new Set(short).size === short.length ? short : plain;

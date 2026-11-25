@@ -22,7 +22,7 @@ const ko = {
   'lang.ko.name': '한국어', // UI addition
   'lang.en.name': 'English', // UI addition
   'theme.button': '테마 바꾸기 (지금: {mode})',
-  'theme.system': '시스템 설정',
+  'theme.system': '시스템 테마', // spec G: '시스템 설정' read as OS settings (UX-19)
   'theme.light': '라이트',
   'theme.dark': '다크',
   'settings.title': '설정',
@@ -35,6 +35,7 @@ const ko = {
   'common.cancel': '취소',
   'common.save': '저장',
   'common.apply': '적용',
+  'common.reset': '초기화', // UI addition: 상세 조건 (UX-18)
   'common.details': '자세히',
   'common.help': '도움말',
   'common.more': '더 보기', // UI addition: ⋯ menu button
@@ -46,6 +47,7 @@ const ko = {
   'a11y.chart_keys': '화살표 키로 시점을 옮길 수 있어요',
   'a11y.remove': '{name} 빼기',
   'a11y.new_tab': '새 창에서 열림',
+  'a11y.datelink': '차트에서 이 시점 보기', // UI addition: date links (A11Y-21)
   'title.home': 'trendai — 트렌드 분석과 예측',
   'title.upload': '내 파일 분석',
   'title.samples': '샘플 갤러리',
@@ -60,17 +62,19 @@ const ko = {
   'home.examples': '예시',
   'home.example_terms.naver': '선크림,패딩,수능,김장,다이어트',
   'home.example_terms.wiki': '자외선 차단제,대학수학능력시험,김장,장마,인공지능',
+  'home.example_terms.wiki_en': 'Artificial intelligence,Sunscreen,Kimchi,Monsoon,Python (programming language)', // UI addition: wl=en
   'home.upload.title': '내 데이터 분석',
   'home.upload.body': '엑셀·CSV를 끌어다 놓거나',
   'home.upload.choose': '파일 선택',
   'home.upload.paste': '붙여넣기',
-  'home.samples.title': '샘플로 체험하기 · 가상 데이터',
+  'home.samples.title': '샘플로 체험하기', // spec G: the 가상 데이터 pill follows it (UX-27)
   'home.recent': '최근 분석(이 브라우저)',
   'home.recent.remove': '목록에서 지우기',
 
   // ------------------------------------------------------------------------------------------- G.3 search
   'search.placeholder.naver': '키워드를 입력하세요 (예: 선크림, 패딩)',
   'search.placeholder.wiki': '위키백과 문서 제목을 입력하세요 (예: 인공지능)',
+  'search.placeholder.wiki_en': '영어 위키백과 문서 제목을 입력하세요 (예: Artificial intelligence)', // UI addition: wl=en (FU-1)
   'search.placeholder.sample': '샘플을 고르세요 (최대 5개)',
   'search.label': '분석할 키워드',
   'search.submit': '분석',
@@ -87,7 +91,11 @@ const ko = {
   'source.upload': '내 파일',
   'source.sample': '샘플',
   'source.unavailable': '준비 중',
-  'source.naver.unconfigured': '운영자가 네이버 API 키를 설정하지 않았어요. 위키백과나 내 파일로 분석해 보세요.',
+  'source.naver.unconfigured': '네이버 검색어 트렌드는 아직 연결되지 않았어요. 위키백과나 내 파일로 분석해 보세요.', // spec G: user copy, no operator jargon (UX-26)
+  'source.wiki_lang': '위키백과 ({lang})', // UI addition: source chip choices (FU-1)
+  'wiki.lang.label': '위키백과 언어', // UI addition (FU-1)
+  'wiki.lang.ko': '한국어', // UI addition
+  'wiki.lang.en': '영어', // UI addition
   'source.naver.budget': '이번 달 네이버 조회 한도를 모두 썼어요. 이미 조회된 검색어는 저장된 결과로 볼 수 있어요.',
   'chipeditor.title': '같은 뜻 검색어',
   'chipeditor.label': '같은 뜻 검색어 (쉼표로 구분, 최대 5개)',
@@ -138,13 +146,15 @@ const ko = {
   'chip.sample_fixed': '샘플은 기간과 단위가 정해져 있어요.',
   'chip.readonly': '올린 파일의 결과는 조건을 바꿀 수 없어요.',
   'chip.reanalyze_upload': '다시 분석',
+  'chip.analyze_own': '내 파일로 분석해 보기', // UI addition: shared read-only results (UX-10)
+  'chip.fixed': '고정', // UI addition: sample period/unit before the result is known (UX-8)
 
   // ------------------------------------------------------------------------------------------- G.5 upload
   'upload.title': '내 파일 분석',
   'upload.drop': '파일을 여기에 끌어다 놓으세요',
   'upload.or': '또는',
   'upload.choose': '파일 선택',
-  'upload.formats': 'CSV·TSV·TXT·엑셀(.xlsx)·JSON · 최대 10MB · 값 열 최대 20개',
+  'upload.formats': 'CSV·TSV·TXT·엑셀(.xlsx)·JSON · 최대 {mb}MB · 값 열 최대 {n}개', // spec G + server limits (OPS-12)
   'upload.paste': '엑셀에서 붙여넣기',
   'upload.paste.label': '엑셀에서 표를 복사해 여기에 붙여넣으세요 (첫 줄은 열 이름)',
   'upload.paste.read': '읽기',
@@ -163,7 +173,7 @@ const ko = {
   'confirm.value_cols': '값 열',
   'confirm.excluded.row_number': '제외됨: 순번으로 보여요',
   'confirm.excluded.not_numeric': '제외됨: 숫자가 아니에요',
-  'confirm.max_cols': '값 열은 20개까지 고를 수 있어요.',
+  'confirm.max_cols': '값 열은 {n}개까지 고를 수 있어요.', // spec G + server limit (OPS-12)
   'confirm.freq': '주기',
   'confirm.freq.detected': '(자동 감지: {value})',
   'freq.auto': '자동 감지',
@@ -175,6 +185,7 @@ const ko = {
   'confirm.unit_label': '단위(선택)',
   'confirm.unit_placeholder': '예: 원, 개, 명',
   'confirm.preview': '미리보기: 처음 5행 · 마지막 5행',
+  'confirm.preview_all': '미리보기: 전체 {n}행', // UI addition: short files (UX-25)
   'confirm.encoding.utf8': 'UTF-8로 읽었어요',
   'confirm.encoding.cp949': '한국어 엑셀(CP949)로 읽었어요',
   'confirm.encoding.utf16': 'UTF-16으로 읽었어요',
@@ -224,6 +235,7 @@ const ko = {
   'detail.narrative.ai_running': 'AI가 해석을 쓰는 중이에요… 규칙 기반 해석을 먼저 보여 드려요.',
   'detail.narrative.show_rule': '규칙 기반 해석 보기',
   'detail.narrative.show_ai': 'AI 해석 보기',
+  'detail.narrative.ai_done': 'AI 해석을 보여 드려요. 규칙 기반 해석으로 언제든 돌아갈 수 있어요.', // UI addition (A11Y-4)
   'detail.caveats.title': '주의할 점',
   'naver_explainer.title': '네이버 상대 지수 읽는 법',
   'naver_explainer.body': '표시된 값은 실제 검색 횟수가 아닌 상대값이에요. 조회 기간 중 가장 많이 검색된 시점을 100으로 두고 나머지를 비율로 나타내요. 같은 조회 안의 검색어끼리만 비교할 수 있고, 기간을 바꾸면 100의 기준도 바뀌어요. trendai의 변화율·국면·예측은 척도와 무관해서 상대 지수여도 그대로 의미가 있어요.',
@@ -264,6 +276,9 @@ const ko = {
   'compare.values_date': '날짜', // UI addition: first column of the values table
   'compare.download_csv': 'CSV로 받기',
   'compare.grey_hint': '회색 선을 누르면 강조돼요',
+  'compare.all_failed': '어느 시계열도 분석하지 못했어요. 시계열마다 이유와 해결 방법을 확인해 주세요.', // UI addition (FU-2)
+  'compare.summary': '[trendai] {names}: {items}', // UI addition: 요약 복사 of a comparison (FU-15)
+  'compare.summary.item': '{rank}위 {name}({phase}, 상승 확률 {prob})', // UI addition
 
   // ------------------------------------------------------------------------------------------- G.7 footer
   'footer.disclaimer': '예측은 과거 패턴이 이어진다고 가정해요. 갑작스러운 사건이나 외부 변수(가격·광고·휴일)는 반영하지 못해요.',
@@ -287,6 +302,8 @@ const ko = {
   'share.summary': '요약 복사',
   'share.summary.copied': '요약을 복사했어요',
   'share.readonly': '읽기 전용 공유 링크 · {date}까지',
+  'share.unavailable': '공유 링크를 열 수 없어요', // UI addition: unknown/expired /s (UX-10)
+  'result.unavailable': '결과를 열 수 없어요', // UI addition: unknown/expired /r (UX-10)
   'export.csv': 'CSV',
   'export.xlsx': '엑셀(.xlsx)',
   'export.png': '이미지(PNG)',
@@ -310,6 +327,7 @@ const ko = {
   'progress.series': '{name} 분석 중 ({k}/{n})',
   'progress.finishing': '결과를 정리하는 중…',
   'progress.loading': '결과를 불러오는 중…', // UI addition: /r and /s first load
+  'progress.done': '{name} 분석을 마쳤어요.', // UI addition: completion announcement (A11Y-6)
   'progress.cancel': '취소',
   'progress.cancelled': '분석을 취소했어요.',
   'empty.no_query': '분석할 키워드를 입력해 주세요.',
@@ -317,10 +335,11 @@ const ko = {
   'empty.notfound.body': '주소를 확인하거나 처음 화면에서 다시 시작해 주세요.',
   'empty.recent_none': '아직 분석한 데이터가 없어요. 샘플로 먼저 둘러보세요.',
   'err.client_network': '서버에 연결하지 못했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.',
-  'err.file_too_large': '파일이 너무 커요. 10MB까지 올릴 수 있어요.',
+  'err.file_too_large': '파일이 너무 커요. {mb}MB까지 올릴 수 있어요.', // spec G + server limit (OPS-12)
   'err.png_failed': '이미지를 만들지 못했어요. CSV나 HTML 리포트로 받아 주세요.',
   'err.clipboard': '복사하지 못했어요. 주소를 직접 복사해 주세요.',
-  'fix.retry_in_seconds': '지금 다시 ({seconds}초)', // UI addition: retry_in countdown (C.12.6)
+  'fix.retry_wait': '{seconds}초 뒤 다시 시도', // UI addition: retry_in countdown, button disabled (UX-11)
+  'fix.wiki_lang': '{lang} 위키백과에서 찾기', // UI addition (FU-1)
   'fix.retry': '다시 시도', // UI addition: client-side errors (network), same text as fix_retry
   'fix.reload': '새로고침', // UI addition
   'fix.go_home': '처음으로', // UI addition
@@ -384,7 +403,7 @@ const ko = {
   'sources.naver.title': '네이버 데이터랩 검색어트렌드',
   'sources.naver.body': '- **무엇인가요**: NAVER API HUB의 검색어트렌드예요. 운영자가 API 키를 설정했을 때만 쓸 수 있어요.\n- **값의 성격**: 상대 지수(조회 기간 최댓값 = 100)예요. 같은 조회 안의 검색어끼리만 비교할 수 있어요.\n- **기간**: 2016년 1월 1일부터, 끝난 기간만 받아요.\n- **출처 표기**: 출처: 네이버 데이터랩 검색어트렌드(NAVER API HUB)\n- **보관**: 서버 캐시에 최대 21일 보관해요.\n- **제한**: AI로 보내지 않고, 원본 값은 파일로 내려받을 수 없어요. 네이버 로고와 브랜드는 쓰지 않고 글자로만 표기해요.',
   'sources.wiki.title': 'Wikimedia 조회수(위키백과)',
-  'sources.wiki.body': '- **무엇인가요**: 위키백과 문서별 조회수(Wikimedia Pageviews)예요. 사람의 조회만 세고 봇은 빼요.\n- **값의 성격**: 조회수예요. 관심의 대리 지표라서 검색량과 다를 수 있어요.\n- **기간**: 2016년 1월부터 받을 수 있어요.\n- **출처 표기**: 출처: Wikimedia Pageviews · 한국어 위키백과 · 사람 조회만(봇 제외)\n- **보관**: 서버 캐시에 월 단위는 24시간, 일·주 단위는 6시간 보관해요.',
+  'sources.wiki.body': '- **무엇인가요**: 위키백과 문서별 조회수(Wikimedia Pageviews)예요. 사람의 조회만 세고 봇은 빼요.\n- **값의 성격**: 조회수예요. 관심의 대리 지표라서 검색량과 다를 수 있어요.\n- **기간**: 2016년 1월부터 받을 수 있어요.\n- **언어**: 한국어 위키백과가 기본이고, 출처 선택에서 영어 위키백과로 바꿀 수 있어요.\n- **출처 표기**: 출처: Wikimedia Pageviews · 한국어(또는 영어) 위키백과 · 사람 조회만(봇 제외)\n- **보관**: 서버 캐시에 월 단위는 24시간, 일·주 단위는 6시간 보관해요.',
   'sources.gt.title': 'Google 트렌드(사용자 업로드)',
   'sources.gt.body': '- **무엇인가요**: Google 트렌드에서 직접 내려받은 CSV를 올렸을 때만 써요. 실시간으로 연동하지 않아요.\n- **값의 성격**: Google 트렌드가 요청마다 0–100으로 다시 맞춘 상대 지수예요. 다른 다운로드와 비교할 수 없어요.\n- **출처 표기**: Data source: Google Trends (https://www.google.com/trends)\n- **보관**: 올린 파일의 결과와 같아요(24시간, 공유 링크는 30일).',
   'sources.upload.title': '내 파일',
@@ -439,6 +458,7 @@ const en = {
   'common.cancel': 'Cancel',
   'common.save': 'Save',
   'common.apply': 'Apply',
+  'common.reset': 'Reset',
   'common.details': 'Details',
   'common.help': 'Help',
   'common.more': 'More',
@@ -450,6 +470,7 @@ const en = {
   'a11y.chart_keys': 'Use the arrow keys to move along the chart',
   'a11y.remove': 'Remove {name}',
   'a11y.new_tab': 'Opens in a new tab',
+  'a11y.datelink': 'Show this date on the chart',
   'title.home': 'trendai — trend analysis and forecasts',
   'title.upload': 'Analyse your file',
   'title.samples': 'Sample gallery',
@@ -464,17 +485,19 @@ const en = {
   'home.examples': 'Examples',
   'home.example_terms.naver': '선크림,패딩,수능,김장,다이어트',
   'home.example_terms.wiki': '자외선 차단제,대학수학능력시험,김장,장마,인공지능',
+  'home.example_terms.wiki_en': 'Artificial intelligence,Sunscreen,Kimchi,Monsoon,Python (programming language)',
   'home.upload.title': 'Analyse your data',
   'home.upload.body': 'Drop an Excel or CSV file here, or',
   'home.upload.choose': 'Choose a file',
   'home.upload.paste': 'Paste',
-  'home.samples.title': 'Try a sample · synthetic data',
+  'home.samples.title': 'Try a sample',
   'home.recent': 'Recent analyses (this browser)',
   'home.recent.remove': 'Remove from the list',
 
   // ------------------------------------------------------------------------------------------- G.3 search
   'search.placeholder.naver': 'Enter a keyword (e.g. 선크림, 패딩)',
   'search.placeholder.wiki': 'Enter a Wikipedia article title (e.g. 인공지능)',
+  'search.placeholder.wiki_en': 'Enter an English Wikipedia article title (e.g. Artificial intelligence)',
   'search.placeholder.sample': 'Choose samples (up to 5)',
   'search.label': 'Keywords to analyse',
   'search.submit': 'Analyse',
@@ -491,7 +514,11 @@ const en = {
   'source.upload': 'My file',
   'source.sample': 'Samples',
   'source.unavailable': 'Not available',
-  'source.naver.unconfigured': 'The operator has not set up Naver API keys. Try Wikipedia or your own file.',
+  'source.naver.unconfigured': 'Naver search trends are not connected yet. Try Wikipedia or your own file.',
+  'source.wiki_lang': 'Wikipedia ({lang})',
+  'wiki.lang.label': 'Wikipedia language',
+  'wiki.lang.ko': 'Korean',
+  'wiki.lang.en': 'English',
   'source.naver.budget': "This month's Naver quota is used up. Terms looked up before can still be viewed.",
   'chipeditor.title': 'Terms with the same meaning',
   'chipeditor.label': 'Terms with the same meaning (comma-separated, up to 5)',
@@ -542,13 +569,15 @@ const en = {
   'chip.sample_fixed': 'Samples have a fixed period and unit.',
   'chip.readonly': 'Results from an uploaded file cannot be changed here.',
   'chip.reanalyze_upload': 'Analyse again',
+  'chip.analyze_own': 'Analyse your own file',
+  'chip.fixed': 'fixed',
 
   // ------------------------------------------------------------------------------------------- G.5 upload
   'upload.title': 'Analyse your file',
   'upload.drop': 'Drop a file here',
   'upload.or': 'or',
   'upload.choose': 'Choose a file',
-  'upload.formats': 'CSV, TSV, TXT, Excel (.xlsx), JSON · up to 10 MB · up to 20 value columns',
+  'upload.formats': 'CSV, TSV, TXT, Excel (.xlsx), JSON · up to {mb} MB · up to {n} value columns',
   'upload.paste': 'Paste from Excel',
   'upload.paste.label': 'Copy a table in Excel and paste it here (first row = column names)',
   'upload.paste.read': 'Read',
@@ -567,7 +596,7 @@ const en = {
   'confirm.value_cols': 'Value columns',
   'confirm.excluded.row_number': 'Excluded: looks like row numbers',
   'confirm.excluded.not_numeric': 'Excluded: not numeric',
-  'confirm.max_cols': 'Choose up to 20 value columns.',
+  'confirm.max_cols': 'Choose up to {n} value columns.',
   'confirm.freq': 'Frequency',
   'confirm.freq.detected': '(detected: {value})',
   'freq.auto': 'Auto-detect',
@@ -579,6 +608,7 @@ const en = {
   'confirm.unit_label': 'Unit (optional)',
   'confirm.unit_placeholder': 'e.g. KRW, units, people',
   'confirm.preview': 'Preview: first 5 rows · last 5 rows',
+  'confirm.preview_all': 'Preview: all {n} rows',
   'confirm.encoding.utf8': 'Read as UTF-8',
   'confirm.encoding.cp949': 'Read as Korean Excel text (CP949)',
   'confirm.encoding.utf16': 'Read as UTF-16',
@@ -628,6 +658,7 @@ const en = {
   'detail.narrative.ai_running': 'The AI is writing… showing the rule-based interpretation meanwhile.',
   'detail.narrative.show_rule': 'Show rule-based',
   'detail.narrative.show_ai': 'Show AI version',
+  'detail.narrative.ai_done': 'Showing the AI interpretation. You can switch back to the rule-based one at any time.',
   'detail.caveats.title': 'Caveats',
   'naver_explainer.title': "How to read Naver's relative index",
   'naver_explainer.body': "The values are relative, not search counts: the busiest point of the period is 100 and everything else is a share of it. Only terms in the same query can be compared, and changing the period moves the 100. trendai's changes, phases and forecasts do not depend on the scale, so they stay meaningful.",
@@ -668,6 +699,9 @@ const en = {
   'compare.values_date': 'Date',
   'compare.download_csv': 'Download CSV',
   'compare.grey_hint': 'Click a grey line to highlight it',
+  'compare.all_failed': 'None of the series could be analysed. See each series for the reason and a fix.',
+  'compare.summary': '[trendai] {names}: {items}',
+  'compare.summary.item': '#{rank} {name} ({phase}, chance of rise {prob})',
 
   // ------------------------------------------------------------------------------------------- G.7 footer
   'footer.disclaimer': 'Forecasts assume past patterns continue. Sudden events and outside factors (prices, ads, holidays) are not included.',
@@ -691,6 +725,8 @@ const en = {
   'share.summary': 'Copy summary',
   'share.summary.copied': 'Summary copied',
   'share.readonly': 'Read-only shared link · until {date}',
+  'share.unavailable': 'This share link cannot be opened',
+  'result.unavailable': 'This result cannot be opened',
   'export.csv': 'CSV',
   'export.xlsx': 'Excel (.xlsx)',
   'export.png': 'Image (PNG)',
@@ -714,6 +750,7 @@ const en = {
   'progress.series': 'Analysing {name} ({k}/{n})',
   'progress.finishing': 'Putting the results together…',
   'progress.loading': 'Loading the result…',
+  'progress.done': 'Analysis of {name} finished.',
   'progress.cancel': 'Cancel',
   'progress.cancelled': 'The analysis was cancelled.',
   'empty.no_query': 'Enter a keyword to analyse.',
@@ -721,10 +758,11 @@ const en = {
   'empty.notfound.body': 'Check the address or start again from the home page.',
   'empty.recent_none': 'Nothing analysed yet. Start with a sample.',
   'err.client_network': 'Could not reach the server. Check your connection and try again.',
-  'err.file_too_large': 'The file is too large. The limit is 10 MB.',
+  'err.file_too_large': 'The file is too large. The limit is {mb} MB.',
   'err.png_failed': 'The image could not be created. Download CSV or the HTML report instead.',
   'err.clipboard': 'Could not copy. Please copy the address manually.',
-  'fix.retry_in_seconds': 'Retry now ({seconds} s)',
+  'fix.retry_wait': 'Retry in {seconds} s',
+  'fix.wiki_lang': 'Try {lang} Wikipedia',
   'fix.retry': 'Try again',
   'fix.reload': 'Reload',
   'fix.go_home': 'Home',
@@ -788,7 +826,7 @@ const en = {
   'sources.naver.title': 'Naver DataLab Search Trends',
   'sources.naver.body': "- **What it is**: Search Trends from NAVER API HUB, available only when the operator has set up API keys.\n- **Values**: a relative index (maximum of the period = 100). Only terms in the same query can be compared.\n- **Period**: from 1 January 2016, completed periods only.\n- **Attribution**: Source: Naver DataLab Search Trends (NAVER API HUB)\n- **Retention**: kept in the server cache for up to 21 days.\n- **Restrictions**: never sent to AI, and raw values cannot be downloaded as files. Naver's logo and brand are not used; the source is named in text only.",
   'sources.wiki.title': 'Wikimedia page views (Wikipedia)',
-  'sources.wiki.body': '- **What it is**: page views per Wikipedia article (Wikimedia Pageviews), counting human views only (bots excluded).\n- **Values**: page views, a proxy for interest that can differ from search volume.\n- **Period**: available from January 2016.\n- **Attribution**: Source: Wikimedia Pageviews · Korean Wikipedia · human views only (bots excluded)\n- **Retention**: kept in the server cache for 24 hours (monthly) or 6 hours (daily and weekly).',
+  'sources.wiki.body': '- **What it is**: page views per Wikipedia article (Wikimedia Pageviews), counting human views only (bots excluded).\n- **Values**: page views, a proxy for interest that can differ from search volume.\n- **Period**: available from January 2016.\n- **Language**: Korean Wikipedia by default; the source choice switches to English Wikipedia.\n- **Attribution**: Source: Wikimedia Pageviews · Korean (or English) Wikipedia · human views only (bots excluded)\n- **Retention**: kept in the server cache for 24 hours (monthly) or 6 hours (daily and weekly).',
   'sources.gt.title': 'Google Trends (your upload)',
   'sources.gt.body': '- **What it is**: used only when you upload a CSV you downloaded from Google Trends yourself. There is no live connection.\n- **Values**: a relative index that Google Trends rescales to 0–100 for each request; not comparable with other downloads.\n- **Attribution**: Data source: Google Trends (https://www.google.com/trends)\n- **Retention**: as for your own files (24 hours; share links 30 days).',
   'sources.upload.title': 'Your file',
