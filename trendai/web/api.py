@@ -16,7 +16,7 @@ from .. import __version__
 from ..connectors import NAVER_EARLIEST, WIKI_EARLIEST, period_bounds
 from . import analyze, exports, narrative_ai, texts, uploads, viewmodel
 from .budget import kst_now
-from .errors import WebError, catalog_code
+from .errors import WebError
 from .http import Request, Response, json_response, parse_json, valid_id
 from .jobs import analyze_snapshot, disk_series_needed, narrative_snapshot
 from .log import LOGGER, log_exception
@@ -49,8 +49,8 @@ def _refuse_when_draining(app: Any) -> None:
 
 
 def _store_full() -> WebError:
-    """No room in the store (disk nearly full, share quota used up): ``store_full`` once the catalog has it."""
-    return WebError(catalog_code("store_full", "server_busy"), 503, retry_after=300)
+    """No room in the store (disk nearly full, share quota used up): ``503 store_full``, ``Retry-After: 300``."""
+    return WebError("store_full", retry_after=300)
 
 
 def _refuse_when_disk_full(app: Any) -> None:

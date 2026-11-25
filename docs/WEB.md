@@ -50,11 +50,11 @@ trendai serve               # http://127.0.0.1:8000
 | `TRENDAI_LOG_LEVEL` | `INFO` | `CRITICAL`·`ERROR`·`WARNING`·`INFO`·`DEBUG` |
 | `TRENDAI_WORKERS` | `2` | 동시에 실행하는 분석 작업 수 |
 | `TRENDAI_MAX_QUEUED` | `8` | 기다릴 수 있는 분석 작업 수. 넘치면 `503 server_busy` |
-| `TRENDAI_JOB_TIMEOUT` | `180` | 이 시간(초)이 지나면 다음 단계 경계에서 작업을 `job_timeout`으로 실패 처리 |
+| `TRENDAI_JOB_TIMEOUT` | `180` | 이 시간(초)이 지나면 다음 단계 경계에서 작업을 `job_timeout`으로 실패 처리(이미 끝난 시계열은 저장). 최대 86400 |
 | `TRENDAI_UPLOAD_MAX_MB` | `10` | 업로드 최대 크기(MB) |
 | `TRENDAI_UPLOAD_MAX_SERIES` | `20` | 업로드 한 번에 분석할 수 있는 값 열 수 |
-| `TRENDAI_RESULT_TTL_H` | `24` | 결과 보관 시간(시간) |
-| `TRENDAI_SHARE_TTL_D` | `30` | 공유 링크 보관 기간(일) |
+| `TRENDAI_RESULT_TTL_H` | `24` | 결과 보관 시간(시간). 최대 8760 |
+| `TRENDAI_SHARE_TTL_D` | `30` | 공유 링크 보관 기간(일). 최대 3650 |
 | `TRENDAI_NAVER_MONTHLY_LIMIT` | `50000` | 네이버 API 월 호출 한도(예산 가드 기준) |
 | `TRENDAI_NAVER_IP_PER_HOUR` | `20` | IP당 시간당 네이버 새 조회 수(캐시 적중은 세지 않음) |
 | `TRENDAI_NAVER_CACHE_DAYS` | `21` | 네이버 데이터 캐시 최대 일수. 21보다 크면 21로 줄입니다 |
@@ -67,7 +67,7 @@ trendai serve               # http://127.0.0.1:8000
 | `ANTHROPIC_API_KEY` | 없음 | Anthropic SDK가 직접 읽습니다 |
 | `TRENDAI_HSTS` | `false` | `Strict-Transport-Security` 헤더 보내기(TLS 뒤에서만 켜세요) |
 | `TRENDAI_STORE_MAX_MB` | `2048` | 저장소가 이 크기를 넘으면 오래된 결과부터 지움. 분석이 많으면 늘리세요(아래 ‘용량 산정’) |
-| `TRENDAI_SHUTDOWN_GRACE` | `30` | 종료 신호 뒤 실행 중인 작업을 기다리는 최대 시간(초) |
+| `TRENDAI_SHUTDOWN_GRACE` | `30` | 종료 신호 뒤 실행 중인 작업을 기다리는 최대 시간(초). 최대 3600 |
 
 API 키(`NAVER_*`, `ANTHROPIC_API_KEY`)는 설정 객체에 담기지 않고, 응답·로그·URL·오류 문구 어디에도 나오지 않습니다.
 
@@ -112,7 +112,11 @@ trendai는 네이버 데이터랩 **검색어트렌드** API를 NAVER API HUB로
 `TRENDAI_PUBLIC_URL`과 `TRENDAI_CONTACT`에서 옵니다.
 
 * **공개 운영**(접속 주소가 루프백(`127.0.0.0/8`, `::1`, `localhost`)이 아니거나 `TRENDAI_PUBLIC_URL`이 설정됨)에서는
-  `TRENDAI_CONTACT`가 **필수**입니다. 없으면 `trendai serve`와 `trendai.web.wsgi`가 시작하지 않습니다(종료 코드 2).
+  `TRENDAI_CONTACT`가 **필수**입니다. 없으면 `trendai serve`는 시작하지 않습니다(종료 코드 2).
+* `trendai.web.wsgi`(gunicorn·waitress)는 실제 바인드 주소를 알 수 없으므로 늘 공개 운영으로 봅니다. `TRENDAI_HOST`를
+  루프백 주소로 직접 설정했거나 `TRENDAI_ALLOW_NO_CONTACT`를 켠 경우가 아니면 `TRENDAI_CONTACT`가 필요합니다. 설정이
+  잘못되면 프로세스를 끝내지 않고 오류를 한 번 ERROR로 기록한 뒤, `/api/health`를 포함한 **모든 요청에 JSON
+  `503 config_error`**로 답합니다(헬스 체크가 실패로 보이도록).
 * 사내망 등 비공개 배포라면 `TRENDAI_ALLOW_NO_CONTACT=1`로 이 요구를 끌 수 있습니다.
 * 로컬(루프백) 실행에서는 경고만 출력합니다.
 
@@ -122,11 +126,14 @@ trendai는 네이버 데이터랩 **검색어트렌드** API를 NAVER API HUB로
 
 * 켜는 법: `pip install anthropic`(또는 `pip install -e ".[web]"`) 후 `ANTHROPIC_API_KEY`를 설정합니다. `TRENDAI_AI=auto`
   (기본)이면 둘 다 갖춰졌을 때 켜지고, `off`면 늘 꺼집니다.
-* Claude에는 분석으로 계산한 사실(요약 수치·국면·예측)만 보냅니다. 업로드 원본은 서버에 남지 않으므로 보낼 수도 없습니다.
+* Claude에는 분석으로 계산한 사실(요약 수치·국면·예측)과 함께 **시계열 값 일부(최대 60개, 짧은 데이터는 전부)와 시계열
+  이름**을 보냅니다. 화면의 안내 문구·`/method`·`/privacy`도 그렇게 적습니다. 올린 파일 자체는 서버에 남지 않으므로 보낼
+  수도 없습니다. 이름은 80자로 자르고 사실 JSON 안에만 넣으며, 시스템 프롬프트가 이름·라벨을 지시가 아닌 데이터로 다루게
+  합니다. 4만 자를 넘는 요청은 모델을 부르기 전에 `ai_failed`로 거절합니다.
 * **네이버 출처 결과는 AI로 보내지 않습니다**(버튼이 비활성화되고 이유를 보여 줌, API는 `403 ai_naver_blocked`). 공유
   링크에서도 AI 해석을 새로 만들 수 없습니다.
 * 한도: IP당 처음 3건, 이후 시간당 10건(`TRENDAI_AI_IP_PER_HOUR`), 하루 200건(`TRENDAI_AI_DAILY_LIMIT`, 한국 시간
-  기준), 동시에 2건 실행·4건 대기. 같은 결과·시계열·언어의 AI 해석은 한 번 만들면 저장해 두고 다시 씁니다.
+  기준), 동시에 2건 실행·4건 대기, 한 클라이언트가 동시에 대기·실행할 수 있는 AI 작업은 2건. 같은 결과·시계열·언어의 AI 해석은 한 번 만들면 저장해 두고 다시 씁니다.
 * 시간 제한: Anthropic 클라이언트는 **90초** 타임아웃(재시도 1회)으로 만들고, 120초가 지나도 끝나지 않은 작업은
   `ai_failed`로 실패 처리합니다. 실패해도 규칙 기반 해석은 그대로 남습니다.
 
@@ -149,12 +156,17 @@ waitress-serve --threads=8 --inbuf-overflow=12582912 trendai.web.wsgi:applicatio
 ```
 
 `trendai.web.wsgi:application`은 지연 생성됩니다. 모듈을 import할 때는 아무것도 만들지 않고, 첫 요청에서 설정 확인
-(`TRENDAI_CONTACT` 규칙 포함)·로그 설정·앱 생성을 한 번 합니다. gunicorn/waitress를 쓸 때도 설정은 같은 환경 변수로 합니다.
+(`TRENDAI_CONTACT` 규칙 포함, 위 ‘Wikimedia 연락처’)·로그 설정·앱 생성을 한 번 합니다. gunicorn/waitress를 쓸 때도 설정은
+같은 환경 변수로 합니다. 루프백 바인드에서만 켜지는 DNS 리바인딩 방어(아래 ‘보안’)는 WSGI에서는 `TRENDAI_HOST`를
+설정했을 때만 켜집니다.
 
 **정상 종료**: `trendai serve`는 SIGINT/SIGTERM을 받으면 먼저 ‘배수(drain)’ 상태가 됩니다. `/api/health`가 `503
 draining`을 돌려주고, 새 분석·AI·업로드 요청은 `503 server_busy`(`Retry-After: 30`)로 거절하며 대기 중인 작업은
-취소합니다. 진행 조회·결과·내보내기는 계속 응답합니다. 실행 중인 작업이 끝나거나 `TRENDAI_SHUTDOWN_GRACE`(30초)가
-지나면 서버를 닫고 종료 코드 0으로 끝냅니다. 신호를 한 번 더 받으면 즉시 종료 코드 1로 끝납니다.
+`server_busy`(30초 뒤 재시도) 실패로 끝냅니다. 진행 조회·결과·내보내기는 계속 응답합니다. 실행 중인 작업이 끝나면 결과를
+가져갈 수 있게 최대 3초 더 응답한 뒤(전체는 `TRENDAI_SHUTDOWN_GRACE`(30초) 안), 처리 중인 연결을 최대 2초 기다려 서버를
+닫고 종료 코드 0으로 끝냅니다. 신호를 한 번 더 받으면 즉시 종료 코드 1로 끝납니다. **이 배수 절차는 `trendai serve`에만
+있습니다.** gunicorn·waitress에서는 서버 자체의 종료 절차를 따르므로, gunicorn이라면 `--graceful-timeout 60`처럼 실행
+중인 분석(기본 제한 180초 안에서 보통 수 초)이 끝날 시간을 주세요.
 
 ### 리버스 프록시와 TLS
 
@@ -234,8 +246,16 @@ docker run -d --name trendai -p 8000:8000 \
 * `TRENDAI_WORKERS`를 늘려도 처리량은 거의 늘지 않습니다. 긴 작업 뒤에 짧은 작업이 막히지 않게 해 줄 뿐입니다.
 * 같은 조회가 동시에 들어오면 한 작업으로 합쳐지고(진행 중인 작업에 합류), 끝난 결과는 캐시에서 바로 돌려줍니다.
   같은 네이버 요청은 한 번만 호출합니다.
-* 실행 2건 + 대기 8건(`TRENDAI_MAX_QUEUED`)을 넘으면 `503 server_busy`(`Retry-After: 10`)로 거절합니다. 업로드 파싱은
-  동시에 2건까지이고 넘치면 `503 server_busy`(`Retry-After: 5`)입니다.
+* 실행 2건 + 대기 8건(`TRENDAI_MAX_QUEUED`)을 넘으면 `503 server_busy`(`Retry-After: 10`)로 거절합니다. 한 클라이언트가
+  동시에 대기·실행할 수 있는 분석은 **3건**(AI 해석 2건)이고, 넘으면 `429 rate_limited`(`Retry-After: 10`)입니다. 진행 중인
+  작업에 합류하는 것은 세지 않습니다. 용량 때문에 거절한 요청은 가져간 `analyze`·`naver` 토큰을 돌려주므로,
+  `Retry-After`를 지켜 다시 보내면 `429`가 나지 않습니다.
+* 업로드 파싱은 동시에 2건, 한 클라이언트당 1건까지이고 넘치면 `503 server_busy`(`Retry-After: 5`)입니다.
+* **업로드 작업 예산**: 업로드 분석은 시계열 하나에 최대 20,000개 시점, 요청 하나에 최대 60,000개 시점까지입니다(예: 일간
+  데이터 10열 × 55년은 거절). 넘으면 `422 upload_too_large_table`로 분석 전에 거절하고, 분석 중에도 실제 길이로 다시
+  확인합니다. 표는 행 200,000개·셀 200만 개까지 읽습니다.
+* 결과·공유·완료된 작업의 저장 데이터를 읽는 요청과 내보내기는 동시에 4건까지 처리하고, 10초 안에 차례가 오지 않으면
+  `503 server_busy`(`Retry-After: 5`)로 답합니다.
 
 ## 요청 한도와 NAT
 
@@ -250,8 +270,12 @@ docker run -d --name trendai -p 8000:8000 \
 | `ai` | `POST /api/narrative` | 3 | 10 |
 | `share` | 공유 만들기·삭제 | 5 | 20 |
 | `export` | 내보내기 | 30 | 300 |
-| `poll` | 작업 진행 조회 (IP와 작업 ID 조합마다) | 60 | 21,600 |
-| `read` | 결과·공유·설정·샘플 조회 | 60 | 1,200 |
+| `poll` | 메모리에 있는 작업의 진행 조회 (IP와 작업 ID 조합마다) | 60 | 21,600 |
+| `read` | 결과·공유 조회, 메모리에 없는(끝난 지 오래됐거나 없는) 작업 조회 | 60 | 1,200 |
+| `config` | 설정·샘플 조회 (`/api/config`, `/api/samples`) | 300 | 6,000 |
+
+버킷마다 따로 최대 50,000개 키를 기억하므로, 한 버킷(예: 작업마다 생기는 `poll` 키)이 다른 버킷의 기록을 밀어내지
+못합니다. 브라우저 앱은 `/api/config`가 `429`/`503`이면 `Retry-After`만큼 기다렸다가 스스로 다시 시도합니다.
 
 IP당 한도는 **같은 주소 뒤의 사용자끼리 나눠 씁니다**. 통신사 CGNAT나 사무실 NAT 뒤의 사용자는 한 IP로 보이고, 리버스
 프록시 뒤에서 `TRENDAI_TRUST_PROXY`를 켜지 않으면 **모든 사용자가 프록시의 IP 하나**로 보여 금세 한도에 걸립니다.
@@ -268,8 +292,16 @@ $TRENDAI_DATA_DIR/            폴더 0700, 파일 0600
   budget/                     네이버 월 사용량, AI 일 사용량 (400일 뒤 삭제)
 ```
 
-* **업로드 원본은 디스크에 쓰지 않습니다.** 파싱한 표는 메모리 캐시에 30분(최대 64개·256 MB)만 두고, 분석이 끝난
-  결과만 저장합니다. 앞단 프록시가 본문을 디스크에 버퍼링하지 않게 하세요(위 nginx 설정).
+* **업로드 원본은 디스크에 쓰지 않습니다.** 파싱한 표는 메모리 캐시에 30분(최대 64개·256 MB, 한 클라이언트는 4개·96 MB를
+  넘으면 자기 것부터 밀려남)만 두고, 분석이 끝난 결과만 저장합니다. 공간이 모자라 먼저 밀려난 업로드로 분석하면
+  `410 upload_evicted`(다시 올려 달라는 안내)가 나옵니다. 앞단 프록시가 본문을 디스크에 버퍼링하지 않게 하세요(위 nginx
+  설정).
+* **공유 링크**는 결과 파일을 하드 링크로 가리키므로, 한 결과를 여러 번 공유해도 디스크는 한 벌만 씁니다(링크를 만들 수
+  없는 파일 시스템에서는 복사). 공유 링크 전체는 `TRENDAI_STORE_MAX_MB`의 절반까지만 쓸 수 있고, 넘거나 디스크 여유가
+  50 MB 아래면 새 공유를 `503 store_full`(`Retry-After: 300`)로 거절하며 로그에 WARNING을 남깁니다.
+* **디스크 여유**: 여유 공간이 50 MB 아래로 내려가면 `/api/health`가 `degraded`가 되고, 새 분석·공유는
+  `503 store_full`로 거절합니다. 쓰는 도중 디스크가 차면(`ENOSPC`) `500` 대신 `503 store_full`이 되고 로그에
+  `exc=OSError(ENOSPC)`가 남습니다.
 * 정리 스레드가 10분마다 만료된 결과·공유·캐시, 1시간 넘게 읽을 수 없는 파일, 400일 지난 예산 파일을 지웁니다. 결과와
   캐시가 자기 몫(`TRENDAI_STORE_MAX_MB`에서 공유 링크가 쓰는 만큼을 뺀 것, 공유 링크는 최대 절반까지만 쓸 수 있고 넘으면 새
   공유를 거절)을 넘으면 오래된 결과부터 그 몫의 90 % 아래로 줄입니다(공유와 예산 파일은 용량 때문에 지우지 않음). 이때 로그에
@@ -313,9 +345,14 @@ TRENDAI_STORE_MAX_MB ≈ (하루 분석 수 × 결과 평균 크기(MB) × TREND
   frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
   `Permissions-Policy`, `Cross-Origin-Opener-Policy`/`Cross-Origin-Resource-Policy: same-origin`을 붙입니다. 앱에는
   인라인 스크립트·스타일이 없습니다. HTML 리포트 내보내기는 `sandbox` CSP로 내려갑니다. CORS는 없습니다.
-* **요청 검사**: POST/DELETE는 `Origin`이 자기 주소와 다르면 `403 cross_origin`입니다. 본문 크기는 읽기 전에
-  확인하고(JSON 64 KB, 업로드 10 MB), JSON 형식을 요구합니다. 압축 폭탄(압축 해제 30 MB 또는 항목 1,000개 초과)과
-  지나치게 큰 표(셀 200만 개, 열 5,000개 초과 등)는 거절합니다.
+* **요청 검사**: POST/DELETE는 `Origin`이 자기 주소와 다르면 `403 cross_origin`입니다. 루프백 주소에 바인드했고
+  `TRENDAI_PUBLIC_URL`·`TRENDAI_TRUST_PROXY`가 없으면, `Origin`의 호스트가 `localhost`·`*.localhost`·루프백 IP가 아닌
+  POST/DELETE도 거절합니다(DNS 리바인딩 방어). 본문 크기는 읽기 전에 확인하고(JSON 64 KB, 업로드 10 MB), JSON 형식을
+  요구합니다. 지나치게 깊게 중첩된 JSON, 파트가 10개를 넘는 multipart, 읽다가 끊긴 본문은 `400 bad_request`입니다. 압축
+  폭탄(압축 해제 30 MB 또는 항목 1,000개 초과), 지나치게 큰 표(셀 200만 개, 행 20만 개, 열 5,000개 초과 등 — 엑셀은
+  시트를 읽는 도중에 멈춤), PDF·이미지 같은 바이너리 파일은 거절합니다.
+* **응답의 `Server` 헤더**는 `trendai`뿐이고 Python 버전을 드러내지 않습니다. 내려받은 HTML 리포트는 외부 글꼴을
+  불러오지 않습니다(CSP에도 글꼴 호스트 없음).
 * **정적 파일**은 시작할 때 만든 목록에 있는 경로만 제공하므로 경로 조작(`..`)이 통하지 않습니다. `/static/dev/`는
   개발 모드에서만 열립니다.
 * **로그 정책**: 접속 로그는 `rid=… ip=<12자리 해시> GET /api/results/{id} 200 12ms 3456B` 형식입니다. IP는 하루마다
@@ -356,9 +393,11 @@ TRENDAI_STORE_MAX_MB ≈ (하루 분석 수 × 결과 평균 크기(MB) × TREND
 | 위키백과·네이버 요청이 TLS 인증서 오류로 실패 (회사 프록시 뒤) | 앱은 시스템 CA와 `HTTPS_PROXY`를 씁니다. 프록시의 CA 묶음을 `SSL_CERT_FILE=/path/ca-bundle.crt`로 지정하세요 |
 | `오류: 127.0.0.1:8000을 열 수 없습니다 — 이미 다른 프로그램이 이 포트를 쓰고 있습니다` | 다른 포트(`--port 8001`, 또는 `--port 0`으로 빈 포트)를 쓰거나 기존 프로세스를 끄세요 |
 | `오류: 공개 주소로 실행하려면 TRENDAI_CONTACT…` | `TRENDAI_CONTACT`를 설정하거나, 비공개 배포라면 `TRENDAI_ALLOW_NO_CONTACT=1` |
+| gunicorn·waitress에서 모든 요청이 `503 config_error` | 설정 오류입니다. 첫 요청 때 남은 ERROR 로그 한 줄을 보세요. WSGI에서는 `TRENDAI_CONTACT`가 필요합니다(또는 `TRENDAI_HOST`를 루프백으로 설정하거나 `TRENDAI_ALLOW_NO_CONTACT=1`) |
+| 분석·공유가 `503 store_full`, `/api/health`가 `degraded` | 데이터 디스크 여유가 50 MB 아래이거나 공유 링크가 `TRENDAI_STORE_MAX_MB`의 절반을 넘었습니다. 디스크를 늘리거나 한도를 조정하세요 |
 | 네이버 결과가 ‘네이버 연결에 문제가 생겼어요’ (`naver_auth`, 로그에 HTTP 401) | 키 ID·키가 맞는지, HUB 애플리케이션에서 **검색어트렌드 API를 켰는지** 확인하세요. 로그의 `log_detail`에 네이버 오류 코드가 있습니다 |
 | 네이버 출처가 ‘한도 소진’ | 이번 달 사용량이 90 %를 넘었습니다. `budget/naver-YYYY-MM.json`을 보고 다음 달(한국 시간)을 기다리거나 한도를 조정하세요 |
-| 분석·업로드 POST가 `403 cross_origin` | 브라우저가 보는 주소와 앱이 아는 자기 주소가 다릅니다. `TRENDAI_PUBLIC_URL`을 실제 주소로 설정하고, 프록시라면 `TRENDAI_TRUST_PROXY=1`과 `Host`/`X-Forwarded-*` 헤더를 확인하세요 |
+| 분석·업로드 POST가 `403 cross_origin` | 브라우저가 보는 주소와 앱이 아는 자기 주소가 다릅니다. `TRENDAI_PUBLIC_URL`을 실제 주소로 설정하고, 프록시라면 `TRENDAI_TRUST_PROXY=1`과 `Host`/`X-Forwarded-*` 헤더를 확인하세요. 루프백에 바인드한 서버를 다른 호스트 이름(예: 사내 DNS 이름)으로 열면 DNS 리바인딩 방어에 걸리므로 `TRENDAI_PUBLIC_URL`을 그 주소로 설정하세요 |
 | 사용자들이 자꾸 `429` | 프록시 뒤에서 `TRENDAI_TRUST_PROXY`가 꺼져 있어 모두 한 IP로 보이는지 확인하세요 |
 | `/`가 `503 trendai: static files are missing` | 정적 파일이 설치되지 않았습니다. `pip install .`로 다시 설치하세요(패키지 데이터 `trendai/web/static/**`) |
 | Docker 컨테이너가 계속 `unhealthy` | 포트를 `--port`로 바꿨다면 `TRENDAI_PORT`로 바꾸세요(상태 확인은 `TRENDAI_PORT`를 봄). `/api/health`가 `503`이면 데이터 볼륨이 가득 찼거나 쓸 수 없는지(`store.writable`) 확인하세요 |

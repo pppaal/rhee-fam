@@ -1,6 +1,7 @@
 # trendai web app — implementation spec
 
-Date 2026-11-25 (rev. 2, after the feasibility and design reviews) · Status: **binding implementation contract**
+Date 2026-11-25 (rev. 3: rev. 2 after the feasibility and design reviews, updated to the code after the verification
+round of the running app, J13–J28) · Status: **binding implementation contract**
 for the four work packages (WP1–WP4) · Inputs: `docs/WEB_DESIGN_RESEARCH.md` (the design brief, "the brief", cited as
 §x.y), `docs/ARCHITECTURE.md`, `README.md`, the code as of commit `0b7f1ce` (re-checked at `88c3492`: Python 3.13,
 pandas 3.0.5, Node 22). Review findings that were *not* applied, and partial applications, are explained in the
@@ -354,14 +355,34 @@ class RawTable:
     encoding: Optional[str]        # e.g. 'utf-8-sig', 'cp949'; None for Excel
     decimal_comma: bool            # pass to frame_to_series(prefer_decimal_comma=...)
     google_trends: Optional[GoogleTrendsInfo]
+    header_row: Optional[int] = None   # physical 0-based row/line of the labels (GT preamble counted); None for
+                                       # JSON and headerless files
+    title_rows: int = 0                # non-blank title rows skipped above it (FU-4)
 
-def read_table_bytes(raw: bytes, filename: str, *, max_columns: Optional[int] = None) -> RawTable:
+def read_table_bytes(raw: bytes, filename: str, *, max_columns: Optional[int] = None,
+                     max_cells: Optional[int] = None, header_row: Optional[int] = None) -> RawTable:
     """Parse file bytes in memory (never touches the disk). Format from the extension of `filename`
     (.csv .tsv .txt .xlsx .xlsm .xls .ods .json; unknown -> text sniffing), Excel via io.BytesIO.
-    Emits the same DataNotice/DataWarning as load_table (+ gt_detected, gt_lt1_half). Raises DataError.
-    max_columns: for text formats the header row is split with the sniffed delimiter *before* the full parse and
-    more than max_columns fields raise DataError(msg('table_too_many_columns', n=..., max=...)); for Excel/JSON the
-    check runs right after reading. None = no limit (load_table's behaviour)."""
+    Emits the same DataNotice/DataWarning as load_table (+ gt_detected, gt_lt1_half, title_rows_skipped).
+    Raises DataError. The limits are checked *before* the frame is built (SEC-1):
+    max_columns: text formats split the header row with the sniffed delimiter before the full parse; .xlsx
+    stops at the first cell right of the limit while streaming the first sheet (openpyxl read-only,
+    reset_dimensions(), styled empty cells ignored); JSON counts the union of record keys first. More columns
+    raise DataError(msg('table_too_many_columns', n=..., max=...)).
+    max_cells: rows x columns of the frame-to-be (text: non-blank lines below the header x header fields;
+    .xlsx: rows x widest row so far, while streaming; JSON: records x keys) above it raises
+    DataError(msg('table_too_large', n=..., max=...)). None = UNTRUSTED_MAX_CELLS (2,000,000) for Excel and JSON
+    when max_columns is given, else no limit. A MemoryError while reading -> DataError('table_out_of_memory');
+    JSON nested too deeply -> DataError('json_shape'). .xls/.ods are read whole by their engine and checked
+    right after reading.
+    header_row: the 0-based line / sheet row holding the labels (None = automatic). Automatic detection skips
+    leading rows that hold one filled cell each (a sheet title, '(단위: 원)', blank rows between) when the next row
+    has >= 2 filled cells and starts with a label, and emits DataNotice 'title_rows_skipped'; an invalid value ->
+    DataError('header_row_invalid').
+    Blank header cells are named after their column letter ('열 B') on this path; load_table / load_table_bytes
+    (CLI, library) keep pandas' 'Unnamed: N'. frame_to_series treats '열 X' like an unnamed column.
+    Text without a BOM whose NUL bytes sit at every other position is decoded as UTF-16-LE/BE before UTF-8 is
+    tried (UTF-8 would accept the NULs)."""
 
 def load_table_bytes(raw: bytes, filename: str, date_col: Optional[str] = None,
                      value_cols: Optional[Iterable[str]] = None) -> dict[str, pd.Series]:
@@ -378,6 +399,13 @@ def load_table_bytes(raw: bytes, filename: str, date_col: Optional[str] = None,
 #  * a wide table with duplicate row names (and any other source of duplicate series names) gets unique keys:
 #    the 2nd, 3rd ... occurrence is renamed '<name> (2)', '<name> (3)' (series.name too) instead of silently
 #    overwriting the earlier series in the returned dict.
+# data.prepare(...) (FU-5): out.attrs[INTERPOLATED_ATTR] ('trendai_interpolated') lists every period it filled by
+# interpolation as ascending 'YYYY-MM-DD' strings ([] when none), also below the gaps_interpolated threshold; a
+# second prepare of an already prepared series keeps the list, and pipeline.run copies it to
+# report.analysis.series.attrs. WP1 turns it into the 'gaps_filled' notice (C.12.5).
+# narrative.plain_language(text, lang) and narrative.phase_reason_kind(reason, label) (FU-8) are additive helpers
+# (statistical jargon -> plain words; 'caveat' | 'support'); the CLI/HTML texts are unchanged. The web VM uses its
+# own post-processing (D.2.5 kind, D.2.9) and does not call them yet (J17).
 
 @contextmanager
 def collect_notices() -> Iterator[list[Warning]]:
@@ -485,7 +513,12 @@ def start_background(app: TrendaiApp, host: str = "127.0.0.1",
 def application(environ, start_response):
     """Lazy: importing the module creates nothing (no data dir, no threads). The first call, under a module lock,
     runs install_warning_baseline(), WebConfig.from_env().validate_public(), logging.basicConfig (E.11) and
-    create_app(), then delegates. docs/WEB.md: never use gunicorn --preload (threads do not survive fork)."""
+    create_app(), then delegates. docs/WEB.md: never use gunicorn --preload (threads do not survive fork).
+    The WSGI server decides the bind, so the deployment counts as public: TRENDAI_CONTACT is required unless
+    TRENDAI_HOST is set explicitly (to a loopback address) or TRENDAI_ALLOW_NO_CONTACT is set (OPS-8). A
+    configuration error is cached and logged once at ERROR; every request, /api/health and HEAD included, then
+    gets 503 with a JSON 'config_error' envelope (no 'exit 2', no HTML 500 from the WSGI server). The DNS-
+    rebinding rule of C.0 is off unless TRENDAI_HOST is set. The E.14 drain applies only to `trendai serve`."""
 
 # trendai/web/fetchers.py
 @dataclass
@@ -713,6 +746,13 @@ pipeline/data/narrative sections.
   else, with `trust_proxy`, the last `X-Forwarded-Proto` value + the last `X-Forwarded-Host` value (each falling back
   to `wsgi.url_scheme` / `HTTP_HOST` when absent); else `wsgi.url_scheme` + `HTTP_HOST`. Default ports (`:80` for
   http, `:443` for https) are dropped before comparing. There is no CORS: no `Access-Control-*` headers, `OPTIONS` → `405`.
+* **DNS rebinding** (SEC-10, J14): when the server is bound to a loopback address and neither `public_url` nor
+  `trust_proxy` is set, a `POST`/`DELETE` whose `Origin` host is not `localhost`, `*.localhost` or a loopback IP →
+  `403 cross_origin`, even when it equals the `Host` header (a rebound name resolves to 127.0.0.1). Requests without
+  `Origin` are unchanged. The WSGI entry (`trendai.web.wsgi`) turns the rule off unless `TRENDAI_HOST` is set,
+  because the bind address is unknown there.
+* **Malformed bodies** answer `400 bad_request` without a traceback: JSON nested deeper than the parser's recursion
+  limit (`http.parse_json` catches `RecursionError`), and a body whose read times out or is reset (`read_body`).
 * **Compression**: JSON responses larger than 1 KB are gzip-compressed (`gzip.compress(level=6)`) when the request's
   `Accept-Encoding` contains `gzip`; such responses carry `Content-Encoding: gzip` and `Vary: Accept-Encoding`.
   Static files and exports are never compressed (their ETags stay byte-exact).
@@ -733,7 +773,9 @@ pipeline/data/narrative sections.
  "jobs": {"running": 1, "queued": 0}, "store": {"writable": true}}
 ```
 
-`status` is `"ok"` | `"draining"` | `"degraded"` (store not writable). No secrets, no config values.
+`status` is `"ok"` | `"draining"` | `"degraded"` (store not writable). `store.writable` means the probe file can be
+created **and** at least 50 MB are free on the data dir's file system (`statvfs`; OPS-6), so a nearly full disk reports
+`degraded` before writes start failing. No secrets, no config values.
 Headers: `Cache-Control: no-store`. Not rate limited.
 
 ### C.2 `GET /api/config`
@@ -782,7 +824,7 @@ Headers: `Cache-Control: no-store`. Not rate limited.
   (`TRENDAI_AI=off`). `xlsx_export` = `openpyxl` importable. `html_report` is always true (per-result availability
   is in the VM `exports`).
 * `last_complete.*` = `period_bounds(..., today)[1]` per unit (Naver with the KST date, Wikipedia with the UTC date).
-* Headers: `Cache-Control: no-cache`. Rate limit: `read` bucket.
+* Headers: `Cache-Control: no-cache`. Rate limit: `config` bucket (C.13; OPS-11).
 
 ### C.3 `GET /api/samples?hl=ko`
 
@@ -799,16 +841,20 @@ Headers: `Cache-Control: no-store`. Not rate limited.
   `texts.SAMPLE_TITLES_EN` / `texts.SAMPLE_DESCRIPTIONS_EN` (G.13). `spark` = the default sample (`n=120`, `M`)
   downsampled to exactly 60 points: the values at positions 1, 3, 5, …, 119 (0-based; the last value is therefore
   always included), rounded to 3 significant digits.
-* Computed once at app start. `Cache-Control: public, max-age=3600`. Rate limit: `read`.
+* Computed once at app start. `Cache-Control: public, max-age=3600`. Rate limit: `config` (C.13).
 
 ### C.4 `POST /api/upload`
 
 Query: `?hl=ko|en` (language of `notices[].text` and labels; default `ko`). **Request A — file**: `multipart/form-data` with exactly one part `name="file"` that has a `filename`. Other parts
-are ignored. **Request B — paste**: `application/json` `{"text": "<tab-separated text>", "filename": "붙여넣기.tsv"}`
+are ignored; a body with more than 10 parts (`uploads.MAX_MULTIPART_PARTS`, counted from the boundary delimiters
+before `email.parser` runs) → `400 bad_request` (SEC-11). **Request B — paste**: `application/json` `{"text": "<tab-separated text>", "filename": "붙여넣기.tsv"}`
 (`filename` optional, default `"paste.tsv"`; `text` 1 byte–10 MB).
 
-Processing (E.17): rate limit → parse slot (at most 2 concurrent parses, else `503 server_busy`, `Retry-After: 5`)
-→ size checks → Excel zip guard → `data.read_table_bytes(raw, name, max_columns=5000)` → table limits →
+Processing (E.17): rate limit → parse slot (at most 2 concurrent parses, and **one per client**, else
+`503 server_busy`, `Retry-After: 5`) → size checks → Excel zip guard → binary check (`uploads.looks_binary`: a PDF,
+an image or random bytes that are no Excel file → `422 upload_unreadable`; text with a BOM, and UTF-16 without one,
+is text) → `data.read_table_bytes(raw, name, max_columns=5000, max_cells=2_000_000)` (the data layer streams `.xlsx`
+rows and checks JSON / text shapes **before** building the frame, SEC-1) → table limits → label caps →
 `data.frame_to_series` with automatic detection → store the `RawTable` in the in-memory upload cache (30 min).
 Notices of both calls are captured with `data.collect_notices()`. Nothing is written to disk by the app.
 
@@ -859,6 +905,14 @@ Notices of both calls are captured with `data.collect_notices()`. Nothing is wri
 
 * `role`: `date` | `value` (detected value column) | `excluded` (numeric but skipped: `reason: "row_number"`) |
   `ignored` (`reason: "not_numeric"`: < 80 % of cells parse as numbers). `numeric_share` = parsed share of non-empty cells.
+  A column with `numeric_share >= 0.8` that is neither a date, a detected value column nor a row number (typically
+  because no date column was found) has `role: "value"`, `reason: null` but is **not** in `detected.value_cols`, so
+  the confirm step shows it unchecked and selectable (UX-20). The confirm step shows `confirm.need_value` only after
+  the user picked a date column, changed a box or pressed 분석하기.
+* **Labels** (SEC-6): column names and the first-column texts of a wide table (series names) are cut to 80
+  characters with `…` and kept unique (`uploads._cap_labels`; Google Trends terms are remapped). Blank header cells
+  are named after their column letter (`열 B`, in both languages: it is data, B.3.1) instead of pandas' `Unnamed: 1`. A title row
+  above the header (a sheet title, `(단위: 원)`) is skipped with the notice `title_rows_skipped` (B.3.1, FU-4).
 * `detected.freq` = `data.infer_freq` of the detected date column's parsed dates (non-null), or `null`;
   `freq_label` from G.5 (`일간`/`주간`/`월간`/`분기`/`연간`). `date_format_label` = `messages.format_label(label, hl)`
   plus the unit word (`형식 (월)` / `format (monthly)`).
@@ -872,7 +926,10 @@ Notices of both calls are captured with `data.collect_notices()`. Nothing is wri
 * **Wide tables** (dates across columns): `detected.wide = true`, `detected.date_col = null`, `date_cols = []`,
   `detected.value_cols` = the series (row) names (unique, B.3.1), `columns` lists those names with `role: "value"`.
 * **Table limits** (B.3.4), checked after `read_table_bytes` and detection: more than 2,000,000 cells
-  (`frame.size`) → `422 upload_too_large_table`; a long table with more than 50 columns → `422 upload_too_many_columns`;
+  (`frame.size`, or the data layer's `table_too_large` while reading) → `422 upload_too_large_table`; more than
+  200,000 rows (`uploads.MAX_TABLE_ROWS`, checked right after reading, before detection) → `422
+  upload_too_large_table` with `n` = cells and `max` = 200,000 × columns (SEC-11); a long table with more than 50
+  columns → `422 upload_too_many_columns`;
   a wide table with more than 200 rows or more than 5,000 date columns → `422 upload_too_many_columns` (`n` = the
   offending count, `max` = its limit). The column limit thus never rejects a wide table for having many periods.
 * `preview` cells are WP1's stringification of `RawTable.frame` (E.17): Timestamps → `YYYY-MM-DD` (or
@@ -887,9 +944,13 @@ Notices of both calls are captured with `data.collect_notices()`. Nothing is wri
 * `notices`: captured `DataNotice`/`DataWarning` (C.12.5), texts via `messages.render_web_msg` in `hl`.
 
 **Errors**: `413 body_too_large`, `413 upload_archive_too_large`, `415 unsupported_media_type`,
-`400 bad_request` (no `file` part / empty text), `422 upload_unreadable`, `422 upload_too_many_columns`,
-`422 upload_too_large_table`, `501 upload_excel_needs_pkg`, `429 rate_limited` (bucket `upload`),
-`503 server_busy` (both parse slots taken).
+`400 bad_request` (no `file` part / empty text / more than 10 parts / JSON nested too deeply), `422 upload_unreadable`,
+`422 upload_too_many_columns`, `422 upload_too_large_table`, `501 upload_excel_needs_pkg`, `429 rate_limited`
+(bucket `upload`), `503 server_busy` (both parse slots taken, or this client already has a parse running).
+`upload_unreadable` always shows the catalog text when the data layer's message would quote a library exception
+(`{error}`: `csv_ragged`, `excel_unreadable*`, `json_*`, `file_unreadable`); `params.reason` keeps the data code
+(UX-6). A zip that is no spreadsheet (no `xl/` part and no ODS `content.xml`, e.g. a renamed `.docx`) →
+`422 upload_unreadable` (`reason: excel_unreadable`).
 
 ### C.5 `POST /api/analyze`
 
@@ -917,7 +978,7 @@ Request (JSON, ≤ 64 KB):
 | `h` | all | `"auto"` or an integer 1…`horizon_max[freq]` (freq from `unit`; for samples `M`). Upload with automatic freq: values above the maximum are clamped with notice `horizon_clamped`. |
 | `dev` / `gender` / `ages` | naver | `""`\|`pc`\|`mo` · `""`\|`m`\|`f` · subset of `"1"`…`"11"` |
 | `wl` | wiki | `^[a-z]{2,3}$`, default `ko` |
-| `upload_id` | upload | an id in the upload cache, else `410 upload_expired` |
+| `upload_id` | upload | an id in the upload cache, else `410 upload_expired`; `410 upload_evicted` when the id was dropped early to make room in the cache (remembered for the 30-min TTL, SEC-8) |
 | `date_col` | upload | a column of the table, or `null` for wide tables / automatic detection |
 | `value_cols` | upload | 1–20 column (or wide-row) names, or `null` = detected [`upload_too_many_series`] |
 | `freq` | upload | `auto`\|`D`\|`W`\|`M`\|`Q`\|`Y` |
@@ -927,12 +988,26 @@ Fields that do not apply to the source are ignored. Display names are unique wit
 `groupName` is the wire name `g1` … `g5` (series index + 1), never the display name; results are mapped back by
 index (E.6), so display names of any length or content are safe.
 
-**Pre-checks before queueing** (all synchronous): validation; rate limit `analyze`; result-cache lookup (E.10) →
-`200 cached`; **in-flight lookup** — a queued or running analyze job with the same result-cache key → `202` with
-that job's id and `"joined": true` (its subscriber count is incremented; no Naver token, budget or executor slot is
-used); for Naver: configured (`503 naver_unconfigured`), cache lookup by `naver_cache_key`; on a miss: budget
-(`503 naver_budget_exhausted`) and per-IP Naver bucket (`429 naver_rate_limited`); executor capacity (`503 server_busy`).
-Uploads have no result-cache key and are never joined.
+**Pre-checks before queueing** (all synchronous), in this order: validation (for uploads also the **work budget**
+below); rate limit `analyze`; result-cache lookup (E.10) → `200 cached`; **in-flight lookup** — a queued or running
+analyze job with the same in-flight key → `202` with that job's id and `"joined": true` (its subscriber count for
+this client is incremented; no Naver token, budget or executor slot is used, and joins never count against the
+per-client cap); executor capacity (`503 server_busy`) and the **per-client cap**: a client may own at most 3 queued
+or running analyze jobs (2 narrative jobs; `jobs.PER_CLIENT_ACTIVE`), beyond that `429 rate_limited` with
+`retry_after: 10`, checked under the manager lock (SEC-5); free disk (under 50 MB → `503 store_full`, E.7); for
+Naver: configured (`503 naver_unconfigured`), cache lookup by `naver_cache_key`; on a miss: budget
+(`503 naver_budget_exhausted`) and per-IP Naver bucket (`429 naver_rate_limited`); submit. When the request is refused
+for capacity (`server_busy`, the per-client `rate_limited`, `store_full`), the `analyze` and Naver tokens it took are
+given back (`RateLimiter.give_back`, OPS-10), so following a `503`'s `Retry-After` never leads to a `429`.
+
+Uploads have no result-cache key (they are never served from the cache), but they do have an **in-flight key**
+(`upload_id` + `date_col` + `value_cols` + `freq` + `h` + `unit_label`): repeating a running upload analysis joins it.
+
+**Upload work budget** (SEC-2, OPS-5): each prepared series may have at most 20,000 points
+(`analyze.MAX_SERIES_POINTS`) and a request at most 60,000 (`MAX_REQUEST_POINTS`). The synchronous pre-check
+estimates `n` = detected distinct dates (scaled for a coarser requested `freq`) × series and refuses with
+`422 upload_too_large_table` (`max` = min(60,000, 20,000 × series)); the job checks again after `data.prepare` and
+fails each series that exceeds the budget with the same code.
 
 **`202`** (queued, or joined) or **`200`** (an identical result exists and is fresh — `cached: true`):
 
@@ -989,8 +1064,12 @@ GET `200` while queued/running (analyze job):
 * `error`: the C.12.1 error object when `status == "failed"` (e.g. `naver_auth`, `data_too_short`,
   `job_timeout`); `null` otherwise. A job fails when the data stage fails or **every** series fails.
 * `result_url` set when `done`. `poll_after_ms`: 500 while queued/running, `null` when terminal.
-* After a restart, or 10 min after completion, the job is no longer in memory: GET then synthesises
-  `{"status": "done", …}` from the stored result (full `series` list, `compare`), or `404 job_not_found`.
+* A done job keeps no VMs in memory (OPS-2/OPS-9): its `series` (index ≥ `since`) are read from the stored
+  `vm-<hl>.json` under the heavy-read semaphore (C.13) and charged to the client's `read` bucket. After a restart, or
+  10 min after completion, the job is no longer in memory: GET then synthesises `{"status": "done", …}` from the
+  stored result (`series` with index ≥ `since` — `since=0` gives the full list — and `compare`), or
+  `404 job_not_found`.
+* `current.name` is the display name in `hl` (sample titles, E.6.1).
 
 Narrative job (`kind: "narrative"`) while queued or running:
 
@@ -1008,14 +1087,19 @@ and when done:
                "model": "claude-opus-5-5", "note": "AI가 작성한 해석이에요. 수치는 위 분석 결과를 근거로 해요."}}
 ```
 
-`DELETE /api/jobs/<id>` decrements the job's subscriber count (C.5 joins increment it; the creator counts as 1). Only
-when it reaches 0 is the job cancelled: `202 {"job_id": "…", "status": "cancelling"}` for queued/running jobs
+`DELETE /api/jobs/<id>` withdraws **the calling client's own** subscription (SEC-9): subscriptions are counted per
+client key (C.5 joins increment the joiner's count; the creator counts as 1), and a DELETE from a client without a
+subscription changes nothing, so a joiner cannot cancel a shared job by repeating DELETE. Only when the total reaches
+0 is the job cancelled: `202 {"job_id": "…", "status": "cancelling"}` for queued/running jobs
 (queued jobs become `cancelled` immediately; running jobs at their next stage boundary). While other subscribers
 remain the job keeps running and the answer is `202 {"job_id": "…", "status": "<current status>"}` — one tab's
 cancel never cancels another tab's shared job. Terminal jobs → `200 {"job_id": "…", "status": "<terminal>"}`,
 unknown ids → `404 job_not_found`. A cancelled analyze job stores nothing.
 
-Rate limit: bucket `poll` (GET, keyed by client IP **and** job id); DELETE is not rate limited.
+Rate limit: bucket `poll` (GET, keyed by client IP **and** job id) for jobs still in memory; polls of ids that are
+not in memory (stored or unknown) take a token from the client-level `read` bucket instead, so they cannot mint
+fresh per-id buckets (SEC-7). DELETE is not rate limited. Queued jobs ended by a graceful-shutdown drain (E.14) become
+`failed` with `server_busy` (`retry_after: 30`), not `cancelled`.
 `Cache-Control: no-store`.
 
 ### C.7 `GET /api/results/<id>?hl=ko`
@@ -1042,8 +1126,9 @@ Rate limit: bucket `poll` (GET, keyed by client IP **and** job id); DELETE is no
 `connectors.period_bounds`, used by the client to write an absolute `range` when copying a link, F.6.12). For
 uploads: `{"source": "upload", "filename": "월매출.xlsx", "date_col": "날짜", "value_cols": ["매출"], "freq": "M", "h": 12, "unit_label": "원"}`;
 samples have no `period`.
-Errors: `404 result_not_found` (unknown, expired, or stored with another `WEB_VM_SCHEMA`). `Cache-Control: no-store`.
-Rate limit: `read`.
+Errors: `404 result_not_found` (unknown, expired, stored with another `WEB_VM_SCHEMA`, or a stored document of the
+wrong shape — OPS-16), `503 server_busy` (`Retry-After: 5`) when no heavy-read slot frees within 10 s (C.13).
+`Cache-Control: no-store`. Rate limit: `read`.
 
 ### C.8 `POST /api/share` and `DELETE /api/share/<share_id>`
 
@@ -1057,7 +1142,11 @@ POST `{"result_id": "…"}` → **`201`**:
 * Only results whose source kind is `upload` or `google_trends_upload`; others → `400 share_not_needed` (the page URL
   is the link). Unknown/expired result → `404 result_not_found`.
 * Creates `shares/<share_id>/` with a snapshot of the result (VMs in both languages, export data, pre-rendered HTML;
-  **no** LLM payloads) so the share outlives the 24 h result. Stored VMs never contain URLs or the `result_id`
+  **no** LLM payloads) so the share outlives the 24 h result. The snapshot **hard-links** the result's files
+  (`Store.save_dir(links=)`; copied only when linking fails), so N shares of one result use one copy on disk (SEC-2,
+  OPS-3).
+* **Share quota** (E.7): shares may use at most 50 % of `store_max_mb`, and at least 50 MB must stay free on disk;
+  otherwise `503 store_full` with `Retry-After: 300`. Stored VMs never contain URLs or the `result_id`
   (E.7: `exports` are stored as availability flags and URLs are built per response), so the snapshot cannot leak the
   result's id — the result is a writable capability for 24 h (AI rewrites, more shares). The delete token is returned
   once; only its SHA-256 is stored.
@@ -1104,20 +1193,32 @@ private, no-store`, `X-Robots-Tag: noindex, nofollow`.
 * Columns: `날짜, 실제값, 추세, 예측값, 80% 하한, 80% 상한, 95% 하한, 95% 상한` (en: `date, actual, trend, forecast,
   lo80, hi80, lo95, hi95`). **Naver: no `실제값`/`actual` column** and the second comment line ends with the
   "원본 값 제외" note (G.8 `export.naver_note`). History rows fill `실제값`, `추세`; forecast rows fill the rest.
-* Values: plain decimal numbers (`repr`-free, up to 15 significant digits, `.` decimal point, no thousands
-  separators); dates `YYYY-MM-DD`. Comment lines start with `# ` (pandas `comment="#"` reads the file).
-* **Formula-injection guard (CSV)**: any *text* cell (names, labels, comment lines' leading cell) that starts with
-  `=`, `+`, `-`, `@`, tab or CR is prefixed with `'`. Numbers are never prefixed.
+* Values: plain decimal numbers (`repr`-free, `.` decimal point, no thousands separators); dates `YYYY-MM-DD`.
+  Actual values keep up to 15 significant digits; model outputs (trend, forecast, band bounds) are rounded to 6
+  significant digits of the series scale (`31.363`, not `31.3625540402141`; FU-12). Comment lines start with `# `
+  (pandas `comment="#"` reads the file). Sample conditions name the sample title (`# 조건: 샘플 성장형`, E.6.1).
+* **Formula-injection guard (CSV)**: any *text* cell (names, labels) that starts with `=`, `+`, `-`, `@`, tab or CR
+  is prefixed with `'`. Numbers are never prefixed. **Comment lines** (SEC-3) stay unquoted (so `comment="#"` still
+  works) and are neutralised piece by piece: `"` becomes `”` (a piece can never open a quoted cell), CR, LF and tab
+  become spaces, and the line is split at `,` and `;` (semicolon-locale Excel) — every piece whose first non-blank
+  character is `=`, `+`, `-` or `@` gets a leading `'`.
 * Whole-result CSV (compare): ranking columns `순위, 이름, 국면, 전망, 예측 변화(%), 상승 확률(%), 최근 변화(%),
-  모멘텀(%p/기간), 상승 점수, 예측 신뢰도` from `rank_trends`; the first comment line is `compare.source_line` (D.4),
-  the second the condition line listing every series. `values.csv` uses the same two comment lines.
+  모멘텀(%p/기간), 상승 점수, 예측 신뢰도, 참고용 예측` (en `…, reliability, reference only`) from `rank_trends`; the
+  11th column is `예`/`아니요` (`yes`/`no`) for `display != "normal"` (CON-3). Numbers: change % with 2 decimals,
+  P(rise) % with 1 decimal clamped to [0.1, 99.9] when 0 < p < 1, momentum with 3 decimals (|m| < 0.0005 → 0),
+  score with 1 decimal (FU-12, UX-5). The first comment line is `compare.source_line` (D.4), the second the condition
+  line listing every series. `values.csv` uses the same two comment lines.
 
 **XLSX** (only when `openpyxl` is importable, else `501 export_xlsx_unavailable`): sheet `데이터`/`Data` per series
 (name = series display name cut to 31 characters, `[]:*?/\` replaced by `_`, de-duplicated with ` (2)`):
 rows 1–7 = conditions (`출처`, `검색어 그룹/열`, `기간`, `단위`, `조건(기기·성별·연령)`, `데이터 기준`, `값의 성격`; label in
-column A, value in B), row 8 empty, row 9 header (same columns as CSV), data from row 10; numbers as numbers
-(`0.0` format for relative indexes). Sheet `요약`/`Summary`: one row per series with `이름, 국면, 전망, 예측 변화,
-상승 확률, 예측 신뢰도, 정확도, 상승 점수` (pre-formatted texts from the VM). Same Naver rules as CSV. **Formula
+column A, value in B), row 8 empty, row 9 header (same columns as CSV), data from row 10; dates are real date cells
+(`yyyy-mm-dd` for D/W, `yyyy-mm` for M/Q, `yyyy` for Y) and numbers are numbers with full precision and a
+`#,##0[.0…]` display format (`0.0` for relative indexes; FU-12). Sheet `요약`/`Summary`: one row per series with
+`이름, 국면, 전망, 예측 변화, 상승 확률, 예측 신뢰도, 정확도, 상승 점수` (pre-formatted texts from the VM; when
+`chart.display != "normal"` the 예측 변화 and 상승 확률 texts end with ` · 참고용` / ` · for reference`, CON-3) plus
+two numeric columns `예측 변화(%)` and `상승 확률(%)` (`Expected change (%)`, `Chance of rise (%)`). Same Naver rules
+as CSV. **Formula
 guard (XLSX)**: openpyxl stores any string starting with `=` as a formula, and a leading `'` would show as a visible
 character, so text cells are written as strings explicitly (`cell.value = text; cell.data_type = "s"`) — no
 apostrophe is added in XLSX.
@@ -1125,23 +1226,32 @@ apostrophe is added in XLSX.
 **HTML**: the file pre-rendered at job completion (`report.render_html` / `render_compare_html`; Korean only), with
 one post-processing step because the frozen renderer prints only the name: right after the first `<body>` (the
 renderer emits `<body>\n<main class="wrap">`), WP1 inserts `<p class="source">{html.escape(source.line ko)}</p>`
-(compare: `compare.source_line`). **Naver results: `403 export_naver_raw`** (the report embeds raw ratios).
+(compare: `compare.source_line`); weekly reports add ` · 아래 보고서의 주별 날짜는 각 주의 시작일(월요일)이에요` to that
+paragraph (CON-7). The stored reports have the renderer's Google Fonts `<link>` (`report._FONT_LINK`) removed, so a
+downloaded report contacts no third party (system font stack; SEC-14). **Naver results: `403 export_naver_raw`**
+(the report embeds raw ratios).
 Response headers for HTML:
-`Content-Security-Policy: sandbox; default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src data:`.
+`Content-Security-Policy: sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:` (the stored reports load no web fonts, SEC-14).
 
 **JSON**: `report_to_dict(report, lang=hl)` stored at job time in both languages, plus a top-level `"source"` object
 = the series VM's `source` block in that language (kind, label, line, value_kind, value_kind_label, freq, start, end,
 as_of, filters_label, filename, attribution). The whole-result JSON of a compare is an object, not a bare array:
 `{"source_line": compare.source_line, "source": [each series' source object], "reports": [each series' object]}`
-(WEB_INTERFACES §4.1); a single series is the one object. **Naver**: the `history` key is removed,
-`metrics.last_value`, `metrics.peak_value`, `metrics.mean` and every `anomalies[].value` are removed, and
-`"raw_excluded": true` is added (model outputs such as `trend`, `forecast`, `scenarios` stay, A.3).
+(WEB_INTERFACES §4.1); a single series is the one object. Sample names are the titles in `hl` (E.6.1).
+**Naver** (`exports.strip_naver_raw(export, lang)`): the `history` key is removed; `metrics.last_value`,
+`metrics.peak_value`, `metrics.mean`, `metrics.drawdown_pct`, `outlook.compared_levels` and every
+`anomalies[].value` are removed; phase reasons that quote raw values (`관측 기간 동안 값이…`, `현재 값은…` and their
+English forms) are dropped; the narrative is replaced by `EXPORT_TEXTS.naver_narrative_excluded` with
+`narrative_source: "excluded"`; and `"raw_excluded": true` is added (model outputs such as `trend`, `forecast`,
+`scenarios` stay, A.3; CON-1).
 
 All exports: `Content-Disposition: attachment; filename="trendai-<id8>-<k|all>.<fmt>"; filename*=UTF-8''<pct-encoded "trendai-<display name>.<fmt>">`,
 `Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`. MIME: `text/csv; charset=utf-8`,
 `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `text/html; charset=utf-8`,
-`application/json; charset=utf-8`. Errors: `404 result_not_found` / `share_not_found` / `not_found` (bad `k`).
-Rate limit: bucket `export`.
+`application/json; charset=utf-8`. The display name in `filename*` is the sample title in `hl` for samples
+(`trendai-성장형.csv` / `trendai-Growing.csv`); HTML and JSON use the same name rule as CSV/XLSX
+(`exports._result_name`). Errors: `404 result_not_found` / `share_not_found` / `not_found` (bad `k`), `503
+server_busy` (`Retry-After: 5`) when no heavy-read slot frees within 10 s (C.13). Rate limit: bucket `export`.
 
 ### C.11 `POST /api/narrative`
 
@@ -1154,7 +1264,8 @@ link; the SPA never offers it there, but the code path exists and is tested); `l
 `0 ≤ series < number of series` and a successful series at that index (else `404 not_found`; `true`, `0.0`, `"0"`
 are rejected); source kind is not `naver` (`403 ai_naver_blocked`), AI available (`503 ai_unavailable`), per-IP
 bucket `ai` (`429 ai_rate_limited`), daily cap `TRENDAI_AI_DAILY_LIMIT` (`503 ai_unavailable` with
-`params.reason = "daily_limit"`), narrative executor capacity (`503 server_busy`). If an AI narrative for
+`params.reason = "daily_limit"`), narrative executor capacity (`503 server_busy`) and the per-client cap of 2
+queued/running narrative jobs (`429 rate_limited`, `retry_after: 10`; C.5). If an AI narrative for
 `(result, k, lang)` already exists, respond `200` with a job that is already `done`.
 
 The job calls `fetchers.llm(llm_payload, lang)` (default: `narrative.llm_narrative_from_payload`), splits the
@@ -1162,8 +1273,14 @@ caveats section (D.2.9), stores it in the result (`ai/<k>-<lang>.json`) so later
 `series[k].narrative.ai`, and finishes with the C.6 narrative body. Any `NarrativeUnavailable` or exception →
 job `failed` with `502 ai_failed` (the rule-based narrative stays on screen). The default LLM fetcher passes an
 explicit client timeout of 90 s (`anthropic.Anthropic(timeout=90.0, max_retries=1)`), and a narrative job that is
-still running after 120 s is failed with `ai_failed` at its next check. Only the stored LLM payload (computed facts)
-is sent; no raw upload bytes ever exist to send.
+still running after 120 s is failed with `ai_failed` at its next check. Only the stored LLM payload is sent; no raw
+upload bytes ever exist to send. The payload holds the computed facts **plus up to 60 history values** (all of a
+short series) and the series name (SEC-4; the privacy copy says so, G.8/G.12): `narrative_ai.payload_for` sets
+`series.name` to the VM name in the requested language, whitespace collapsed and cut to 80 characters
+(`narrative.build_llm_payload` applies the same cap). The name appears **only inside the facts JSON**, never in the
+free-text instruction, and `SYSTEM_PROMPT` states that names and labels are untrusted data, not instructions (SEC-6).
+A payload over 40,000 characters fails with `ai_failed` before the model is called (a normal payload is ~10 k
+characters, independent of the series length).
 
 ### C.12 Error and notice catalog
 
@@ -1256,6 +1373,9 @@ is sent; no raw upload bytes ever exist to send.
 | `ai_readonly` | 403 | 공유 링크에서는 AI 해석을 새로 만들 수 없어요. | AI interpretations cannot be created on a shared link. | — |
 | `ai_failed` | 502 | AI 해석을 만들지 못해 규칙 기반 해석을 보여 드려요. | The AI interpretation could not be created, so the rule-based one is shown. | retry |
 | `ai_rate_limited` | 429 | AI 해석은 한 시간에 {limit}번까지 만들 수 있어요. | AI interpretations are limited to {limit} per hour. | retry_in |
+| `store_full` | 503 | 저장 공간이 부족해 지금은 저장할 수 없어요. 잠시 뒤 다시 시도해 주세요. | The server is out of storage space right now. Please try again later. | retry_in (`Retry-After: 300`) |
+| `upload_evicted` | 410 | 서버 메모리가 부족해 올린 파일을 보관하지 못했어요. 다시 올려 주세요. | The server ran short of memory and could not keep the uploaded file. Please upload it again. | reupload |
+| `wiki_not_found_no_naver` | 404 (text variant of `wiki_not_found`) | 위키백과에 ‘{title}’ 문서가 없어요. 정식 문서 제목인지 확인해 주세요. | Wikipedia has no article titled ‘{title}’. Check that it is the article's exact title. | wiki_title_help |
 
 #### C.12.3 Connector codes (WP2 adds; library/CLI texts) and their web mapping (WP1)
 
@@ -1263,7 +1383,7 @@ is sent; no raw upload bytes ever exist to send.
 |---|---|---|---|
 | `conn_naver_unconfigured` | 네이버 API 키가 설정되지 않았습니다. NAVER_API_HUB_KEY_ID와 NAVER_API_HUB_KEY(또는 NAVER_CLIENT_ID와 NAVER_CLIENT_SECRET)를 설정하세요. | Naver API keys are not set. Set NAVER_API_HUB_KEY_ID and NAVER_API_HUB_KEY (or NAVER_CLIENT_ID and NAVER_CLIENT_SECRET). | `naver_unconfigured` |
 | `conn_naver_auth` (`status`) | 네이버 API 인증에 실패했습니다 (HTTP {status}). 키가 맞는지, 앱에서 검색어트렌드 API를 켰는지 확인하세요. | Naver API authentication failed (HTTP {status}). Check the keys and that the Search Trend API is enabled for the app. | `naver_auth` |
-| `conn_naver_rate` | 네이버 API 요청 한도를 초과했습니다 (HTTP 429). 잠시 후 다시 시도하세요. | Naver API rate limit exceeded (HTTP 429). Try again in a moment. | `naver_rate` (`retry_after` 30) |
+| `conn_naver_rate` | 네이버 API 요청 한도를 초과했습니다 (HTTP 429). 잠시 후 다시 시도하세요. | Naver API rate limit exceeded (HTTP 429). Try again in a moment. | `naver_rate` (`retry_after` = the upstream `Retry-After`, else 30) |
 | `conn_naver_server` (`status`) | 네이버 API 서버 오류입니다 (HTTP {status}). | Naver API server error (HTTP {status}). | `naver_server` |
 | `conn_naver_http` (`status`) | 네이버 API 오류입니다 (HTTP {status}). | Naver API error (HTTP {status}). | `source_bad_response` |
 | `conn_naver_bad_response` | 네이버 API 응답을 해석할 수 없습니다. | The Naver API response could not be read. | `source_bad_response` |
@@ -1275,7 +1395,7 @@ is sent; no raw upload bytes ever exist to send.
 | `conn_bad_range` (`value`) | 조회 기간이 올바르지 않습니다: {value} | Invalid period: {value} | `invalid_param` (`param` = "range") |
 | `conn_timeout` | Wikimedia API 응답이 20초 안에 오지 않았습니다. | The Wikimedia API did not answer within 20 s. | `source_timeout` |
 | `conn_wiki_404` | (existing) | | `wiki_not_found` (`title`) |
-| `conn_wiki_429` | (existing) | | `wiki_rate` (`retry_after` 60) |
+| `conn_wiki_429` | (existing) | | `wiki_rate` (`retry_after` = the upstream `Retry-After`, else 60) |
 | `conn_wiki_empty` | (existing) | | `wiki_empty` (`title`) |
 | `conn_network` | (existing) | | `source_unreachable` |
 | `conn_wiki_http`, `conn_wiki_error`, `conn_wiki_json`, `conn_wiki_no_valid` | (existing) | | `source_bad_response` |
@@ -1284,6 +1404,11 @@ is sent; no raw upload bytes ever exist to send.
 | `conn_start_after_end`, `conn_date_*` | (existing) | | `invalid_param` (`param` = "range") |
 
 Any other `ConnectorError` → `source_bad_response`. WP1 logs `exc.code`, `exc.log_detail` (if any) at WARNING.
+**Upstream `Retry-After`** (OPS-4): the connector sets `exc.retry_after` (whole seconds, from a delta-seconds or
+HTTP-date `Retry-After` header of the 429 answer, else `None`) on `conn_wiki_429` and `conn_naver_rate`;
+`errors.from_connector_error` uses it, clamped to 1–300 s, for `wiki_rate` and `naver_rate` (also `exc.params
+.retry_after`). **Without Naver** (CON-11): `wiki_not_found` is rendered with the `wiki_not_found_no_naver` text (no
+"switch to Naver" clause, no `use_naver` fix), for job errors and `failed[]` entries alike.
 
 #### C.12.4 DataError mapping (WP1)
 
@@ -1293,7 +1418,8 @@ Any other `ConnectorError` → `source_bad_response`. WP1 logs `exc.code`, `exc.
 | `no_numeric_col`, `only_rownum_cols` | upload detection | `problem: upload_no_value_col` (200) |
 | `date_col_missing`, `date_col_unreadable` | analyze with user `date_col` | `upload_bad_date_col` (`col`) |
 | `value_col_missing`, `value_col_unreadable` | analyze with user `value_cols` | `upload_bad_value_col` (`col`) |
-| `file_empty`, `csv_ragged`, `json_*`, `excel_is_html`, `excel_unreadable*`, `excel_wrong_ext`, `file_unreadable`, `table_empty_*` | upload parsing | `upload_unreadable` (`params.reason` = original code) |
+| `file_empty`, `csv_ragged`, `json_*`, `excel_is_html`, `excel_unreadable*`, `excel_wrong_ext`, `file_unreadable`, `table_empty_*`, `table_out_of_memory`, `header_row_invalid` | upload parsing | `upload_unreadable` (`params.reason` = original code); the data layer's own text is shown unless it quotes a library exception (`{error}`), then the catalog text (UX-6) |
+| `table_too_large` (WP2: streaming cell cap, `n` = cells read so far, `max`) | upload parsing (`max_cells`) | `upload_too_large_table` (`n`, `max`) |
 | `table_too_many_columns` (new, WP2: `표의 열이 너무 많습니다({n}개, 최대 {max}개).` / `The table has too many columns ({n}, at most {max}).`) | upload parsing (`max_columns`) | `upload_too_many_columns` (`n`, `max`) |
 | `excel_needs_pkg` | upload parsing | `upload_excel_needs_pkg` |
 | `too_few_obs`, `too_few_after_regularise`, `series_empty`, `no_valid_values` | per series | `data_too_short` (`n`) |
@@ -1327,13 +1453,21 @@ New notice codes (WP2 adds texts; WP1 emits):
 | `index_unavailable` | info | 기준값이 0 이하인 시계열이 있어 ‘기준 시점=100’으로 바꿀 수 없어요. 원래 값으로 보여 드려요. | Some series have a base of 0 or less, so they cannot be indexed to 100. Showing original values. | — |
 | `log_hint` (`ratio`) | info | 최댓값 차이가 {ratio}배를 넘어요. 로그 축으로 보면 작은 시계열도 잘 보여요. | The largest series is more than {ratio}× the smallest. A log axis shows the small ones better. | use_log |
 | `naver_cached` (`fetched`) | info | 저장된 네이버 조회 결과({fetched} 기준)를 보여 드려요. | Showing stored Naver data (as of {fetched}). | — |
+| `gaps_filled` (`n`, `dates`) | warning | 빈 기간 {n}개({dates})는 앞뒤 값으로 채운 추정값이에요. 실제 관측값이 아니에요. | {n} empty period(s) ({dates}) were filled in from the values on either side: estimates, not observations. | — |
 
 Existing data-layer codes (`values_unreadable`, `values_infinite`, `gaps_interpolated`, `weekday_only`,
 `duplicates_merged`, `upsampled`, `rownum_cols_skipped`, `headerless`, `utf8_broken`, `excel_is_text`,
 `wide_table`, `date_order_ambiguous`, `date_ym_ambiguous`, `dates_unreadable_rows`, `col_values_unreadable`) are
 passed through with `render_web_msg` (DataNotice → `notice`, DataWarning → `warning`). `horizon_long` is created by
 WP1 itself (E.6 step 2); the engine's own `horizon_long` from `pipeline.run` is discarded by code (E.6 step 3).
+WP1's `horizon_long` passes `freq`, and `viewmodel.make_notice` then names the horizon with the span word
+(`예측 기간(36개월)` / `(36 months)`) instead of the catalog's `(36기간)` / `(36 periods)` (CON-14).
 `span` in `horizon_clamped` is the D.1.6 span word (`104주` / `104 weeks`), so English plurals are right.
+`gaps_filled` (FU-5) is WP1's: `data.prepare` lists every period it filled by interpolation in
+`out.attrs[data.INTERPOLATED_ATTR]` (`"trendai_interpolated"`, ascending `YYYY-MM-DD`), also below the
+`gaps_interpolated` warning threshold; when the data layer raised neither `gaps_interpolated` nor `upsampled` for the
+series, WP1 adds `gaps_filled` with `n` and `dates` = the D.1.6 labels of at most 5 dates (`… 외 3개` /
+`… and 3 more`). `title_rows_skipped` (DataNotice, FU-4) is passed through like the other data-layer codes.
 
 #### C.12.6 Fix actions (`fix_<action>` codes in `MESSAGES`)
 
@@ -1380,7 +1514,9 @@ wording without CLI/Python hints. Required at least:
 
 ### C.13 Rate limits and the Naver budget
 
-Token buckets per client IP (E.8). `burst` = capacity, `refill` = tokens per hour.
+Token buckets per client IP (E.8). `burst` = capacity, `refill` = tokens per hour. The limiter keeps one LRU table
+per bucket name (50,000 keys each), so one bucket's keys (e.g. many per-job `poll` keys) can never evict and refill
+another bucket's (SEC-7).
 
 | Bucket | Endpoints | burst | refill/h | Error |
 |---|---|---|---|---|
@@ -1390,8 +1526,9 @@ Token buckets per client IP (E.8). `burst` = capacity, `refill` = tokens per hou
 | `ai` | `POST /api/narrative` | 3 | 10 | `429 ai_rate_limited` (`limit`) |
 | `share` | `POST /api/share`, `DELETE /api/share/*` | 5 | 20 | `429 rate_limited` |
 | `export` | `GET /api/export/*` | 30 | 300 | `429 rate_limited` |
-| `poll` | `GET /api/jobs/*` — keyed by `(client IP, job id)`, so two tabs, an analyze plus an AI job, or several users behind one NAT never share a bucket | 60 | 21,600 (6/s; the client polls at ≤ 2/s) | `429 rate_limited` |
-| `read` | `GET /api/results/*`, `/api/shared/*`, `/api/config`, `/api/samples` | 60 | 1,200 | `429 rate_limited` |
+| `poll` | `GET /api/jobs/*` of a job **in memory** — keyed by `(client IP, job id)`, so two tabs, an analyze plus an AI job, or several users behind one NAT never share a bucket | 60 | 21,600 (6/s; the client polls at ≤ 2/s) | `429 rate_limited` |
+| `read` | `GET /api/results/*`, `/api/shared/*`, and `GET /api/jobs/*` of ids not in memory (stored or unknown) | 60 | 1,200 | `429 rate_limited` |
+| `config` | `GET /api/config`, `/api/samples` (OPS-11; the SPA retries `/api/config` by itself after `Retry-After`) | 300 | 6,000 | `429 rate_limited` |
 
 Global guards:
 
@@ -1402,10 +1539,18 @@ Global guards:
 * **Analysis executor**: `TRENDAI_WORKERS` (2) running + `TRENDAI_MAX_QUEUED` (8) waiting; more → `503 server_busy`,
   `Retry-After: 10`. Identical queries in flight share one job (C.5) and identical Naver bodies share one fetch (E.6),
   so a burst of clicks on the same example chip costs one slot and one Naver call.
+* **Per-client job cap** (SEC-5): at most 3 queued/running analyze jobs and 2 narrative jobs per client key (joins
+  are free); more → `429 rate_limited` with `retry_after: 10` (C.5, C.11).
 * **AI executor**: 2 running + 4 waiting; daily cap `TRENDAI_AI_DAILY_LIMIT` (200, KST day).
-* **Upload parsing**: at most 2 concurrent parses (`threading.BoundedSemaphore(2)`, non-blocking acquire); more →
-  `503 server_busy`, `Retry-After: 5`.
-* **Upload cache**: 64 entries / 256 MB (estimated `frame.memory_usage(deep=True)`); oldest evicted first.
+* **Upload parsing**: at most 2 concurrent parses (`threading.BoundedSemaphore(2)`, non-blocking acquire) and one per
+  client; more → `503 server_busy`, `Retry-After: 5` (SEC-11).
+* **Upload cache**: 64 entries / 256 MB (estimated `frame.memory_usage(deep=True)`); each entry records its client
+  key, and once a client holds more than 4 entries or 96 MB its own oldest uploads are dropped first; only then the
+  global LRU applies. Ids dropped for space are remembered for the TTL, so C.5 answers `410 upload_evicted` instead
+  of the 30-minute expiry text (SEC-8).
+* **Heavy reads** (SEC-2/OPS-9): at most 4 at a time (stored VM documents for `GET /api/results`, `/api/shared` and
+  polls of done jobs, and every export); a request waits up to 10 s for a slot, then `503 server_busy`,
+  `Retry-After: 5`.
 * Per-IP limits are shared by every user behind one address (carrier CGNAT, office NAT, or a proxy without
   `TRENDAI_TRUST_PROXY`); docs/WEB.md says so.
 
@@ -1574,7 +1719,7 @@ Axis ticks (client only, F.7.1): span ≥ 3 years → yearly ticks `2022`; 6 mon
 
 ```jsonc
 {
-  "schema": 1,
+  "schema": 2,
   "lang": "ko",
   "index": 0,
   "name": "선크림",
@@ -1621,9 +1766,10 @@ Axis ticks (client only, F.7.1): span ≥ 3 years → yearly ticks `2022`; 6 mon
     "seasonal_note": "계절성 뚜렷",
     "certainty": {"level": "high", "label": "판단 확신도 높음", "value": 0.95, "pct_text": "95%"},
     "tentative": false,
-    "reasons": [{"text": "최근 39주 동안 추세가 +13.4% 변했습니다.", "detail": null},
-                {"text": "Mann-Kendall 검정에서 전체 기간의 상승 추세가 유의합니다.", "detail": "τ = 0.41, p < 0.001"},
-                {"text": "현재 추세는 고점(2026.11.16) 수준입니다.", "detail": null}],
+    "reasons": [{"text": "최근 39주(국면 판단 구간) 동안 추세가 +13.4% 변했습니다.", "detail": null, "kind": "support"},
+                {"text": "Mann-Kendall 검정에서 전체 기간의 상승 추세가 유의합니다.", "detail": "τ = 0.41, p < 0.001",
+                 "kind": "support"},
+                {"text": "현재 추세는 고점(2026.11.16) 수준입니다.", "detail": null, "kind": "support"}],
     "rules_url": "/method#phase"
   },
   "tiles": [
@@ -1709,7 +1855,7 @@ Axis ticks (client only, F.7.1): span ≥ 3 years → yearly ticks `2022`; 6 mon
     "ai_allowed": false,
     "ai_block_reason": "naver_terms",
     "ai_block_text": "네이버 데이터는 이용약관에 따라 AI로 보내지 않아요.",
-    "ai_privacy_note": "계산된 요약 수치(JSON)만 Anthropic으로 보내요. 원본 데이터는 보내지 않아요."
+    "ai_privacy_note": "‘AI로 다시 쓰기’를 누르면 계산된 수치와 함께 시계열 값 일부(최대 60개, 짧은 데이터는 전부)와 이름을 Anthropic으로 보내요. 파일 자체는 보내지 않아요."
   },
   "caveats": {
     "markdown": "- 예측 구간은 먼 미래일수록 넓어집니다.\n- …",
@@ -1782,7 +1928,8 @@ Axis ticks (client only, F.7.1): span ≥ 3 years → yearly ticks `2022`; 6 mon
   (`test_outlook_line_rules`): direction up, P = 0.812 → `▲ 상승 쪽이 우세 (상승 확률 약 80%)`; direction down,
   P = 0.2 → `▼ 하락 쪽이 우세 (상승 확률 약 20%)` / `▼ Fall more likely (chance of rise about 20%)`; direction down,
   P = 0.02 → `▼ 하락 가능성 매우 높음 (상승 확률 5% 이하)` / `▼ Fall very likely (chance of rise 5% or less)`;
-  direction flat (보합), P = 0.5 → `▶ 보합 · 상승·하락 엇비슷 (상승 확률 약 50%)`.
+  direction flat (보합), P = 0.5 → `▶ 보합 · 상승·하락 엇비슷 (상승 확률 약 50%)`. In English the word after the arrow
+  is capitalised (`▶ Flat · About even (chance of rise about 50%)`; CON-14).
 * `basis`: `(fut_b, cur_b) = report._change_basis(report, report._ChartData(report))` (en `_change_basis_en`) →
   `"{fut_b}, {cur_b} 대비"` / `"{fut_b}, vs. {cur_b}"`.
 * `sentence` (해요체):
@@ -1793,8 +1940,16 @@ Axis ticks (client only, F.7.1): span ≥ 3 years → yearly ticks `2022`; 6 mon
   * `word` = 방향 불확실: ko `"{fut_b}이 {cur_b}보다 {pct_abs} {높을|낮을} 수 있지만, 불확실성에 비해 변화가 작아 방향을
     단정하기 어려워요."`, en `"The {fut_b} may be {pct_abs} {higher|lower} than the {cur_b}, but the change is small
     relative to the uncertainty, so the direction is unclear."`;
-  * change undefined: `nc = report._change_undefined(report, d, lang)`; `sentence = nc.sentence` + `" ({nc.levels})"`
-    when `nc.levels`; `change_undefined = {"code": nc.code, "reason": nc.short, "levels": nc.levels}`.
+  * change undefined: `nc = report._change_undefined(report, d, lang)`; `sentence = nc.sentence` (converted to 해요체
+    for ko: `…계산하지 않았어요.`, `…비교해요.`; CON-14) + `" ({nc.levels})"` when `nc.levels`;
+    `change_undefined = {"code": nc.code, "reason": nc.short, "levels": nc.levels}`.
+  * **Seasonal context** (FU-3): when the outlook compares seasonally adjusted averages (`report._outlook_windows`
+    `adj_fut`/`adj_cur`: the forecast window covers only part of a season) and the raw forecast window mean moves
+    against the call — an up call over a falling raw path → `low`; a down call over a rising one → `high`; a flat or
+    uncertain call with a raw move of 10 % or more → by its sign — a second 해요체 sentence is appended
+    (`texts.SEASON_TEXTS.context_low/high`): `다만 앞으로 26주는 계절적으로 낮은 시기라 예측선은 내려가요 (보통 9월
+    정점). 계절 높낮이를 빼고 보면 오르는 흐름이에요.` / `That said, the next 26 weeks are a seasonal low, so the
+    forecast line falls (usually peaks in Sep); with the seasonal swing removed, the trend is rising.`
 * `reliability`: `Outlook.confidence` → `예측 신뢰도 높음/보통/낮음` / `Forecast reliability: high/medium/low`.
 * `accuracy_line` from `ForecastResult.skill` / `backtest_mase` (the narrative's thresholds):
   `skill ≤ 0.95` → `과거 데이터 검증: 단순 예측보다 오차 약 {(1−skill)·100:.0f}% 작음` (`99% 이상` beyond 99.5) /
@@ -1803,9 +1958,12 @@ Axis ticks (client only, F.7.1): span ≥ 3 years → yearly ticks `2022`; 6 mon
   보이지 못함` / `Backtest: did not beat a naive forecast`; skill null, MASE present → `과거 데이터 검증: 단순 예측과 비교한
   결과 없음` / `Backtest: no comparison with a naive forecast`; both null → `데이터가 짧아 정확도를 검증하지 못했어요` /
   `Too short to check accuracy`.
-* `reference_note`: `display == "bands_only"` → `예측력이 낮아 범위만 참고용으로 보여 드려요.` / `The forecast did not beat
-  a naive one, so only the range is shown, for reference.`; `"weak"` → `예측 신뢰도가 낮아 중앙선은 참고용이에요.` /
-  `Low reliability: treat the centre line as a rough guide.`; else `null`.
+* `reference_note`: `display == "bands_only"` → `단순 예측보다 낫지 않아 범위만 참고용으로 보여 드려요.` / `The forecast
+  did not beat a naive one, so only the range is shown, for reference.` (true even when skill is exactly 1.0; CON-5);
+  `"weak"` because of low reliability → `예측 신뢰도가 낮아 중앙선은 참고용이에요.` / `Low reliability: treat the centre
+  line as a rough guide.`; `"weak"` because skill is null while reliability is not low (`weak_unverified`) →
+  `정확도를 검증하지 못해 중앙선은 참고용이에요.` / `Accuracy could not be checked, so treat the centre line as a rough
+  guide.`; else `null`.
 
 #### D.2.4 Tiles (always exactly 6, in this order)
 
@@ -1818,7 +1976,7 @@ has `value: "—"` and `undefined_reason` (a phrase); `sub` keeps the basis. **W
 |---|---|---|---|---|---|
 | 1 | `phase` | 현재 국면 / Current phase | `phase.name` (+ `(잠정)`/` (tentative)`) | `phase.certainty.label` | — |
 | 2 | `recent_change` | 최근 변화 / Recent change | `pct_arrow(metrics.recent_change_pct)`, tone by sign | `추세 기준 · {basis}` where basis = `전년 동기 대비` (M, Q, W with lag 52), `전년 대비` (Y), `7일 전 대비` (D), or `{lag}{unit} 전 대비` when the lag is shorter than a season (lag rule of `report._recent_lag`); en `trend · YoY` / `vs. {lag} {units} ago` | `report._pct_why(code, "recent_change_pct", lang)` with `code = metric_pct_undefined(analysis).get("recent_change_pct")` |
-| 3 | `momentum` | 모멘텀 / Momentum | word (below) | `pp(metrics.momentum)` + `/주`, `/월`, `/일`, `/분기`, `/년` (en `/wk`, `/mo`, `/day`, `/qtr`, `/yr`) | `report._rate_why(report, narrative.momentum_pct_undefined(analysis), lang)` |
+| 3 | `momentum` | 모멘텀 / Momentum | word (below) | `pp(metrics.momentum)` + `/주`, `/월`, `/일`, `/분기`, `/년` (en `/wk`, `/mo`, `/day`, `/qtr`, `/yr`); `pp(0)` when \|momentum\| < 0.005 %p, so float noise never prints as `×10⁻¹⁵` (UX-5) | `report._rate_why(report, narrative.momentum_pct_undefined(analysis), lang)` |
 | 4 | `expected_change` | 예측 변화 / Expected change | `pct_arrow(expected_change_pct)`; for 보합/방향 불확실: `pct(…)` with tone neutral | `hero.basis`; for 방향 불확실 prefix `방향 불확실 · ` / `direction uncertain · ` | `hero.change_undefined.reason` |
 | 5 | `prob_increase` | 상승 가능성 / Chance of rise | `prob_text` | `{likelihood} · 예측 변화와 같은 기준` / `{likelihood} · same basis as expected change` | `prob_undefined_reason` |
 | 6 | `peak_season` *or* `volatility` | 피크 시즌 / Peak season · 변동성 / Volatility | see below | see below | volatility: `report._rate_why(report, narrative.volatility_undefined(analysis), lang)` |
@@ -1844,8 +2002,12 @@ when start == peak; for D: `요일 패턴 · 가장 낮은 날 {trough}`), en `U
 Otherwise tile 6 is **volatility**: `metrics.volatility` (CV) → value `낮음` (< 0.05) / `보통` (< 0.15) / `높음`
 (en `Low`/`Medium`/`High`), sub `잔차 변동 {cv·100:.1f}%` / `residual CV {…}%`.
 
-Tooltips (server texts, `texts.TILE_HELP`, G.14) are fixed strings per key and language; the prob tile appends
-`정확한 값: {prob_exact}` / `Exact value: {prob_exact}`.
+Tooltips (server texts, `texts.TILE_HELP`, G.14) are strings per key and language; the prob tile appends
+`정확한 값: {prob_exact}` / `Exact value: {prob_exact}`. `expected_change` reads `예측 기간의 평균(예측이 한 주기보다 길면
+마지막 한 주기)을 최근 한 주기의 평균과 비교한 값이에요. 특정 시점 한 값의 변화가 아니에요.` When the outlook is
+seasonally adjusted, tile 4's tooltip appends `SEASON_TEXTS.adjust_note` (`26주 구간은 계절 주기(52주)를 다 채우지 못해, 그
+구간의 평균적인 계절 높낮이를 빼고 비교했어요.`) and tile 5's appends `이번에는 계절 높낮이를 뺀 평균끼리 비교했어요.` /
+`Here the averages are compared with the seasonal swing removed.` (FU-3).
 
 #### D.2.5 Phase
 
@@ -1856,12 +2018,18 @@ Tooltips (server texts, `texts.TILE_HELP`, G.14) are fixed strings per key and l
   `≥ 0.5` → `medium`, else `low`; label `판단 확신도 높음/보통/낮음` / `Phase certainty: high/medium/low`;
   `pct_text` = `format_prob(confidence)` — shown **only inside the `help.certainty` popover**, never as visible text
   next to `상승 가능성 약 80%` or `예측 신뢰도` (three percent-like numbers side by side were the R4 naming collision).
-* `reasons`: a list of `{text, detail}` built from ko = `phase.reasons`, en = `[translate_reason(r) for r in reasons
+* `reasons`: a list of `{text, detail, kind}` built from ko = `phase.reasons`, en = `[translate_reason(r) for r in reasons
   if translate_reason(r)]` (untranslated reasons dropped, as in the English narrative; if none remain:
   `[{"text": "See the method page for the rules.", "detail": null}]`). For each reason: ISO dates are rewritten to
   `date_short(…, freq, lang)` (same regexes as D.2.9), and a trailing parenthetical holding test statistics
   (regex `\s*\(([^()]*(?:τ|p\s*[<=>]|t\s*=|MK|Mann)[^()]*)\)\.?$`, the final full stop kept on `text`) is moved to
-  `detail` (shown under a `자세히` toggle); otherwise `detail` is `null`. The wording itself is the engine's (S1, A.2).
+  `detail` (shown under a `자세히` toggle); otherwise `detail` is `null`. The wording itself is the engine's (S1, A.2),
+  except that the `최근 N 동안 추세가 …` reason names its window: `최근 39주(국면 판단 구간) 동안 추세가 …` / `Over the
+  last 39 weeks (the phase-judgement window) the trend …` (FU-7).
+  `kind` (UX-7; required by `vm.schema.json`, `WEB_VM_SCHEMA` 2): `"caveat"` for a reason that weakens the call (the
+  random-walk sentence, detected on the Korean original so the English translation inherits it), else `"support"`.
+  Caveats are listed after the supporting reasons; the SPA shows them with an ⓘ icon in `--ink-2` labelled `주의` /
+  `Caveat` instead of the ✓ (`ui.reasonIcon`, phasewhy.js and the hero's 왜? list).
 
 #### D.2.6 Chart
 
@@ -1883,7 +2051,9 @@ Tooltips (server texts, `texts.TILE_HELP`, G.14) are fixed strings per key and l
   `small` (`작은 전환`/`minor shift`); `on_chart` = among the 5 largest magnitudes.
 * `anomalies`: `direction` = sign of `zscore`; `text` ko `평소보다 크게 {높음|낮음} · 실제 {v} / 예상 {e}`, en `Far
   {above|below} the usual range · actual {v} / expected {e}` (values `value_text(…, kind, compact=False)`;
-  intermittent: `예상` → `평소 규모` / `usual size`).
+  intermittent: `예상` → `평소 규모` / `usual size`). When the printed values are equal or differ by less than 2 % of
+  max(\|v\|, \|e\|), the text says `평소보다 약간 {높음|낮음}` / `Slightly {above|below} the usual range` (UX-23).
+* `title`, `desc`, legend and read-out names use the display name of E.6.1 (sample titles).
 * `desc` (for `<desc>`): `"{name} {freq_adj} {value word}, {start_year}–{end_year}. {peak sentence}. {fut_b} {pct} 예상."`
   (en analogous); `title` = `"{name} — 추이와 예측"` / `"{name} — history and forecast"`.
 
@@ -1910,9 +2080,13 @@ high in Jul and low in Dec.`). The changepoint and anomaly lists are `chart.chan
   (기준 대비 {pct_text})` / `{label} {value_text} ({pct_text} vs. reference)`, or `{label} {value_text}` without a
   percentage.
 * `table.rows`: every forecast step: `mean` = `value_text(…, compact=False)`, `range80` = `"{lo}~{hi}"` (en
-  `"{lo}–{hi}"`), `range95` likewise; bounds at the floor of a nonnegative forecast print `0`.
+  `"{lo}–{hi}"`), `range95` likewise; bounds at the floor of a nonnegative forecast print `0`. For raw value kinds
+  the table uses `compact()` (`4.2조`, `254만`; en K/M/B) when its largest value is ≥ 1e6, matching the scenario
+  boxes (CON-13). When `chart.display == "bands_only"` every `mean` is `—` (the centre value is withheld, as on the
+  chart) and `scenarios.note` adds ` 단순 예측보다 낫지 않아 가운데 값(기준)은 참고용이에요.` (CON-4); the SPA then leaves
+  the 예측값 column out of the table.
 * `accuracy.details` = the narrative's technical MASE note in 해요체 (`기술 참고: 백테스트 MASE {m:.2f} — …`), `null`
-  without MASE.
+  without MASE. (The rule narrative no longer carries this note, D.2.9; this is its one place.)
 * `method` = `narrative.describe_method(forecast, lang)`; `models` = `forecast.model_scores` with `weight > 0`,
   `name = narrative.model_label(id, lang)`, `weight_text = pct-free "36%"`.
 * `phase` from `Outlook.future_phase` + `narrative.future_phase_status(analysis, outlook)`: `undecided` → hedge
@@ -1937,10 +2111,23 @@ high in Jul and low in Dec.`). The changepoint and anomaly lists are `chart.chan
   starting with that `YYYY-MM`; Q the quarter's start date; Y never linked. Strings without a matching chart date are
   rewritten but not linked. md.js links exact occurrences of the `date_links` keys (F.6.14), so the client needs no
   per-frequency date logic.
+* **Rule narrative wording** (UX-13, CON-9; AI texts untouched): `viewmodel._tidy_rule_narrative` post-processes the
+  rule-based text so it uses the cards' terms. The phase certainty becomes the tile's word (`(판단 확신도 높음)` /
+  `(phase certainty: high)`; tentative calls drop the number); `(기술 참고: 백테스트 MASE …)`, `(모델 ID: …)` /
+  `(model ids: …)`, the τ / p test-statistic parentheticals and `(잔차의 변동계수)` are removed (they stay in
+  `future.accuracy.details`, `future.models` and `phase.reasons[].detail`); English `Probability of increase` →
+  `Chance of rise`, `forecast confidence` → `forecast reliability`. For weekly data the analysed span ends on the
+  last week's Sunday, as in the source line (`2023.11.27부터 2026.11.22까지`; CON-7). The headline names the series
+  by its display name (E.6.1).
 * `badge`: `규칙 기반 해석` / `Rule-based`; AI: `AI 해석 · Claude` / `AI · Claude`.
 * `ai`: stored AI narrative for this language or `null` (`{markdown, caveats_markdown, badge, model, note, created_at}`).
 * `ai_allowed` = not Naver and `features.ai` and not a share; `ai_block_reason` ∈ `naver_terms` | `ai_unavailable` |
   `shared_readonly` | `null`; `ai_block_text` = text of `ai_naver_blocked` / `ai_unavailable` / `ai_readonly`.
+  `ai_privacy_note` (SEC-4): `‘AI로 다시 쓰기’를 누르면 계산된 수치와 함께 시계열 값 일부(최대 60개, 짧은 데이터는 전부)와
+  이름을 Anthropic으로 보내요. 파일 자체는 보내지 않아요.` / `‘Rewrite with AI’ sends Anthropic the computed figures plus
+  up to 60 values of the series (all of them for short series) and its name — never the file itself.` (pinned to
+  `narrative.build_llm_payload` by `test_ai_privacy_note_matches_payload`). The SPA keeps the AI button disabled
+  until the result envelope (with its `result_id`) has been rendered.
 * `caveats.disclaimer` fixed (G.6 `detail.disclaimer`).
 
 #### D.2.10 Summary line, exports, notices
@@ -1949,17 +2136,20 @@ high in Jul and low in Dec.`). The changepoint and anomaly lists are `chart.chan
   {prob_text})` + ` · 보통 {peak} 정점` when seasonal; undefined change → `{word} 전망`; en `[trendai] {name} ({short},
   {freq_en}): {phase} · {fut_b} {pct} expected (chance of rise {prob_text}) · usually peaks in {peak}`. Then, when
   `chart.display == "bands_only"`: ` (참고용: 단순 예측보다 낫지 않음)` / ` (for reference: did not beat a naive
-  forecast)`; when `"weak"`: ` (참고용 예측)` / ` (forecast for reference only)`. Then always
-  ` (데이터 기준 {as_of_label})` / ` (data as of {as_of_label})`. Samples always say `샘플·가상 데이터` through
-  `source.short`. The client appends ` — {URL}` (public sources, with the absolute range of F.6.12) or
+  forecast)`; when `"weak"`: ` (참고용 예측)` / ` (forecast for reference only)`. Before that reference suffix, a
+  seasonally adjusted outlook whose raw forecast moves against the call (D.2.3) adds ` · 앞으로 계절적 비수기` /
+  ` · 앞으로 계절적 성수기` (` · seasonal low ahead` / ` · seasonal high ahead`). Then the as-of suffix by source
+  kind (CON-8): naver/wiki ` (데이터 기준 {as_of_label})` / ` (data as of {as_of_label})`; upload and
+  google_trends_upload ` (분석 {as_of_label})` / ` (analysed {as_of_label})`; samples none (matching `source.line`).
+  Samples always say `샘플·가상 데이터` through `source.short`. The client appends ` — {URL}` (public sources, with the absolute range of F.6.12) or
   ` — {share URL}` when one exists.
 * `exports`: per-series links (C.10); `null` when unavailable with the reason in `unavailable[fmt] = {code, text}`
   (`html` for Naver → `export_naver_raw`; `xlsx` without openpyxl → `export_xlsx_unavailable`). Stored as
   availability flags; the URLs (`/api/export/<id>/<k>.<fmt>` or `/api/export/s/<share_id>/<k>.<fmt>`) are built for
   each response (E.7).
 * `notices`: series-level notices (C.12.5) — data-layer notices captured while preparing this series,
-  `data_short` (n < 8), `naver_low_resolution`, `mostly_zero_volume` (≥ 50 % zeros in a Naver/Wiki series),
-  `naver_missing_filled` (its own count).
+  `gaps_filled` (FU-5), `data_short` (n < 8), `naver_low_resolution`, `mostly_zero_volume` (≥ 50 % zeros in a
+  Naver/Wiki series), `naver_missing_filled` (its own count), `horizon_clamped`, `horizon_long`.
 
 ### D.3 Result envelope
 
@@ -2012,7 +2202,9 @@ C.7 is the envelope; `series` holds D.2 VMs, `compare` the D.4 VM, `exports` D.5
 report's `name`, which `rank_trends` uses for its `name` column; WP1 maps every ranking row back to the series index
 through a `{display name: index}` dict built at the same time, never by position or by re-parsing names. Row texts
 come from the series VM (same rules as the tiles: `expected_change.text = pct(...)`, `recent_change.text = pct(...)`;
-`outlook.line` per D.2.3, with the number always labelled). `score.text` = one decimal.
+`outlook.line` per D.2.3, with the number always labelled). `score.text` = one decimal. `expected_change.basis` =
+`hero.basis` plus the seasonal short suffix of D.2.10 when present (` · 앞으로 계절적 비수기/성수기`; FU-3). The compare VM
+of an English result is built from the English display names (E.6.1).
 `sort.level` = last actual value (`metrics.last_value`). `spark.history` = the last `min(len, 2·season_length, 104)`
 actual values; `spark.forecast` = the forecast mean (≤ 52 values), **empty** when `display == "bands_only"` (the
 weak-forecast rule; `display` = the series' `chart.display`). Up to 20 rows (uploads); search compare ≤ 5.
@@ -2114,7 +2306,9 @@ as flags; URLs built per response (E.7).
 | `TRENDAI_SHUTDOWN_GRACE` | `shutdown_grace_s` | `30` | |
 
 Booleans accept `1/true/yes/on` and `0/false/no/off` (case-insensitive). Invalid values raise `ValueError` naming
-the variable at start-up. `WebConfig` is frozen; `repr()` contains no secrets because it holds none.
+the variable at start-up, and so do values above the upper bounds (OPS-13): `result_ttl_h ≤ 8760`,
+`share_ttl_d ≤ 3650`, `job_timeout_s ≤ 86400`, `shutdown_grace_s ≤ 3600`. `WebConfig` is frozen; `repr()` contains
+no secrets because it holds none.
 
 ### E.2 App factory
 
@@ -2197,7 +2391,8 @@ class Job:
     compare: dict | None                    # {'ko': ..., 'en': ...}
     error: WebError | None
     cancel_requested: bool = False
-    subscribers: int = 1                    # creator + C.5 joins − DELETEs; cancel only at 0 (C.6)
+    subscriber_keys: dict[str, int]         # per client key: creator 1 + its C.5 joins − its DELETEs; cancel at 0 (C.6)
+    client_key: str                         # the creator, for the per-client cap (C.5)
     cache_key: str | None = None            # result-cache key (None for uploads and narrative jobs)
     lock: threading.Lock
 ```
@@ -2211,9 +2406,17 @@ class Job:
   `JobTimeout` past `job_timeout_s`), `set_stage(stage, current=None)`, `set_step(step)` (maps the `on_stage` names to
   `current.step` per C.6 and sets it under the job lock) and `add_series(...)`. `check()` is called at every stage
   boundary, including from the `on_stage` callback passed to `pipeline.run`.
-* GET snapshots are taken under the job lock and filtered by `since`/`hl`.
-* Terminal jobs stay in memory 10 minutes, then are dropped (the result stays on disk).
-* `close()`: no new submissions (`server_busy`, `Retry-After: 30`), queued jobs → `cancelled`, wait for running ones.
+* `JobManager` also enforces the per-client cap (`PER_CLIENT_ACTIVE = {"analyze": 3, "narrative": 2}` queued/running
+  jobs per client key, joins free; `429 rate_limited`, `retry_after` 10) and `check_capacity()` (used before tokens
+  are spent, OPS-10), both under the manager lock. `unsubscribe(job_id, client_key)` withdraws one subscription of
+  that client only (SEC-9).
+* GET snapshots are taken under the job lock and filtered by `since`/`hl`; they reference the VMs instead of
+  deep-copying them, and JSON encoding happens outside the lock (OPS-9).
+* Terminal jobs drop their VMs (`job.vms`); a poll of a done job reads the series it still needs (`index ≥ since`)
+  from the stored `vm-<hl>.json` (C.6). Terminal jobs stay in memory 10 minutes, then are dropped (the result stays on
+  disk).
+* `close()`: no new submissions (`server_busy`, `Retry-After: 30`), queued jobs → `failed` with `server_busy`
+  (`retry_after` 30; OPS-1), wait for running ones.
 
 ### E.6 The analyze job (`analyze.py`)
 
@@ -2240,10 +2443,11 @@ class Job:
      name=display)` (`prepare` returns a `(series, freq)` tuple); then **`prepared.attrs.update(raw.attrs)`** so that
      `samples.SYNTHETIC_ATTR` (and the Naver/GT source attrs) survive — `prepare` returns a series with empty
      `attrs`, and `pipeline.run` marks a sample as synthetic only when the series it receives carries the attr.
-     `notes` → series notices (`render_web_msg`, both languages). `DataError` → series failure (C.12.4).
-   * Extra series notices: `data_short` (n < 8), `mostly_zero_volume` (Naver/Wiki, ≥ 50 % zeros),
-     `naver_missing_filled` (`filled > 0`), `naver_low_resolution` (multi-series Naver, `max < 5`),
-     `horizon_long` when `h > 5·n` (created here with `render_web`).
+     `notes` → series notices (`render_web_msg`, both languages). `DataError` → series failure (C.12.4). Uploads
+     then check the work budget (C.5) against the prepared length.
+   * Extra series notices: `gaps_filled` (FU-5, C.12.5), `data_short` (n < 8), `mostly_zero_volume` (Naver/Wiki,
+     ≥ 50 % zeros), `naver_missing_filled` (`filled > 0`), `naver_low_resolution` (multi-series Naver, `max < 5`),
+     `horizon_long` when `h > 5·n` (created here with `render_web`, params incl. `freq`).
 3. **Stage `series`**, for each prepared series in index order: `ctx.check()`;
    `with data.collect_notices(): report = pipeline.run(prepared, name=display, freq=f, horizon=h, lang="ko",
    on_stage=lambda st: (ctx.check(), ctx.set_step(st)))` — the collected list is **discarded by code**: everything
@@ -2253,19 +2457,34 @@ class Job:
    JSON exports ko/en (`report_to_dict` + `source` block, Naver stripping C.10); LLM payload (non-Naver)
    `narrative.build_llm_payload(a, f, o)`; HTML (non-Naver) `report.render_html(report)` + the source paragraph
    (C.10). Any exception → `failed` entry (`DataError` → C.12.4, else `series_failed_web` + an exception log line per
-   E.11). `series_done += 1` after each series (failed or not).
+   E.11). `series_done += 1` after each series (failed or not). The LLM payload is encoded to bytes when its series
+   finishes (OPS-2).
 4. **Stage `finish`**: if every series failed → job `failed` with the first series' error (or `data_too_short`).
    If 2+ were requested: `compare.rank_trends({display name: report})` with the `{display name: index}` map (D.4.1),
    slots (D.4.2), compare VMs ko/en (incl. `source_line`), and (non-Naver, 2+ succeeded)
-   `report.render_compare_html(list(reports.values()), ranking)` + source paragraph. Write the result (E.7), register
-   the result-cache key (non-upload), drop the `TrendReport` objects, status `done`.
-5. `JobCancelled` → status `cancelled`, nothing written; `JobTimeout` → `failed` with `job_timeout`.
+   `report.render_compare_html(list(reports.values()), ranking)` + source paragraph. Write the result (E.7; each file
+   is encoded as it is built and the per-series export objects are freed language by language, OPS-2), register
+   the result-cache key (non-upload) **unless a series failed with a transient code** (`wiki_rate`, `naver_rate`,
+   `naver_server`, `source_timeout`, `source_unreachable`, `source_bad_response`, `series_failed_web`,
+   `job_timeout`, `internal_error`: a retry must really re-run, OPS-4), drop the `TrendReport` objects, status
+   `done`. `ENOSPC`/`EDQUOT` while writing → `failed` with `503 store_full` (OPS-6).
+5. `JobCancelled` → status `cancelled`, nothing written; `JobTimeout` → `failed` with `job_timeout`. When the time
+   limit passes after at least one series finished, the remaining series fail with `job_timeout` and stage `finish`
+   still stores the finished ones (`JobContext.allow_overrun`); `finish` itself is never failed by the time limit
+   (OPS-5).
 
 **E.6.1 Display names** (unique within a request): base name = `terms[0]`, or `" + ".join(terms)` when another series
 of the request has the same first term; uploads use the column (or wide-row) name (already unique, B.3.1); samples
-the sample name. Then, in request order, a base name already taken by an earlier series becomes `"{base} ({n})"` with
-the smallest `n ≥ 2` that is free (e.g. a literal term `a + b` next to `a`+`b` → `a + b`, `a + b (2)`). The display
-name is the VM `name`, the `pipeline.run` name, the `rank_trends` key and the export names; it never goes to Naver.
+the **sample title of G.13 in the VM language** (UX-1/FU-6/CON-2/A11Y-8: ko `texts.SAMPLE_TITLES` `성장형`, en
+`texts.SAMPLE_TITLES_EN` `Growing` — exactly the `/api/samples` titles, without a `(sample)` suffix). Then, in request
+order, a base name already taken by an earlier series becomes `"{base} ({n})"` with the smallest `n ≥ 2` that is free
+(e.g. a literal term `a + b` next to `a`+`b` → `a + b`, `a + b (2)`). The (Korean) display name is the VM `name`, the
+`pipeline.run` name (so the narrative headline, the `rank_trends` key and the frozen HTML report use it) and the export
+names; the English VM, the English JSON export and the English compare VM are built from a renamed shallow copy of
+the report (`analyze._renamed`) carrying the English name. It never goes to Naver. The sample **id** (`growing`)
+stays only in `terms`, the `query` echo, the URL `q` and the result-cache key; the SPA maps ids to titles from
+`/api/samples` for the query-bar chips, the pre-result heading/title and the recent list. `current.name` of C.6
+follows `hl`.
 
 ### E.7 Store (`store.py`)
 
@@ -2304,25 +2523,41 @@ $TRENDAI_DATA_DIR/                        mode 0700, files 0600
   each response. A share snapshot therefore never carries the `result_id`.
 * **Nothing derived from an upload is written before the job finishes**, and raw upload bytes are never written by
   the app.
+* Reads treat wrong-shaped stored documents (a non-dict `result`, a VM document without `series`, …) as absent
+  (`404`, never `500`; OPS-16).
+* **Shares hard-link** the result's files (`Store.save_dir(links=)`, `share_sources`; copied only when linking fails),
+  so a second share of one result adds only `share.json` (OPS-3). **Share quota**: shares may use at most 50 % of
+  `store_max_mb`; above it, or with under 50 MB free, `POST /api/share` answers `503 store_full` (C.8); a WARNING is
+  logged while shares exceed their quota.
+* **Free space** (OPS-6): `Store.writable` also requires ≥ 50 MB free (`statvfs`), so health reports `degraded`;
+  `post_analyze` and `post_share` refuse with `503 store_full` below it; `ENOSPC`/`EDQUOT` in jobs and requests
+  become `503 store_full` (`Retry-After: 300`) instead of `500 internal_error`, and `log_exception` appends the
+  errno name (`exc=OSError(ENOSPC)`).
 * Sweeper: deletes expired results/shares/cache entries and unreadable files older than 1 h; budget files older than
-  400 days; when the store exceeds `store_max_mb`, deletes the oldest result dirs until under 90 % (shares and
-  budget files are never size-evicted).
+  400 days; when results + cache exceed `store_max_mb − min(shares, 50 % of store_max_mb)` (each inode counted once,
+  so hard-linked shares are not counted twice), deletes the oldest result dirs until under 90 % of that allowance.
+  Shares beyond their quota therefore can no longer make the sweeper delete every result (OPS-3). Shares and budget
+  files are never size-evicted.
 
 ### E.8 Rate limiter (`ratelimit.py`)
 
 Token bucket per `(bucket, client_key)`: `tokens = min(burst, tokens + elapsed × refill/3600)`; a request needs 1
 token; refusal → `retry_after = ceil((1 − tokens) × 3600 / refill)`. `client_key` = `REMOTE_ADDR`, or with
 `trust_proxy` the last `X-Forwarded-For` entry; IPv6 addresses are keyed by their /64; the `poll` bucket key is
-`(client_key, job_id)` (C.13). One lock per limiter; at most
-50,000 keys (the least recently used dropped); the sweeper drops buckets idle > 1 h. The clock is the app clock.
-The `naver` bucket refill switches to 5/h while `budget_state != "ok"`.
+`(client_key, job_id)` (C.13) and is created only for jobs in memory (polls of other ids take a `read` token,
+SEC-7). One lock per limiter; one LRU table **per bucket name** with at most 50,000 keys each (the least recently
+used dropped), so keys of one bucket never evict another's; the sweeper drops buckets idle > 1 h. The clock is the
+app clock. The `naver` bucket refill switches to 5/h while `budget_state != "ok"`. `give_back(bucket, key)` returns
+a token taken by a request that was then refused for capacity (C.5, OPS-10).
 
 ### E.9 Naver budget (`budget.py`)
 
 `NaverBudget(store, clock, limit)`: `state() -> (count, limit, "ok"|"low"|"blocked")`; `reserve()` under a process
 lock: reload the current KST month file, raise `WebError(naver_budget_exhausted)` when `count ≥ 0.9 × limit`, else
 `count += 1` and write atomically **before** the HTTP call (failed calls count). A new month starts at 0.
-`AiBudget` is the same per KST day against `ai_daily_limit` (no 90 % rule: blocks at 100 %).
+`AiBudget` is the same per KST day against `ai_daily_limit` (no 90 % rule: blocks at 100 %). Both **fail closed**
+(OPS-16): an existing but unreadable file, one with another period label, or a non-numeric count counts as the
+limit, with one WARNING per file.
 
 ### E.10 Cache keys and TTLs
 
@@ -2330,7 +2565,8 @@ lock: reload the current KST month file, raise `WebError(naver_budget_exhausted)
 |---|---|---|
 | Naver data | `connectors.naver_cache_key(groups, start, end, unit, dev, gender, ages)` | 24 h when `end` equals `period_bounds(...)[1]` for today (the usual case), else `naver_cache_days` (≤ 21 d) |
 | Wikipedia data | sha256 of canonical JSON `{"title", "lang", "granularity", "start", "end"}` | monthly 24 h; daily/weekly 6 h |
-| Result | sha256 of canonical JSON `{"engine", "vm_schema", "source", "series": [[terms]…], "start", "end", "unit", "h", "dev", "gender", "ages", "wl"}` (`vm_schema` = `WEB_VM_SCHEMA`, so a VM-builder change never serves stale cached VMs even while `trendai.__version__` stays `0.1.0`) | until `min(result expires_at, data cache entry expires_at)`; never for uploads. Also the key of the in-flight index (C.5). |
+| Result | sha256 of canonical JSON `{"engine", "vm_schema", "source", "series": [[terms]…], "start", "end", "unit", "h", "dev", "gender", "ages", "wl"}` (`vm_schema` = `WEB_VM_SCHEMA`, so a VM-builder change never serves stale cached VMs even while `trendai.__version__` stays `0.1.0`) | until `min(result expires_at, data cache entry expires_at)`; never for uploads, and never for a result with a series that failed for a transient code (E.6 step 4, OPS-4). Also the key of the in-flight index (C.5). |
+| Upload in-flight | sha256 of `{upload_id, date_col, value_cols, freq, h, unit_label}` | in-flight index only (joins, C.5); never a result cache |
 
 Canonical JSON = `json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`, dates as ISO strings.
 
@@ -2342,6 +2578,9 @@ Canonical JSON = `json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_
   the router pattern name (`/api/results/{id}`), never the raw path or query string. `ip` = first 12 hex of
   `sha256(daily_salt + client_key)`, the salt random per process and rotated per KST day.
 * Job line: `job=<id[:6]>… kind=analyze source=naver series=3 naver=fresh|cache|- status=done ms=2810 error=-`.
+  Job exception lines carry `rid=<job.request_id>` and the mapped code; series failure lines read
+  `job=<id6>… series=k failed rid=…`; AI failures carry the job id and rid (OPS-15).
+* The method in access and exception lines is written only when it matches `^[A-Z]{1,16}$`, else `OTHER` (SEC-13).
 * Never logged: API keys or any header value, request/response bodies, query strings, search terms, upload
   filenames or content, full ids or tokens. Connector failures log `code` and `log_detail` only.
 * Tracebacks of unexpected errors are logged with the request id (no local variables). **Exception messages are not
@@ -2365,6 +2604,8 @@ Cross-Origin-Resource-Policy: same-origin
 
 plus `Strict-Transport-Security: max-age=31536000` when `hsts`. HTML exports replace the CSP with the sandboxed one
 of C.10. No inline scripts or styles exist in the app (F.1 rules), so no `unsafe-inline` is ever needed.
+`trendai serve` answers with `Server: trendai` (`server.SERVER_SOFTWARE`, also on the request-line errors written by
+`http.server` itself), never the `WSGIServer/0.2 CPython/3.x` banner (SEC-14).
 
 ### E.13 Threading model
 
@@ -2402,22 +2643,27 @@ of C.10. No inline scripts or styles exist in the app (F.1 rules), so no `unsafe
 
 `serve_forever` installs SIGINT/SIGTERM handlers. First signal, in this order:
 1. `draining = true`: health answers `503` with `status: "draining"`, new analyze/narrative/upload requests →
-   `503 server_busy` with `Retry-After: 30`; queued jobs are cancelled; **the listener keeps serving** (polls, result
-   GETs, exports) so running jobs can still be watched and fetched.
-2. A helper thread waits until no job is running or `shutdown_grace_s` has passed (polling every 0.2 s), then calls
-   `app.close(timeout=0)` (stops the sweeper; running jobs, if any, are abandoned and logged at WARNING) and
-   `server.shutdown()`.
-3. `serve_forever` returns 0; the caller flushes stdout/stderr/logging and calls `os._exit(0)`, so non-daemon executor
+   `503 server_busy` with `Retry-After: 30`; queued jobs end `failed` with `server_busy` (`retry_after` 30; OPS-1);
+   **the listener keeps serving** (polls, result GETs, exports) so running jobs can still be watched and fetched.
+2. A helper thread waits until no job is running or `shutdown_grace_s` has passed (polling every 0.2 s), keeps
+   serving up to **3 s more** after the last drained job ended (within `shutdown_grace_s`), so pollers see `done`
+   and fetch the result, then calls `app.close(timeout=0)` (stops the sweeper; running jobs, if any, are abandoned
+   and logged at WARNING) and `server.shutdown()`.
+3. `ThreadingWSGIServer` counts connections in progress; `serve_forever` waits up to 2 s for them, then returns 0;
+   the caller flushes stdout/stderr/logging and calls `os._exit(0)`, so non-daemon executor
    threads (a pandas computation, an AI call bounded by its 90 s timeout) cannot hold the process past the grace
    period or until Docker's SIGKILL.
 A second signal at any time → flush and `os._exit(1)` immediately (a normal `sys.exit` would wait for executor
-threads). The budget files are already on disk (written per call), so nothing needs flushing.
+threads). The budget files are already on disk (written per call), so nothing needs flushing. This drain belongs to
+`trendai serve` only: under the WSGI entry (gunicorn, waitress) the host server's own graceful stop applies
+(docs/WEB.md suggests `gunicorn --graceful-timeout`; B.3.2).
 
 ### E.15 Exports (`exports.py`)
 
-* CSV via `csv.writer(lineterminator="\r\n")` into a `StringIO`, encoded `utf-8-sig`. Numbers: `format(v, ".15g")`;
-  `None` → empty cell. Apostrophe formula guard (C.10) on every text cell. Source + condition comment lines from the
-  VM (series) or `compare.source_line` (whole result, `values.csv`).
+* CSV via `csv.writer(lineterminator="\r\n")` into a `StringIO`, encoded `utf-8-sig`. Numbers: actual values
+  `format(v, ".15g")`, model outputs rounded to 6 significant digits of the series scale (C.10); `None` → empty cell.
+  Apostrophe formula guard (C.10) on every text cell, and the piece-wise guard of `exports._comment` on comment lines.
+  Source + condition comment lines from the VM (series) or `compare.source_line` (whole result, `values.csv`).
 * XLSX via `openpyxl.Workbook()`; built in memory (`BytesIO`). Same data; text cells written with
   `data_type = "s"` (no apostrophe, C.10); sheet names per C.10.
 * JSON from the stored `exports.json[hl]`; HTML from the stored files; share variants read the share snapshot.
@@ -2448,18 +2694,26 @@ Both are added to the modules' `__all__`/docs; all existing tests must still pas
 
 * Multipart: Python 3.13 has no `cgi`; parse with `email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
   b"Content-Type: " + header + b"\r\n\r\n" + body)`; take the first part whose `Content-Disposition` has
-  `name="file"` and a filename; `get_payload(decode=True)` gives the bytes. Missing boundary/part → `400 bad_request`.
+  `name="file"` and a filename; `get_payload(decode=True)` gives the bytes. Missing boundary/part → `400 bad_request`;
+  more than 10 parts (boundary delimiters counted before `email.parser` runs) → `400 bad_request` (SEC-11).
 * Filename for display: last path component (split on `/` and `\`), NFC, control characters removed, ≤ 100 chars;
   the lower-cased extension selects the parser (unknown → text).
 * Concurrency: the whole parse (multipart decode → detection) runs while holding one of the 2 slots of the app's
-  `BoundedSemaphore(2)` (`acquire(blocking=False)`; none free → `503 server_busy`, `Retry-After: 5`). Peak memory is
-  therefore bounded to about two 10 MB parses (≈ 180 MB each for a dense CSV).
+  `BoundedSemaphore(2)` (`acquire(blocking=False)`; none free → `503 server_busy`, `Retry-After: 5`) and the
+  client's own parse slot (one per client key, SEC-11). Peak memory is therefore bounded to about two 10 MB parses
+  (≈ 180 MB each for a dense CSV; an `.xlsx` cell bomb now stops while streaming, SEC-1).
 * Zip guard (bytes starting `PK\x03\x04`): `zipfile.ZipFile(BytesIO(raw))`; total uncompressed size > **30 MB** or
-  > 1,000 members → `413 upload_archive_too_large`; `BadZipFile` → `422 upload_unreadable`.
-* `read_table_bytes(raw, name, max_columns=5000)`: a header wider than 5,000 fields is refused before the full
-  parse (`table_too_many_columns` → `422 upload_too_many_columns`). Then the table limits of C.4 by orientation:
-  `frame.size > 2,000,000` → `422 upload_too_large_table`; after detection, long tables > 50 columns, wide tables
-  > 200 rows or > 5,000 date columns → `422 upload_too_many_columns`.
+  > 1,000 members → `413 upload_archive_too_large`; `BadZipFile`, or a zip with neither an `xl/` part nor an ODS
+  `content.xml` (a renamed `.docx`) → `422 upload_unreadable` (UX-6).
+* Binary check (`uploads.looks_binary`, UX-6): bytes that are no Excel file (neither zip nor OLE) and are a PDF, or
+  hold NUL bytes not at every other position (UTF-16 without a BOM is text), or more than 2 % control characters
+  → `422 upload_unreadable` with the catalog text, before any text decoding.
+* `read_table_bytes(raw, name, max_columns=5000, max_cells=2_000_000)`: a header wider than 5,000 fields is refused
+  before the full parse (`table_too_many_columns` → `422 upload_too_many_columns`), and so is a table whose cell
+  count passes 2,000,000 while streaming / pre-counting (`table_too_large` → `422 upload_too_large_table`; B.3.1).
+  Then the table limits of C.4 by orientation: `frame.size > 2,000,000` or more than 200,000 rows → `422
+  upload_too_large_table`; after detection, long tables > 50 columns, wide tables > 200 rows or > 5,000 date columns
+  → `422 upload_too_many_columns`. Labels are then capped (`_cap_labels`, C.4).
 * Detection: `frame_to_series(raw.frame, prefer_decimal_comma=raw.decimal_comma)` inside `collect_notices()`; date
   columns from the first series' `attrs['trendai']['date_cols']` (all marked `date`; `detected.date_col` =
   `date_cols[0]`, C.4); excluded columns from a captured `rownum_cols_skipped` notice (`params['cols']`);
@@ -2467,8 +2721,10 @@ Both are added to the modules' `__all__`/docs; all existing tests must still pas
   on the parsed dates.
 * Preview: cells of `raw.frame.head(5)` / `.tail(5)` stringified per C.4 (`preview` bullet); `RawTable.frame` itself
   is never converted (Excel keeps native types, B.3.1).
-* Upload cache: `{upload_id: (RawTable, created_at, filename, size_bytes, est_bytes)}`, TTL 30 min, LRU-evicted
-  above 64 entries or 256 MB. The `bytes` object is not kept.
+* Upload cache: `{upload_id: UploadEntry(RawTable, created_at, filename, size_bytes, est_bytes, client_key)}`, TTL
+  30 min; above 4 entries / 96 MB per client that client's oldest are dropped first, then LRU-evicted above 64
+  entries or 256 MB; ids dropped for space are remembered (`evicted(id)`) for `410 upload_evicted` (SEC-8). The
+  `bytes` object is not kept.
 
 ### E.18 Private names WP1 may import (one source of truth with the HTML report)
 
@@ -3245,8 +3501,10 @@ Server-side export texts (WP1 `texts.py`): CSV/XLSX comment and condition labels
 `Raw Naver values (ratio) are excluded under its terms of use`, column headers per C.10, XLSX condition labels
 `출처`, `검색어 그룹/열`, `기간`, `단위`, `조건(기기·성별·연령)`, `데이터 기준`, `값의 성격` / `Source`, `Groups/columns`,
 `Period`, `Unit`, `Filters (device · gender · age)`, `Data as of`, `Value kind`; summary sheet headers `이름, 국면, 전망,
-예측 변화, 상승 확률, 예측 신뢰도, 정확도, 상승 점수` / `Name, Phase, Outlook, Expected change, Chance of rise,
-Reliability, Accuracy, Rising score`.
+예측 변화, 상승 확률, 예측 신뢰도, 정확도, 상승 점수, 예측 변화(%), 상승 확률(%)` / `Name, Phase, Outlook, Expected
+change, Chance of rise, Reliability, Accuracy, Rising score, Expected change (%), Chance of rise (%)`; ranking CSV
+column `참고용 예측` / `reference only` with `예`/`아니요` (`yes`/`no`); weekly HTML note `아래 보고서의 주별 날짜는 각
+주의 시작일(월요일)이에요`; Naver JSON `EXPORT_TEXTS.naver_narrative_excluded` (C.10).
 
 ### G.9 Progress, empty states, client-side errors
 
@@ -3297,18 +3555,22 @@ the forecast reliability. · `help.bands` = `chart.band_caption`.
    archetypes (참고용).
 3. `#bands` 예측 범위(80 %·95 %) — 10번 중 8번 / 20번 중 19번은 이 안에 들어올 것으로 보는 범위; 먼 미래일수록 넓어짐(불확실성,
    출렁임 아님); 백테스트 오차로 보정하지만 짧은 데이터·구조 변화 직후엔 실제 포함률이 낮을 수 있음.
-4. `#probability` 상승 확률 — 예측 마지막 한 주기 평균이 최근 한 주기 평균보다 높을 확률(특정 시점 한 값이 아님); 말로 된 척도
-   표(D.1.5 bins); 5 % 단위 반올림, 95 % 이상/5 % 이하 표기; 간헐 수요는 주문 발생 확률과 크기로 계산.
+4. `#probability` 상승 확률 — 예측 구간(예측 기간과 한 주기 중 짧은 쪽; 예측이 더 길면 마지막 한 주기) 평균이 최근 한 주기
+   평균보다 높을 확률(특정 시점 한 값이 아님); 구간이 한 주기를 다 채우지 못하면 계절 높낮이를 빼고 비교(계절 보정)하므로
+   비수기를 앞두면 예측선이 내려가도 상승 확률이 높을 수 있음(FU-3, D.2.3); 말로 된 척도 표(D.1.5 bins); 5 % 단위 반올림,
+   95 % 이상/5 % 이하 표기; 간헐 수요는 주문 발생 확률과 크기로 계산.
 5. `#accuracy` 정확도 — 롤링 원점 백테스트; 단순 예측 3종 중 가장 나은 것 대비 오차; 단순 예측보다 못하면 중앙선을 지우고
    범위만 '참고용'; MASE는 기술 참고값이며 1과 비교하지 않음.
-6. `#metrics` 지표 정의 — 최근 변화(추세 기준, 한 주기), 모멘텀(%p/기간), 변동성(잔차 변동계수), 예측 변화(평균 대 평균),
+6. `#metrics` 지표 정의 — 최근 변화(추세 기준, 한 주기), 모멘텀(%p/기간), 변동성(잔차 변동계수), 예측 변화(예측 구간 평균 대
+   최근 한 주기 평균, 계절 보정 규칙은 4와 같음),
    피크 시즌(계절 성분 최고 달, 계절성 강도 0.3 이상일 때), 변화율을 내지 않는 경우(기준값 0 근처·음수·0 통과·0까지 하락).
 7. `#scores` 상승 점수 — 공식 개요(전망 60 %: 예측 변화 35 % + 상승 확률 25 %, 최근 기세 40 %: 최근 변화 20 % + 모멘텀 20 %;
    연 환산; 안정기·변동성 국면은 전망만), 50 = 중립, 예상 상승률 아님.
 8. `#index` 상대 지수와 축 — 네이버 상대 지수 설명(naver_explainer), 비교 축 규칙(원래 값 / 기준 시점=100 / 로그), 이중 축을
    쓰지 않는 이유, 위키백과 조회수는 관심의 대리 지표.
 9. `#limits` 한계 — README '한계와 주의' 요약(외부 충격 미반영, 일별 데이터는 요일 주기만, 영업일 주기 없음, 짧은 데이터).
-10. `#ai` AI 해석 — 누를 때만 실행, 계산된 사실(JSON)만 Anthropic(Claude)으로 전송, 네이버 출처는 제외, AI가 쓴 글은 항상 표시.
+10. `#ai` AI 해석 — 누를 때만 실행, 계산된 사실(JSON)과 시계열 값 일부(최대 60개, 짧은 데이터는 전부)·시계열 이름을
+    Anthropic(Claude)으로 전송(올린 파일 자체는 보내지 않음, SEC-4), 네이버 출처는 제외, AI가 쓴 글은 항상 표시.
 
 ### G.11 `/sources` content
 
@@ -3327,7 +3589,9 @@ CSV만, "Data source: Google Trends (https://www.google.com/trends)", 요청마�
 2. 분석 결과: 추측할 수 없는 주소(128비트 무작위)로 24시간 보관 후 자동 삭제; 목록은 이 브라우저(localStorage)에만.
 3. 공유 링크: 만든 경우에만, 30일 보관, 만든 브라우저에서 언제든 삭제 가능; 결과 사본을 따로 보관.
 4. 로그: 요청 종류·상태·시간, 하루 단위로 바뀌는 IP 해시만; 검색어·파일 이름·파일 내용·전체 주소는 기록하지 않음.
-5. AI: 누를 때만; 계산된 요약 수치(JSON)만 Anthropic으로 전송; 원본 파일은 보내지 않음; 네이버 데이터는 보내지 않음.
+5. AI: 누를 때만; 계산된 수치(JSON)와 함께 시계열 값 일부(최대 60개, 짧은 데이터는 전부)와 시계열 이름을 Anthropic으로
+   전송; 올린 파일 자체는 보내지 않음; 네이버 데이터는 보내지 않음 (SEC-4: the copy matches the payload, C.11; `/method`
+   `method.ai.body` says the same).
 6. 쿠키·추적·광고 없음; 브라우저 저장소(localStorage)는 언어·테마·최근 분석·공유 링크 삭제 토큰에만 사용.
 7. 개인정보가 든 파일을 올리지 말라는 안내; 문의: 운영자 연락처(`TRENDAI_CONTACT`가 있으면 그 값을 표시 — `/api/config` does not
    expose it, so the page says "운영자에게 문의하세요" / "Contact the operator of this site").
@@ -3338,7 +3602,7 @@ CSV만, "Data source: Google Trends (https://www.google.com/trends)", 요청마�
   `index` disabled reason for single-request sources, and source `short` names — exactly as given in D.1–D.4.
 * `SAMPLE_TITLES` ko/en: emerging 태동기형/Emerging · growing 성장형/Growing · peaking 정점형/Peaking · fad 반짝유행/Fad ·
   declining 쇠퇴형/Declining · seasonal 계절형/Seasonal · reviving 재부상형/Reviving · breakout 급성장형/Breakout ·
-  volatile 변동형/Volatile.
+  volatile 변동형/Volatile. These titles are also the series display names of sample analyses (E.6.1).
 * `SAMPLE_DESCRIPTIONS_EN`: emerging "An emerging trend growing fast from a small base (start of an S-curve)" ·
   growing "Steady growth with seasonality" · peaking "Growth slowing as it nears saturation (end of an S-curve)" ·
   fad "A short-lived fad that spiked and is now falling" · declining "A steadily declining trend" · seasonal "No
@@ -3388,6 +3652,8 @@ WP1 tests use `write_static_fixture`. Existing tests (`python -m pytest`, ~1,450
 | `test_web_pipeline_hooks.py` | `test_run_on_stage_order` (`["prepare","analyze","forecast","outlook","narrative"]`) · `test_run_on_stage_exception_propagates` · `test_run_output_unchanged_without_hook` (report_to_dict equal with/without a no-op hook) · `test_horizon_long_unchanged_outside_collect` (`pytest.warns(DataWarning)` with the same text and the caller's filename as before) · `test_horizon_long_collected_inside_collect` (no warning escapes a `collect_notices()` block) · `test_llm_narrative_from_payload_matches` (mocked client: same request content as `llm_narrative`) |
 | `test_web_messages_present.py` | every code in WP1's emit tables (C.12.2, C.12.3 targets, C.12.4 incl. `table_too_many_columns`, C.12.5) and every fix action exists in `messages.MESSAGES` (fails until WP2 is merged) |
 | `test_web_server.py` | `test_start_background_serves` (real socket on port 0; urllib GET `/api/health`) · `test_threaded_concurrency` (two slow requests overlap) · `test_close_drains` · `test_draining_keeps_serving` (after the first signal handler runs with a slow job: health `503 draining`, new analyze `503`, job GET still `200`; listener closes after the job ends) |
+| `test_web_hardening.py` (verification round) | one or more regression tests per backend finding (J13–J25): sample display names ko/en/compare/exports; transient failures not cached and upstream `Retry-After`; the per-client cap and token refunds; upload joins; per-client DELETE; unknown-id polls on `read`; per-bucket LRU; done jobs read from disk; the upload work budget before and inside the job; partial results on timeout; hard-linked shares, the share quota and eviction with large shares; low disk / `ENOSPC` → `store_full`; corrupt store documents and budget files; short bodies and deep JSON; log sanitising; label caps and the AI payload size; multipart parts, the per-client parse slot, the row cap, binary / unreadable files, UTF-16; numeric columns without a date; the upload cache's per-client share and `upload_evicted`; wiki text without Naver; the `config` bucket; heavy-read slots; config bounds; the drain linger over real HTTP; WSGI `503 config_error`; log rid / job ids |
+| `test_web_integration_final.py` (final integration) | the catalog codes `store_full`, `upload_evicted`, `wiki_not_found_no_naver`; upstream `Retry-After` from the Wikipedia and Naver connectors (seconds and HTTP date); the series name only inside the facts JSON, cut to 80 characters, and the untrusted-data rule of `SYSTEM_PROMPT`; `Server: trendai`; the font-free export CSP; `gaps_filled` (ko/en, not without gaps); `horizon_long` with span words; UTF-16 without a BOM |
 
 ### H.2 WP2
 
@@ -3398,6 +3664,7 @@ WP1 tests use `write_static_fixture`. Existing tests (`python -m pytest`, ~1,450
 | `tests/test_data_gtrends.py` | `test_classic_gt_csv_with_category_preamble` (series names = terms, attrs region/source/`value_kind == "relative_index_gt"`, `<1` → 0.5, notices `gt_detected` + `gt_lt1_half` with n) · `test_gt_without_preamble` · `test_gt_korean_headers` (`카테고리: 모든 카테고리`, `주,선크림: (대한민국)`) · `test_gt_ispartial_dropped` · `test_non_gt_file_lt1_unchanged` (generic CSV with `<1` still reported unreadable, no GT notices) · `test_load_table_bytes_equals_load_table` (every fixture used by `tests/test_data.py` that is written to disk, **plus an `.xlsx` fixture with separate year and month columns and a blank cell** (skip without openpyxl): identical series and attrs; the xlsx frame keeps native types) · `test_read_table_bytes_xlsx` (skip without openpyxl) · `test_read_table_bytes_meta` (format, encoding `cp949`, decimal_comma) · `test_read_table_bytes_never_writes` (monkeypatch `open`/`Path.write_bytes` to fail → still works) · `test_max_columns_checked_before_parse` (6,000-field header with `max_columns=5000` → `table_too_many_columns` without calling `pd.read_csv`) |
 | `tests/test_data_notices.py` | `test_collect_notices_captures_and_suppresses` (inside the block: list filled, `warnings` sees nothing; outside: unchanged warnings) · `test_collect_notices_nested` · `test_collect_notices_thread_isolation` (8 threads, each preparing a series with distinct gaps inside its own block while others run without a block: each list holds exactly its own notices; `warnings.filters` identical before and after) · `test_emit_notice_stacklevel` (outside a block the warning's filename is the caller's, as before) · `test_date_cols_attr` (year + month → `['연도','월']`; single → `['날짜']`; wide → `[]`) · `test_wide_duplicate_names` (`A`, `A (2)`, `A (3)`) |
 | `tests/test_messages_web.py` | `test_new_codes_render_both_languages` (each C.12 code with sample params renders ko and en without `KeyError`/leftover `{`) · `test_render_web_has_no_cli_hints` (for every code in `MESSAGES`, `render_web` output contains none of `--`, `파이썬`, `Python`, `trendai.`; params filled with dummies) · `test_render_web_msg_joined` (`join(date_order_ambiguous, dates_unreadable_rows)` → both parts in ko and en; en contains no Hangul from the `label` param) · `test_render_web_msg_nested_and_L` (`series_failed` with a nested Msg `detail` uses web wording; `gaps_interpolated.unit` and `col_values_unreadable.edge` (L) resolved) · `test_render_web_msg_lists_and_examples` (`cols=['번호','순번']` → `‘번호’, ‘순번’`; `examples="'a', 'b'"` → `‘a’, ‘b’`) · `test_josa` (‘번호’+은/는 → `‘번호’는`; 104주+으로/로 → `104주로`; 36개월 → `36개월로`; 10년 → `10년으로`; CP949 → `CP949로`; UTF-16 → `UTF-16으로`; 수능+이/가 → `수능이`) · `test_fix_labels_exist` (every action of C.12.6) · `test_existing_render_unchanged` (`render` of old codes byte-identical to before) |
+| `tests/test_data_upload_limits.py` (verification round) | SEC-1: crafted `.xlsx` cell bombs (column XFD / GJH, a wrong `<dimension>`, styled empty cells), wide-key and columns-orient JSON, ragged list rows and the text pre-check all stop before the frame is built, each with a `tracemalloc` peak and time budget; the `MemoryError` path; parity of the streamed `.xlsx` frame with `pd.read_excel`. FU-4: Excel and CSV title rows, `header_row` choice and invalid values, false positives (data rows, blank-A1 headers over dates, one-column, headerless, KOSIS wide), `열 B` labels on the web path vs `Unnamed: N` on the library path, the Google Trends `header_row`. FU-5: `prepare` lists every interpolated period |
 
 
 ### H.3 WP3 — `tests/js/*.test.mjs` (Node 22 built-in runner, no browser; imports the pure modules by relative path)
@@ -3613,3 +3880,27 @@ part, and why. Everything else from both reviews was applied in the sections nam
 | J10 | Feasibility, non-blocking (Naver raw-ratio policy): "either accept that the API is machine-readable, or round/strip in the API". | **Accepted as machine-readable display data** and recorded as the working legal judgement (A.3, docs/WEB.md legal checklist). | The SPA needs the values to draw the chart and read-outs; rounding would degrade the display without changing what can be scraped from the page. Files and copy controls stay free of raw ratios. |
 | J11 | Verification CON-16 (spec drift): "C.10 says the compare JSON is an array; D.4.1 gives samples an as-of that D.2.2 does not; C.5 says a new job answers `queued`". | **The spec text follows the implementation** (C.5, C.10, D.2.2, D.4.1). | Compare JSON: a bare array cannot hold the top-level `source` array and `source_line` C.10 asks for, so it is `{source_line, source, reports}` (WEB_INTERFACES §4.1). Samples: synthetic data have no fetch time, and an analysis time on a fixed built-in series adds nothing, so the D.2.2 row (no as-of) wins over the old D.4.1 wording. C.5: the `status` of a fresh job races with a free worker; clients poll either way, so the answer reports the real state instead of forcing `queued`. |
 | J12 | Verification OPS-14 (capacity): "15–20 comparisons per minute and 24 h retention under the 2 GB default are not what operators will see". | **Docs corrected, defaults kept** (E.13, docs/WEB.md 처리량 and 데이터 보관). | Measured 12–15 five-series weekly comparisons per minute on 4 vCPU, and 0.07–1.2 MB stored per series (a five-series weekly Wikipedia comparison ≈ 2.5 MB). docs/WEB.md now gives per-result sizes and the rule `TRENDAI_STORE_MAX_MB ≥ results per TTL × size ÷ 0.9 + shares`; 2 GB suits a few thousand analyses a day, and operators with more raise it. Shrinking stored results is tracked separately (OPS-2/OPS-3). |
+
+**Verification round (rev. 3).** The UX, security, operations, consistency, accessibility and first-user reviews of
+the running app produced findings with ids `UX-n`, `SEC-n`, `OPS-n`, `CON-n`, `A11Y-n` and `FU-n`. The fixes changed
+the contract in the sections named in brackets; the rows below record the decisions behind those changes and every
+finding that was not adopted, or only in part.
+
+| # | Finding | Decision | Why |
+|---|---|---|---|
+| J13 | UX-1 / FU-6 / CON-2 / A11Y-8: sample analyses showed the internal id (`growing`) as the series name in chips, headings, legends, cards, the narrative and file names. | **Applied** (E.6.1, C.6, C.10, D.2.6, D.2.9, G.13): the display name is the G.13 title in the VM language (`성장형` / `Growing`); the id stays only in `terms`, the `query` echo, the URL `q` and the result-cache key. The SPA maps ids to the `/api/samples` titles for chips, the pre-result heading and the recent list. No `(sample)` suffix in English. | One name everywhere (gallery, chips, chart, ranking, exports). The suffix was dropped because `summary_line` already says `샘플·가상 데이터` / `sample · synthetic data` and printed it twice. |
+| J14 | SEC-10 (DNS rebinding against a loopback server): "check the Host header or require a token". | **A loopback-origin rule** (C.0): on a loopback bind without `public_url`/`trust_proxy`, a POST/DELETE whose `Origin` host is not `localhost`, `*.localhost` or a loopback IP → `403 cross_origin`. Off under the WSGI entry unless `TRENDAI_HOST` is set. | A rebound name passes the Host = Origin comparison by construction, so only the Origin's host itself can tell. Requests without `Origin` (curl, tests) are unaffected. Under gunicorn the bind is unknown, and a reverse proxy may legitimately send public origins. |
+| J15 | SEC-2 / OPS-2 / OPS-3 (unbounded work, memory and disk per result): "downsample the VM chart arrays (LTTB, ~2–3 k points); store one language-independent export; build the whole-result JSON on demand". | **Applied in part** (C.5, C.6, C.8, C.13, E.5, E.6, E.7): an upload work budget (20,000 points per series, 60,000 per request), hard-linked shares with a quota, an eviction allowance that ignores share volume beyond it, done jobs without in-memory VMs, file-by-file encoding at finish, and 4 heavy-read slots. **Not adopted**: chart downsampling and a single export store. | Downsampling changes what the chart, the crosshair read-out, the data table and the PNG show, so it needs a coordinated VM + SPA change with its own tests; with the budget a result holds at most 60 k points, so what remains is a constant factor (≈ 2× for the duplicated export store). Tracked for the next round. |
+| J16 | SEC-4 (the AI privacy copy said only summary figures are sent, but the payload carries up to 60 history values and the name): "(a) strip history and raw metrics from upload payloads, or (b) make the copy match". | **(b)** (C.11, D.2.9, G.10, G.12): `ai_privacy_note`, `/method` and `/privacy` say that computed figures plus up to 60 values (all of a short series) and the name are sent, never the file; a test pins the note to `build_llm_payload`. | The history excerpt is what lets the model describe the shape of the series; the request is user-initiated and bounded. Honest copy keeps the feature useful; option (a) remains open if an operator needs it. |
+| J17 | FU-8 (statistical jargon in the rule narrative and reasons; caveats drawn with ✓): engine helpers `narrative.plain_language` and `narrative.phase_reason_kind`. | **`phase_reason_kind` is wired** into the VM's `phase.reasons[].kind` (D.2.5); **`plain_language` is not**: the VM keeps its own `_tidy_rule_narrative` (D.2.9). | The VM post-processing already covers UX-13/CON-9 and is pinned by VM tests; running two rewriters over the same text risks double edits. The engine rule for `kind` is label-aware (a random-walk sentence supports `volatile`), which the VM's first keyword rule was not. |
+| J18 | FU-7 (a)/(b): hero `약 95%` next to the narrative's `93%`; likelihood word from the raw P while the number is rounded. | **Not reopened** (D.1.5). | Decided in J3; the verifier recommended leaving it. |
+| J19 | FU-3, optional parts: "extend the dotted trend line into the forecast; default `h` to a full season for strongly seasonal weekly series". | **Not adopted.** The core of FU-3 is applied: the seasonal context sentence (D.2.3), the summary / rank suffix (D.2.10, D.4.1) and the tooltips (D.2.4). | A trend extension is a chart design change, and a different default horizon changes every weekly result and the brief's horizon chips (brief §3.1); both are product decisions for a later round. |
+| J20 | SEC-14 (third-party fonts in downloaded reports; the `Server` header named the Python version). | **Applied** (C.10, E.12): stored reports drop the Google Fonts link, `HTML_EXPORT_CSP` drops the font hosts, and `trendai serve` answers `Server: trendai`. | Nothing in a downloaded report should contact a third party, and the banner only helps attackers. |
+| J21 | OPS-4 (a failed series of a transient kind was cached for 24 h; the upstream `Retry-After` was ignored). | **Applied** (C.12.3, E.6, E.10): no result-cache entry when a series failed with a transient code; connectors attach the upstream `Retry-After` (seconds or HTTP date), clamped to 1–300 s. | "Try again" must really re-run, and the upstream's own wait is better than a fixed one. |
+| J22 | UX-23, optional: "an absolute-size floor in the anomaly detector". | **Not adopted**; the VM words sub-2 % deviations as `평소보다 약간` (D.2.6). | The detector is engine code shared with the CLI and HTML report; changing it needs its own calibration run. |
+| J23 | CON-13, optional: "use `compact()` in the chart read-out (`fmt.js`) for values ≥ 1e12". | **Not adopted**; the forecast table uses compact notation on the server (D.2.8). | `fmt.js` must stay in parity with `fmt.py` (D.1.7 vectors); the read-out shows `full()` by design. |
+| J24 | OPS-8 (WSGI entry: an invalid configuration answered an HTML 500, or the spec said "exit 2"). | **A JSON `503 config_error` on every request** (B.3.2), and `TRENDAI_CONTACT` is required unless `TRENDAI_HOST` is set explicitly or `TRENDAI_ALLOW_NO_CONTACT` is set. | A WSGI module cannot exit its host server; a 503 makes health checks fail visibly, and the bind of a WSGI deployment is unknown, so it counts as public. |
+| J25 | SEC-5 (one client could fill the queue; repeating an upload analysis queued duplicates). | **Applied** (C.5, C.13, E.5, E.10): 3 analyze / 2 narrative jobs per client (joins free), and an in-flight key for uploads (joins, never a result cache). | Fairness between clients behind the global queue limit; uploads still never serve someone a cached result. |
+| J26 | E2E scenario 14 was flaky: the AI button of the progressive view (no result id yet) swallowed the click. | **The SPA keeps the button disabled until the result envelope is rendered** (D.2.9), and the scenario waits for the enabled button of the final card before it observes that card's status line. | The bug was real for users too: a click before the final render did nothing. The final render replaces the card, so an observer attached to the progressive card saw nothing (3 × 16/16 E2E runs after the change). |
+| J27 | Seen while testing SEC-6: UTF-16 text without a BOM was decoded as UTF-8 (ASCII with NULs) or CP949. | **Applied** (B.3.1): NUL bytes at every other position select UTF-16-LE/BE before UTF-8 is tried. | `uploads.looks_binary` already lets such text through as text; it must also read correctly. |
+| J28 | `WEB_VM_SCHEMA` after the final integration changes (reason `kind` from the engine rule, `gaps_filled`, `horizon_long` wording). | **Stays 2.** | The 1 → 2 bump of this round has not been released; the integration changes ship in the same release, so cached VMs of schema 2 from before them never existed outside development. |

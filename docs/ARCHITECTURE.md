@@ -160,7 +160,8 @@ class DataWarning(Localised, UserWarning)  # data was repaired (values dropped, 
 class DataNotice(Localised, UserWarning)   # how the input was interpreted (ignored columns, date order...)
 
 def load_table(path, date_col=None, value_cols=None) -> dict[str, pd.Series]       # raw series
-def read_table_bytes(raw, filename, *, max_columns=None) -> RawTable                # in memory, no detection
+def read_table_bytes(raw, filename, *, max_columns=None, max_cells=None,
+                     header_row=None) -> RawTable                                   # in memory, no detection
 def load_table_bytes(raw, filename, date_col=None, value_cols=None) -> dict[str, pd.Series]
 class RawTable;  class GoogleTrendsInfo     # frame + format/encoding/decimal_comma + Google Trends layout
 def frame_to_series(df, date_col=None, value_cols=None, *, decimal=None,
@@ -189,7 +190,8 @@ PANDAS_FREQ, FREQ_KO
 * `load_table` reads `.csv` `.tsv` `.txt` (separator `,` `;` tab `|` sniffed),
   `.xlsx` (openpyxl), `.xls` (xlrd) and `.json` (records, `{date: value}`,
   the `DataFrame.to_json` orients, JSON Lines). Encodings: UTF-8 (± BOM),
-  UTF-16, CP949/EUC-KR. Dates: ISO, `2024.01` / `2024. 1. 5.`, `202401` /
+  UTF-16 (with or without a BOM: NUL bytes at every other position are
+  checked before UTF-8, which would accept them), CP949/EUC-KR. Dates: ISO, `2024.01` / `2024. 1. 5.`, `202401` /
   `20240105`, `2024년 1월`, `2024년 1분기`, `2024 Q1` / `Q1 2024`, ISO weeks,
   `dd.mm.yyyy` / `mm/dd/yyyy` (order decided once per column, ambiguous orders
   reported), month names, plain years, Unix s/ms, timestamps with UTC offsets
@@ -215,6 +217,11 @@ PANDAS_FREQ, FREQ_KO
   interpolated, only `{observed}` observed: accuracy and probabilities can
   look better than the data allow); a coarser one (an aggregation the user
   asked for) is reported only for large gaps, never as merged duplicates.
+  Every period filled by interpolation, also below those thresholds, is
+  listed in `out.attrs[INTERPOLATED_ATTR]` (`'trendai_interpolated'`,
+  ascending `YYYY-MM-DD`); a second `prepare` keeps the list and
+  `pipeline.run` copies it to `analysis.series.attrs`, so the web can name
+  estimated periods (`gaps_filled`).
 * Frequency inference uses the 25 % quantile of the spacing (gappy data keeps
   its native frequency). `prepare` / `regularize` infer it from every dated
   row, empty values included (`_infer_freq_with_gaps`), so a monthly table
@@ -239,9 +246,17 @@ PANDAS_FREQ, FREQ_KO
   `warnings` state (`warnings.catch_warnings` swaps global state and mixes
   threads on Python 3.12/3.13). Blocks nest.
 * `read_table_bytes` parses bytes entirely in memory (Excel from `BytesIO` with
-  native cell types; `max_columns` refuses a too-wide header with
-  `table_too_many_columns` before the full parse) and returns a `RawTable`
-  (`frame`, `format`, `encoding`, `decimal_comma`, `google_trends`). Google
+  native cell types; `.xlsx` is streamed row by row with openpyxl in
+  read-only mode) and checks the shape **before** building the frame:
+  `max_columns` refuses a too-wide header with `table_too_many_columns`,
+  `max_cells` (default `UNTRUSTED_MAX_CELLS` = 2,000,000 for Excel and JSON
+  when `max_columns` is given) refuses a table with `table_too_large`, and a
+  `MemoryError` becomes `table_out_of_memory`. Title rows above the header
+  (a sheet title, `(단위: 원)`) are skipped with the notice
+  `title_rows_skipped` (`header_row=` overrides the detection), and blank
+  header cells are named `열 B` on this path (the library loaders keep
+  `Unnamed: N`). It returns a `RawTable` (`frame`, `format`, `encoding`,
+  `decimal_comma`, `google_trends`, `header_row`, `title_rows`). Google
   Trends CSV exports are recognised by their layout (an optional
   `Category:` / `카테고리:` line, `term: (region)` headers or a pytrends
   `isPartial` column): `<1` is read as 0.5 and the `gt_detected` /
@@ -861,6 +876,8 @@ def format_prob(p, lang="ko") -> str
 def format_date(ts, freq, lang="ko") -> str        # D/W 2024-03-05, M 2024-03, Q 2024-Q1, Y 2024
 def period_unit(freq, lang="ko") -> str            # /월 /주 /일 /분기 /년 (/mo ... in English)
 def translate_reason(reason) -> str | None
+def phase_reason_kind(reason, label) -> str         # 'caveat' | 'support' (the web's reason icons)
+def plain_language(text, lang="ko") -> str          # jargon -> plain words (helper; not used by CLI/HTML)
 def direction_label(direction, expected_change_pct=None, lang="ko", undefined=None, levels=None) -> str
 def model_label(name, lang="ko") -> str;  describe_method(forecast, lang="ko") -> str
 def scenario_value(value, reference=None, nonnegative=False, lang="ko") -> tuple[str, float | None]
@@ -1079,8 +1096,10 @@ PHASE_EN                                            # English phase names
   `prob_increase_basis`; `momentum`, `slope_pct_per_period` and
   `robust_zscore` definitions; seasonal-strength notes; `intermittent`, which
   also says that the compared levels of intermittent demand are average
-  demand per period, zeros included; `pct_undefined`), a history downsampled
-  to ~60 points (recent detail kept)
+  demand per period, zeros included; `pct_undefined`), the series name cut to
+  80 characters (it is user data: the request names it only inside the facts
+  JSON, and `SYSTEM_PROMPT` treats names and labels as data, never as
+  instructions), a history downsampled to ~60 points (recent detail kept)
   with a note, trend ends, `current_level`, `metrics`, `phase`,
   `changepoints`, `anomalies`, `forecast` (method + plain-language
   description, `backtest_mase`, `skill`, table of at most 36 rows),
@@ -1672,14 +1691,17 @@ availability, `vm-ko/en.json`, `export-ko/en.json`, HTML reports, LLM payloads,
 `viewmodel.WEB_VM_SCHEMA`; a different value reads as absent. Stored view
 models hold no URLs or ids: export links are added per response. A result takes
 about 0.07–1.2 MB per series on disk (both languages, exports, HTML reports);
-the sweeper evicts the oldest results when the store passes
-`TRENDAI_STORE_MAX_MB` (docs/WEB.md, 용량 산정).
+the sweeper evicts the oldest results when results and caches pass their share
+of `TRENDAI_STORE_MAX_MB` (shares hard-link the result files and may use at
+most half of it; docs/WEB.md, 용량 산정).
 
 **Limits.** Per-IP token buckets (`analyze`, `upload`, `naver`, `ai`, `share`,
-`export`, `poll` per job, `read`), executor caps (`503 server_busy` with
-`Retry-After`), the Naver monthly budget, the AI daily cap, 2 concurrent upload
-parses, body limits checked before reading, a 30 MB zip guard and table-size
-limits.
+`export`, `poll` per job, `read`, `config`), executor caps (`503 server_busy`
+with `Retry-After`), a per-client cap of 3 analyze / 2 narrative jobs, the
+Naver monthly budget, the AI daily cap, 2 concurrent upload parses (one per
+client), body limits checked before reading, a 30 MB zip guard, table-size
+limits, an upload work budget (20,000 points per series, 60,000 per request),
+4 heavy-read slots and a 50 MB free-disk floor (`503 store_full`).
 
 **Notices and threads.** Request threads only parse uploads; analyses run on
 the job pools. Every call that must capture data notices (`read_table_bytes`,

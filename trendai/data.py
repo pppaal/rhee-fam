@@ -1215,17 +1215,21 @@ def _decode(raw: bytes, what: str) -> tuple[str, str]:
         return raw.decode("utf-32", errors="replace"), "utf-32"
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16", errors="replace"), "utf-16"
+    sample = raw[:4000]
+    # UTF-16 without a BOM: NUL bytes at (nearly) only odd positions (LE) or only even ones (BE) -- the ASCII
+    # digits, separators and line breaks of a table. Checked before UTF-8, which also accepts NUL bytes.
+    half = max(1, len(sample) // 2)
+    even, odd = sample[0::2].count(0), sample[1::2].count(0)
+    if max(even, odd) >= 0.3 * half and min(even, odd) <= 0.02 * half:
+        enc = "utf-16-le" if odd > even else "utf-16-be"
+        try:
+            return raw[:len(raw) - len(raw) % 2].decode(enc), enc
+        except UnicodeDecodeError:
+            pass
     try:
         return raw.decode("utf-8"), "utf-8"
     except UnicodeDecodeError:
         pass
-    sample = raw[:4000]
-    if sample.count(b"\x00") > len(sample) // 4:  # UTF-16 without BOM
-        enc = "utf-16-le" if sample[1:2] == b"\x00" else "utf-16-be"
-        try:
-            return raw.decode(enc), enc
-        except UnicodeDecodeError:
-            pass
     bad_utf8 = raw.decode("utf-8", errors="replace").count("\ufffd")
     multibyte = len(re.findall(rb"[\xc2-\xf4][\x80-\xbf]+", raw))
     if multibyte >= 20 * max(bad_utf8, 1):

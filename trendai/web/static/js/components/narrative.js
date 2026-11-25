@@ -35,8 +35,10 @@ export function createNarrative(vm, opts) {
   const note = h('p', { class: 'muted small narrative-note' });
   const errorSlot = h('div');
   const toggle = h('button', { type: 'button', class: 'btn btn-secondary btn-small', hidden: true, on: { click: () => setMode(mode === 'ai' ? 'rule' : 'ai') } });
+  // Until the result envelope is rendered (the progressive view draws this card from the poll VM) there is no
+  // result id to send: the button waits disabled instead of swallowing a click (E2E 14 race).
   const aiButton = h('button', {
-    type: 'button', class: 'btn btn-secondary', disabled: n.ai_allowed ? null : true,
+    type: 'button', class: 'btn btn-secondary', disabled: n.ai_allowed && opts.resultId ? null : true,
     'aria-describedby': n.ai_allowed ? null : `ai-block-${vm.index}`,
     on: { click: () => runAi() },
   }, icon('ui-sparkle'), t('detail.narrative.ai'));

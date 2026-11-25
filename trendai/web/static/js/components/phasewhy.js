@@ -3,7 +3,7 @@
 
 import { h } from '../dom.js';
 import { t } from '../i18n.js';
-import { cardHead, disclosure, icon, pill } from '../ui.js';
+import { cardHead, disclosure, pill, reasonIcon } from '../ui.js';
 import { helpButton } from './help.js';
 
 let counter = 0;
@@ -22,7 +22,7 @@ export function renderPhaseWhy(vm) {
       detail = h('p', { class: 'reason-detail', id, hidden: true }, r.detail);
       toggle = disclosure(h('button', { type: 'button', class: 'link-btn small' }, t('detail.reason_detail')), detail);
     }
-    return h('li', null, icon('ui-check', { cls: 'reason-icon' }),
+    return h('li', { class: r.kind === 'caveat' ? 'reason-caveat' : null }, reasonIcon(r),
       h('div', null, h('span', null, r.text), toggle ? [' ', toggle] : null, detail));
   });
   const certaintyHelp = helpButton(phase.certainty.label, () => [

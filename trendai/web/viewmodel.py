@@ -138,9 +138,6 @@ _ANOMALY_SMALL_REL = 0.02
 _SEASON_FLAT_PCT = 10.0
 #: raw table values of this size are printed compact (만/억/조, K/M/B) in the forecast table, like the scenario boxes
 _TABLE_COMPACT_FROM = 1e6
-#: phase reasons that argue *against* the call (``kind = "caveat"``, D.2.5): the random-walk caveat of
-#: ``analysis.py`` (ko original; the English text is its ``translate_reason`` output)
-_CAVEAT_MARKERS = ("무작위 행보", "random walk")
 #: "최근 39주 동안 추세가 …" (the phase-judgement window, analysis.phase_window) and its English translation
 _REASON_WINDOW_KO = re.compile(r"^(최근 [\d,]+(?:일|주|개월|분기|년)) (동안 추세)")
 _REASON_WINDOW_EN = re.compile(r"^(Over the last [\d,]+ (?:days?|weeks?|months?|quarters?|years?))(,? the trend)")
@@ -292,15 +289,8 @@ def _lang(lang: str) -> str:
     return "en" if lang == "en" else "ko"
 
 
-def _finite(x: Any) -> Optional[float]:
-    """``float(x)`` for a finite real number (bools excluded), else ``None``."""
-    if x is None or isinstance(x, bool):
-        return None
-    try:
-        v = float(x)
-    except (TypeError, ValueError):
-        return None
-    return v if math.isfinite(v) else None
+#: ``float(x)`` for a finite real number (bools excluded), else ``None`` -- one rule with the formatters (A11Y-24)
+_finite = fmt._finite
 
 
 def _num(x: Any) -> Optional[float]:
@@ -1003,8 +993,14 @@ def _reason_item(text: str, freq: str, lang: str, kind: str = "support") -> dict
     return {"text": head, "detail": m.group(1).strip(), "kind": kind}
 
 
-def _reason_kind(text: str) -> str:
-    return "caveat" if any(k in str(text) for k in _CAVEAT_MARKERS) else "support"
+def _reason_kind(text: str, label: str) -> str:
+    """``"caveat"`` for a phase reason that qualifies the call instead of supporting it (D.2.5, UX-7): the engine's
+    rule (``narrative.phase_reason_kind``) -- the random-walk or short-data sentence beside a directed phase, a
+    trend test with no (or the opposite) direction for a growing / declining phase. Judged on the Korean original,
+    so the English translation inherits it."""
+    from .. import narrative as N
+
+    return N.phase_reason_kind(str(text), label)
 
 
 def _phase(fx: _Facts, hero: dict) -> dict:
@@ -1015,12 +1011,12 @@ def _phase(fx: _Facts, hero: dict) -> dict:
     ph = fx.a.phase
     label = str(ph.label)
     if lang == "en":
-        pairs = [(r2, _reason_kind(r)) for r2, r in ((N.translate_reason(r), r) for r in ph.reasons) if r2]
+        pairs = [(r2, _reason_kind(r, label)) for r2, r in ((N.translate_reason(r), r) for r in ph.reasons) if r2]
         items = [_reason_item(r, fx.freq, lang, kind) for r, kind in pairs] or [
             {"text": T.t(T.PHASE_TEXTS, "reasons_fallback", "en"), "detail": None, "kind": "support"}]
         name_long = N.PHASE_EN.get(label, label)
     else:
-        items = [_reason_item(str(r), fx.freq, lang, _reason_kind(r)) for r in ph.reasons]
+        items = [_reason_item(str(r), fx.freq, lang, _reason_kind(r, label)) for r in ph.reasons]
         name_long = PHASE_KO.get(label, label)
     # supporting reasons first, caveats after them (stable within each group)
     items = [x for x in items if x["kind"] == "support"] + [x for x in items if x["kind"] == "caveat"]

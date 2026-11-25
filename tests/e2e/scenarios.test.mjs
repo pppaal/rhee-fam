@@ -440,7 +440,7 @@ test('13 English UI', T, () => withServer({}, async ({ url }) => {
       for (const node of clone.querySelectorAll('[lang]:not([lang=en])')) node.remove();
       return clone.innerText || clone.textContent;
     }, region);
-    const hangul = content.replaceAll('fad', '').match(/[가-힣]+/g);
+    const hangul = content.match(/[가-힣]+/g);   // the sample is named 'Fad' in English too (E.6.1)
     assert.equal(hangul, null, `${region} contains Hangul: ${(hangul || []).slice(0, 8).join(' ')}`);
   }
   assert.equal(await page.evaluate(() => document.documentElement.dataset.updown), 'intl');
@@ -453,7 +453,9 @@ test('13 English UI', T, () => withServer({}, async ({ url }) => {
 test('14 AI rewrite (non-Naver)', T, () => withServer({ ai: true }, async ({ url }) => {
   const { context, page, errors } = await newPage(browser);
   await page.goto(`${url}/explore?src=sample&q=growing`);
-  await page.waitForSelector('#narrative');
+  // the progressive view draws the card from the poll VM with the AI button disabled (no result id yet); the final
+  // render replaces the card, so observe the status line of the final card only
+  await page.waitForSelector('#narrative button:has-text("AI로 다시 쓰기"):not([disabled])');
   await page.evaluate(() => {
     window.__statusTexts = [];
     const status = document.querySelector('#narrative .narrative-status');

@@ -404,7 +404,7 @@ def analyse_upload(raw: bytes, filename: str, *, hl: str, max_bytes: int, max_mb
     name = display_filename(filename)
     with data.collect_notices() as read_notes:
         try:
-            table = data.read_table_bytes(raw, name, max_columns=MAX_HEADER_COLUMNS)
+            table = data.read_table_bytes(raw, name, max_columns=MAX_HEADER_COLUMNS, max_cells=MAX_TABLE_CELLS)
         except data.DataError as exc:
             raise from_data_error(exc, "upload_parse") from None
     frame = table.frame

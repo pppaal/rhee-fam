@@ -66,8 +66,7 @@ CONTENT_TYPES: dict[str, str] = {
 }
 
 #: Content-Security-Policy sent with HTML exports instead of the app CSP (C.10, E.12).
-HTML_EXPORT_CSP: str = ("sandbox; default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; "
-                        "font-src https://fonts.gstatic.com; img-src data:")
+HTML_EXPORT_CSP: str = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
 
 #: first characters that make a spreadsheet treat a text cell as a formula (C.10)
 _FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")

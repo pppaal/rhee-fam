@@ -1057,6 +1057,8 @@ a.recent-title:hover { text-decoration: underline; }
 .reason-list, .prose ul.reason-list { display: grid; gap: var(--s-2); list-style: none; padding: 0; }
 .reason-list li { display: flex; gap: var(--s-2); align-items: flex-start; }
 .reason-icon { width: 18px; height: 18px; margin-top: 4px; color: var(--ph-growing); }
+.reason-icon-caveat { color: var(--ink-2); }
+.reason-caveat { color: var(--ink-2); }
 .reason-detail { margin-top: 2px; color: var(--ink-2); font-size: var(--fs-cap); font-variant-numeric: tabular-nums; }
 .certainty { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-1) var(--s-2); margin-top: var(--s-4); }
 .more-link { display: inline-flex; margin-top: var(--s-3); font-weight: 600; text-decoration: none; }

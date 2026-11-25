@@ -568,7 +568,7 @@ def test_evicted_upload_is_not_reported_as_expired(app, client):
     resp = client.post("/api/analyze", json={"source": "upload", "upload_id": up["upload_id"]})
     assert resp.status == 410
     code = resp.json()["error"]["code"]
-    assert code == "upload_evicted" == errors.catalog_code("upload_evicted", "upload_expired")
+    assert code == "upload_evicted"
 
 
 # --------------------------------------------------------------------------- CON-11

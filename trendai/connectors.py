@@ -25,6 +25,7 @@ Requests carry no personal data.
 from __future__ import annotations
 
 import datetime as _dt
+import email.utils
 import hashlib
 import http.client
 import json as _json
@@ -82,6 +83,34 @@ class ConnectorError(Localised, RuntimeError):
     operator logs only -- never request headers or keys."""
 
     log_detail: Optional[str] = None
+    #: seconds from the upstream ``Retry-After`` header of a 429 answer (``conn_wiki_429``, ``conn_naver_rate``),
+    #: or ``None`` when the source gave none
+    retry_after: Optional[int] = None
+
+
+def _retry_after(resp: Any) -> Optional[int]:
+    """The ``Retry-After`` header of ``resp`` in whole seconds (delta-seconds or an HTTP date), else ``None``."""
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+    except Exception:  # noqa: BLE001 - an odd headers object is the same as no header
+        return None
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if text.isdigit():
+        return int(text)
+    try:
+        when = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=_dt.timezone.utc)
+    return max(0, math.ceil((when - _dt.datetime.now(_dt.timezone.utc)).total_seconds()))
 
 
 def _connector_error(code: str, log_detail: Optional[str] = None, **params: Any) -> ConnectorError:
@@ -612,6 +641,8 @@ def fetch_naver_search_trend(groups: Sequence[NaverGroup], start: _dt.date, end:
         payload = None
     failure = _naver_failure(status, payload, credentials)
     if failure is not None:
+        if failure.code == "conn_naver_rate":
+            failure.retry_after = _retry_after(resp)
         raise failure
     if not isinstance(payload, dict):
         raise _connector_error("conn_naver_bad_response", f"HTTP {status}: body is not a JSON object")
@@ -843,7 +874,9 @@ def fetch_wikipedia_pageviews(article: str, lang: str = "ko", start: Optional[st
     if status == 404:
         raise ConnectorError(msg("conn_wiki_404", title=title, lang=lang_))
     if status == 429:
-        raise ConnectorError(msg("conn_wiki_429"))
+        exc = ConnectorError(msg("conn_wiki_429"))
+        exc.retry_after = _retry_after(resp)
+        raise exc
     if isinstance(status, int) and status >= 400:
         raise ConnectorError(msg("conn_wiki_http", status=status, url=url))
     raise_for_status = getattr(resp, "raise_for_status", None)

@@ -27,15 +27,18 @@ export function renderFuture(vm) {
       h('span', { class: 'sr-only' }, r.text)))),
     sc.note ? h('p', { class: 'muted small' }, sc.note) : null) : null;
 
-  const cols = t('detail.future.cols').split(',');
+  // bands_only (D.2.8): the centre value is withheld ('—' in every row), so the column is left out, as in the
+  // chart's data table
+  const noMean = vm.chart && vm.chart.display === 'bands_only';
+  const allCols = t('detail.future.cols').split(',');
+  const cols = noMean ? [allCols[0], allCols[2], allCols[3]] : allCols;
   const rows = (f.table && f.table.rows) || [];
   const table = rows.length ? h('details', { class: 'disclosure' },
     h('summary', null, t('detail.future.table')),
-    dataTable(t('detail.future.table'), cols, rows.map((r) => cardRow([
-      cardCell('th', cols[0], r.date_label),
-      cardCell('td', cols[1], r.mean),
-      cardCell('td', cols[2], r.range80),
-      cardCell('td', cols[3], r.range95)])))) : null;
+    dataTable(t('detail.future.table'), cols, rows.map((r) => cardRow(noMean
+      ? [cardCell('th', cols[0], r.date_label), cardCell('td', cols[1], r.range80), cardCell('td', cols[2], r.range95)]
+      : [cardCell('th', cols[0], r.date_label), cardCell('td', cols[1], r.mean), cardCell('td', cols[2], r.range80),
+        cardCell('td', cols[3], r.range95)])))) : null;
 
   const acc = f.accuracy || {};
   const detailsId = `acc-details-${++counter}`;

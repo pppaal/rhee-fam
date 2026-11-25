@@ -69,11 +69,8 @@ _RETRY_DEFAULTS: dict[str, int] = {"server_busy": 10, "naver_rate": 30, "wiki_ra
 _UPLOAD_KINDS = ("upload", "google_trends_upload")
 _MAX_FIXES = 3
 _RETRY_AFTER_MAX = 300
-#: a text variant for a context, used when the catalog has it (``messages.MESSAGES``); else the base text is used
-#: with the clause cut below. ``wiki_not_found`` ends "…or switch to Naver", which is wrong when Naver is unavailable.
+#: the text variant of a code when Naver is unavailable: ``wiki_not_found`` ends "…or switch to Naver" (CON-11)
 _NO_NAVER_VARIANT = {"wiki_not_found": "wiki_not_found_no_naver"}
-_NO_NAVER_CUT = {"wiki_not_found": {"ko": ("인지 확인하거나 네이버로 바꿔 보세요.", "인지 확인해 주세요."),
-                                    "en": (" or switch to Naver.", ".")}}
 
 
 def catalog_code(code: str, fallback: str) -> str:
@@ -83,10 +80,10 @@ def catalog_code(code: str, fallback: str) -> str:
 
 
 def store_error(exc: BaseException) -> Optional["WebError"]:
-    """A full disk or quota while writing the store is not an internal error: ``store_full`` (or ``server_busy``
-    until the catalog has it), ``503`` with ``Retry-After: 300``. ``None`` for anything else."""
+    """A full disk or quota while writing the store is not an internal error: ``503 store_full`` with
+    ``Retry-After: 300``. ``None`` for anything else."""
     if isinstance(exc, OSError) and exc.errno in (_errno.ENOSPC, getattr(_errno, "EDQUOT", _errno.ENOSPC)):
-        return WebError(catalog_code("store_full", "server_busy"), 503, retry_after=300)
+        return WebError("store_full", retry_after=300)
     return None
 
 
@@ -144,12 +141,7 @@ def _text(err: WebError, lang: str, *, naver_available: bool = True) -> str:
     if err.detail is not None:
         return messages.render_web_msg(err.detail, lang)
     if not naver_available and err.code in _NO_NAVER_VARIANT:
-        variant = _NO_NAVER_VARIANT[err.code]
-        if catalog_code(variant, "") == variant:
-            return messages.render_web(variant, err.params, lang)
-        text = messages.render_web(err.code, err.params, lang)
-        old, new = _NO_NAVER_CUT[err.code]["en" if lang == "en" else "ko"]
-        return text.replace(old, new) if text.endswith(old) else text
+        return messages.render_web(_NO_NAVER_VARIANT[err.code], err.params, lang)
     return messages.render_web(err.code, err.params, lang)
 
 
@@ -293,6 +285,8 @@ def from_data_error(exc: BaseException, context: str, *, source_kind: Optional[s
     if context == "upload_parse":
         if code == "table_too_many_columns":
             return WebError("upload_too_many_columns", params={"n": params.get("n"), "max": params.get("max")})
+        if code == "table_too_large":     # the data layer's streaming cell cap (SEC-1), before the frame exists
+            return WebError("upload_too_large_table", params={"n": params.get("n"), "max": params.get("max")})
         if code == "excel_needs_pkg":
             return WebError("upload_excel_needs_pkg")
         return WebError("upload_unreadable", params={"reason": code or "file_unreadable"},

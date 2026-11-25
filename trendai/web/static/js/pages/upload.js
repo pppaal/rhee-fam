@@ -211,11 +211,14 @@ export function create(ctx) {
     const otherCols = res.columns.filter((c) => c.role === 'excluded' || c.role === 'ignored');
     const firstChecked = new Set(prev && prev.value_cols ? prev.value_cols : (detected.value_cols || []).slice(0, maxCols));
     let dateChanged = Boolean(prev && prev.date_col);
+    // 'pick a value column' shows only once the user has acted (picked a date column, changed a box or pressed
+    // 분석하기), not as an error on arrival when no column was pre-checked (UX-20)
+    let touched = Boolean(prev);
 
     // date column
     const dateCols = detected.date_cols || [];
     const wantedDate = prev && prev.date_col ? prev.date_col : null;
-    const dateSelect = h('select', { id: 'confirm-date', class: 'input select', on: { change: () => { dateChanged = true; syncValues(); } } });
+    const dateSelect = h('select', { id: 'confirm-date', class: 'input select', on: { change: () => { dateChanged = true; touched = true; syncValues(); } } });
     if (!detected.wide) {
       if (dateCols.length > 1) {
         dateSelect.appendChild(h('option', { value: dateCols[0], props: { selected: !wantedDate } }, dateCols.join(' + ')));
@@ -241,7 +244,7 @@ export function create(ctx) {
     const valueItem = (c, checked, reasonKey) => {
       const box = h('input', {
         type: 'checkbox', value: c.name, props: { checked }, dataset: { reason: reasonKey ? c.reason : null },
-        on: { change: syncValues },
+        on: { change: () => { touched = true; syncValues(); } },
       });
       boxes.push(box);
       return h('li', null, h('label', { class: ['check', reasonKey && 'is-excluded'] }, box,
@@ -294,14 +297,16 @@ export function create(ctx) {
         b.disabled = b.dataset.reason === 'not_numeric' || (full && !b.checked) || b.value === dateName;
       }
       maxNote.textContent = full ? t('confirm.max_cols', { n: maxCols }) : '';
-      needNote.textContent = n === 0 ? t('confirm.need_value') : '';
-      analyzeBtn.disabled = n === 0;
+      needNote.textContent = n === 0 && touched ? t('confirm.need_value') : '';
+      analyzeBtn.disabled = n === 0 && touched;
     }
 
     async function submit() {
       const cols = selectedValues();
       if (!cols.length) {
+        touched = true;
         syncValues();
+        needNote.closest('.field')?.querySelector('input:not(:disabled)')?.focus();
         return;
       }
       analyzeBtn.disabled = true;

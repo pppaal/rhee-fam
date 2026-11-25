@@ -3,7 +3,7 @@
 
 import { h } from '../dom.js';
 import { t } from '../i18n.js';
-import { arrowLine, disclosure, icon, phaseBadge, pill, toneClass } from '../ui.js';
+import { arrowLine, disclosure, icon, phaseBadge, pill, reasonIcon, toneClass } from '../ui.js';
 import { helpButton } from './help.js';
 
 let counter = 0;
@@ -16,8 +16,8 @@ export function renderHero(vm) {
   const id = `why-${++counter}`;
   const { hero, phase } = vm;
   const why = h('div', { class: 'hero-why', id, hidden: true },
-    h('ul', { class: 'reason-list' }, (phase.reasons || []).map((r) => h('li', null,
-      icon('ui-check', { cls: 'reason-icon' }), h('span', null, r.text)))),
+    h('ul', { class: 'reason-list' }, (phase.reasons || []).map((r) => h('li',
+      { class: r.kind === 'caveat' ? 'reason-caveat' : null }, reasonIcon(r), h('span', null, r.text)))),
     h('p', { class: 'muted small' }, phase.certainty.label, ' · ',
       h('a', { href: phase.rules_url || '/method#phase' }, t('detail.now.rules'))));
   const whyBtn = disclosure(h('button', { type: 'button', class: 'link-btn hero-why-btn' },

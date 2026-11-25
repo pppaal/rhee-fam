@@ -22,6 +22,16 @@ export function icon(id, opts = {}) {
   return svg('svg', attrs, svg('use', { href: `${SPRITE}#${id}` }));
 }
 
+/**
+ * Icon of a phase reason (D.2.5): ✓ for a supporting reason, ⓘ in --ink-2 with a spoken label for a caveat
+ * (`kind: 'caveat'`, e.g. "the series moves like a random walk"), so a caveat never reads as evidence.
+ */
+export function reasonIcon(reason) {
+  return reason && reason.kind === 'caveat'
+    ? icon('ui-info', { cls: ['reason-icon', 'reason-icon-caveat'], label: t('detail.reason_caveat') })
+    : icon('ui-check', { cls: 'reason-icon' });
+}
+
 /** The slot icon name of slot 1–5, or null. */
 export function slotIconName(slot) {
   return Number.isInteger(slot) && slot >= 1 && slot <= 5 ? SLOT_ICONS[slot - 1] : null;

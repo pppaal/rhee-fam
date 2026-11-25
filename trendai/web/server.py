@@ -65,8 +65,35 @@ class _V6Server(ThreadingWSGIServer):
     address_family = socket.AF_INET6
 
 
+#: the ``Server`` header of every response: no Python / wsgiref versions (SEC-14)
+SERVER_SOFTWARE = "trendai"
+
+
+class _ServerHandler(wsgiref.simple_server.ServerHandler):
+    server_software = SERVER_SOFTWARE
+
+
 class _QuietHandler(wsgiref.simple_server.WSGIRequestHandler):
     timeout = 30      # seconds of socket inactivity before a slow client is dropped (E.13)
+
+    def version_string(self) -> str:   # error answers written by http.server itself (414, a bad request line)
+        return SERVER_SOFTWARE
+
+    def handle(self) -> None:
+        """``WSGIRequestHandler.handle`` with :class:`_ServerHandler`, so the app's answers carry
+        ``Server: trendai`` too (the stdlib one sends ``WSGIServer/0.2 CPython/3.x``)."""
+        self.raw_requestline = self.rfile.readline(65537)
+        if len(self.raw_requestline) > 65536:
+            self.requestline = ""
+            self.request_version = ""
+            self.command = ""
+            self.send_error(414)
+            return
+        if not self.parse_request():   # an error answer has been sent
+            return
+        handler = _ServerHandler(self.rfile, self.wfile, self.get_stderr(), self.get_environ(), multithread=False)
+        handler.request_handler = self   # back-pointer for logging
+        handler.run(self.server.get_app())
 
     def log_message(self, format: str, *args: Any) -> None:   # noqa: A002 - signature of the base class
         return            # E.11: the app writes its own access line (no raw paths or query strings)

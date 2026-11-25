@@ -144,7 +144,7 @@ def test_catalog_matches_spec_tables():
         expected[re.match(r"`([a-z_0-9]+)`", c[0]).group(1)] = (c[2], c[3])
     for c in rows("#### C.12.6", "#### C.12.7"):
         expected["fix_" + c[0].strip("`")] = (c[1], c[2])
-    assert len(expected) == 100
+    assert len(expected) == 104     # + store_full, upload_evicted, wiki_not_found_no_naver, gaps_filled
     for code, texts in expected.items():
         assert M.MESSAGES[code] == texts, code
     # the C.12.7 table: the required web wordings

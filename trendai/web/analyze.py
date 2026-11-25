@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Sequence
 from .. import __version__, data
 from ..connectors import NAVER_EARLIEST, WIKI_EARLIEST, ConnectorError, NaverGroup, naver_cache_key, period_bounds
 from . import exports, fmt, texts, viewmodel
-from .errors import REQUEST_CLASS, WebError, catalog_code, encode_series, error_object, from_connector_error, \
+from .errors import REQUEST_CLASS, WebError, encode_series, error_object, from_connector_error, \
     from_data_error, series_error
 from .jobs import JobCancelled, JobContext, JobTimeout
 from .log import log_exception, short_id
@@ -281,8 +281,8 @@ def _normalize_upload(body: Mapping[str, Any], upload_cache: Any, max_series: in
     entry = upload_cache.get(uid) if valid else None
     if entry is None:
         if valid and getattr(upload_cache, "evicted", None) is not None and upload_cache.evicted(uid):
-            # dropped for space seconds ago, not 30 minutes: say so (until the catalog has the text, the expiry one)
-            raise WebError(catalog_code("upload_evicted", "upload_expired"), 410)
+            # dropped for space seconds ago, not 30 minutes: say so (SEC-8)
+            raise WebError("upload_evicted")
         raise WebError("upload_expired")
     frame_cols = [str(c) for c in entry.raw.frame.columns]
     date_col = body.get("date_col")
@@ -456,7 +456,7 @@ _GAP_DATES_SHOWN = 5
 
 
 def _date_list(dates: Sequence[str], freq: str, lang: str) -> str:
-    """``2023년 6월, 2024년 7월`` (D.1.6 labels); beyond :data:`_GAP_DATES_SHOWN` dates ``… 외 3개`` / ``and 3 more``."""
+    """``2023년 6월, 2024년 7월`` (D.1.6 labels); past :data:`_GAP_DATES_SHOWN` dates ``… 외 3개`` / ``and 3 more``."""
     shown = ", ".join(fmt.date_label(d, freq, lang) for d in dates[:_GAP_DATES_SHOWN])
     rest = len(dates) - _GAP_DATES_SHOWN
     if rest <= 0:

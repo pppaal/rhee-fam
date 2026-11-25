@@ -16,8 +16,7 @@ from trendai.web.testing import (FrozenClock, TestClient, analyze_and_wait, asse
                                  monthly_csv, write_static_fixture)
 
 T0 = dt.datetime(2026, 11, 25, 0, 12, tzinfo=dt.timezone.utc)
-EXPORT_CSP = ("sandbox; default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; "
-              "font-src https://fonts.gstatic.com; img-src data:")
+EXPORT_CSP = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
 
 
 @pytest.fixture

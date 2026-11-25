@@ -185,7 +185,10 @@ function onChange(state, routeInfo) {
   });
 }
 
-async function loadConfig() {
+/** Automatic retries of /api/config after a 429/503 that names a Retry-After (OPS-11). */
+const CONFIG_RETRIES = 3;
+
+async function loadConfig(attempt = 0) {
   try {
     app.config = await api.config();
     renderChrome();
@@ -195,6 +198,16 @@ async function loadConfig() {
     root.appendChild(h('div', { class: 'page page-narrow' },
       h('h1', { class: 'sr-only' }, t('app.name')),
       errorCard(err, { navigate: (url) => window.location.assign(url), retry: () => window.location.reload() })));
+    const wait = err && (err.status === 429 || err.status === 503) ? err.retryAfter : null;
+    if (wait && attempt < CONFIG_RETRIES) {
+      // the card counts down; when the wait is over, try again and render the current route on success
+      setTimeout(async () => {
+        if (app.config) return;
+        if (await loadConfig(attempt + 1) && app.router) {
+          app.router.navigate(window.location.pathname + window.location.search + window.location.hash, { replace: true });
+        }
+      }, Math.min(wait, 300) * 1000);
+    }
     return false;
   }
 }
