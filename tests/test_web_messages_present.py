@@ -20,14 +20,15 @@ DATA_CODES = ["no_date_col", "no_numeric_col", "only_rownum_cols", "date_col_mis
               "value_col_missing", "value_col_unreadable", "file_empty", "table_too_many_columns", "excel_needs_pkg",
               "too_few_obs", "too_few_after_regularise", "series_empty", "no_valid_values"]
 NOTICE_CODES = ["naver_missing_filled", "naver_low_resolution", "mostly_zero_volume", "data_short", "horizon_clamped",
-                "gt_detected", "gt_lt1_half", "index_unavailable", "log_hint", "naver_cached", "horizon_long"]
+                "gt_detected", "gt_lt1_half", "index_unavailable", "log_hint", "naver_cached", "horizon_long", "gaps_filled"]
 FIX_ACTIONS = ["reload", "retry", "retry_in", "go_home", "reanalyze", "use_wiki", "use_naver", "upload_file",
                "reupload", "try_sample", "extend_range", "unit_month", "group_terms", "remove_series",
                "show_formats", "try_paste", "pick_columns", "wiki_title_help", "use_log", "copy_link", "export_csv",
                "reanalyze_single"]
 PARAMS = {"param": "range", "max": 5, "group": "선크림", "name": "x", "max_mb": 10, "n": 3, "col": "날짜",
           "retry_after": 30, "limit": 20, "title": "인공지능", "span": "26주", "terms": "‘a’", "region": "KR",
-          "ratio": 20, "fetched": "2026.11.25 09:12", "horizon": 100, "reason": "daily_limit"}
+          "ratio": 20, "fetched": "2026.11.25 09:12", "horizon": 100, "reason": "daily_limit",
+          "dates": "2023.06"}
 
 
 def test_web_error_codes_present():

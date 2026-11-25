@@ -102,6 +102,7 @@ NOTICE_DEFAULTS: dict[str, tuple[str, tuple[str, ...]]] = {
     "index_unavailable": ("info", ()),
     "log_hint": ("info", ("use_log",)),
     "naver_cached": ("info", ()),
+    "gaps_filled": ("warning", ()),
 }
 
 #: source kinds whose series of one request already share one scale (D.4.3: no ``index`` scale)

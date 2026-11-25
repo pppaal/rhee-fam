@@ -451,6 +451,19 @@ def _iso_dates(index: Any) -> list[str]:
     return [iso_date(d) for d in index]
 
 
+#: at most this many dates are listed in a ``gaps_filled`` notice; the rest are counted
+_GAP_DATES_SHOWN = 5
+
+
+def _date_list(dates: Sequence[str], freq: str, lang: str) -> str:
+    """``2023년 6월, 2024년 7월`` (D.1.6 labels); beyond :data:`_GAP_DATES_SHOWN` dates ``… 외 3개`` / ``and 3 more``."""
+    shown = ", ".join(fmt.date_label(d, freq, lang) for d in dates[:_GAP_DATES_SHOWN])
+    rest = len(dates) - _GAP_DATES_SHOWN
+    if rest <= 0:
+        return shown
+    return f"{shown} and {rest} more" if lang == "en" else f"{shown} 외 {rest}개"
+
+
 def _renamed(report: Any, name: str) -> Any:
     """A shallow copy of a ``TrendReport`` under another display name (the English sample title): the numbers are
     shared, only ``report.name`` / ``analysis.name`` -- read by the narrative, the VM and the JSON export -- change."""
@@ -676,9 +689,17 @@ class _Job:
             self.points += n_points
         item.prepared, item.freq = prepared, f
         k = item.index
+        codes = set()
         for w in notes:
-            self._add(item.notices, {lang: viewmodel.notice_from_warning(w, lang, series_index=k)
-                                     for lang in ("ko", "en")})
+            notice = {lang: viewmodel.notice_from_warning(w, lang, series_index=k) for lang in ("ko", "en")}
+            codes.add(notice["ko"]["code"])
+            self._add(item.notices, notice)
+        filled = [str(d) for d in (prepared.attrs.get(data.INTERPOLATED_ATTR) or ())]
+        if filled and not codes & {"gaps_interpolated", "upsampled"}:
+            # FU-5: a few blank periods stay below the data layer's warning thresholds; still say which ones are
+            # estimates (the larger cases already carry gaps_interpolated / upsampled)
+            self._add(item.notices, self._notice("gaps_filled", index=k, lang_params={
+                lang: {"n": len(filled), "dates": _date_list(filled, f, lang)} for lang in ("ko", "en")}))
         values = np.asarray(prepared, dtype=float)
         n = int(len(values))
         h = q.resolved_h(f)
@@ -699,8 +720,8 @@ class _Job:
             fix = viewmodel.fix_object("reanalyze_single", {"term": encode_series(item.terms)})
             self._add(item.notices, self._notice("naver_low_resolution", index=k, fixes=[fix]))
         if h > _LONG_HORIZON_RATIO * n:
-            self._add(item.notices, self._notice("horizon_long", index=k,
-                                                 params={"horizon": h, "n": n, "ratio": _LONG_HORIZON_RATIO}))
+            self._add(item.notices, self._notice("horizon_long", index=k, params={
+                "horizon": h, "n": n, "ratio": _LONG_HORIZON_RATIO, "freq": f}))
 
     def _meta(self, item: _Item, report: Any) -> viewmodel.SourceMeta:
         idx = report.analysis.series.index
