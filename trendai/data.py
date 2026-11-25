@@ -28,10 +28,18 @@ and ambiguous date orders are reported with a Korean :class:`DataWarning` /
 from the message catalog (:mod:`trendai.messages`): the exception / warning carries
 its ``code`` and ``params`` and renders itself in English with ``.text('en')`` (the
 command line does under ``--lang en``); ``str()`` stays Korean.
+
+Warnings and notices go through :func:`emit_notice`: normally ``warnings.warn``, but inside a
+:func:`collect_notices` block they are appended to that block's list instead -- per thread, without
+touching the process-global ``warnings`` state (the web app captures each job's notices this way).
+:func:`read_table_bytes` / :func:`load_table_bytes` parse file *bytes* in memory (uploads are never
+written to disk) and also read Google Trends CSV exports (``Category:`` preamble, ``term: (region)``
+columns, ``<1`` read as 0.5); :func:`load_table` reads the file and delegates to them.
 """
 
 from __future__ import annotations
 
+import contextvars
 import csv
 import io
 import json
@@ -39,6 +47,8 @@ import re
 import warnings
 import zipfile
 from collections import Counter
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional, Union
@@ -48,6 +58,14 @@ import pandas as pd
 
 from . import numfmt as _numfmt
 from .messages import L, Localised, Msg, format_label, join, msg, unit
+
+__all__ = [
+    "PANDAS_FREQ", "FREQ_KO", "DataError", "DataWarning", "DataNotice", "season_length", "periods_per_year",
+    "default_horizon", "infer_freq", "future_index", "regularize", "parse_numbers", "parse_dates", "prepare",
+    "frame_to_series", "load_table", "from_values",
+    # web app (docs/WEB_SPEC.md B.3.1)
+    "collect_notices", "emit_notice", "GoogleTrendsInfo", "RawTable", "read_table_bytes", "load_table_bytes",
+]
 
 # canonical frequency code -> pandas offset alias used for resampling / future dates
 PANDAS_FREQ: dict[str, str] = {
@@ -86,8 +104,48 @@ class DataNotice(Localised, UserWarning):
     Like :class:`DataError`: ``code``, ``params`` and ``text(lang)``; ``str()`` is Korean."""
 
 
+#: the list of the innermost active collect_notices() block of the current thread / context (None: none)
+_NOTICE_SINK: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar("trendai_notice_sink", default=None)
+
+
+@contextmanager
+def collect_notices() -> Iterator[list[Warning]]:
+    """Capture the data layer's notices for the *current thread* instead of emitting them via ``warnings``.
+
+    While the block is active, every :class:`DataNotice` / :class:`DataWarning` that trendai code emits
+    (through :func:`emit_notice`) is appended to the yielded list -- as an instance whose ``args[0]`` is
+    the :class:`~trendai.messages.Msg` -- and ``warnings.warn`` is *not* called.  Nested blocks: the
+    innermost list receives.  The sink is a ``contextvars.ContextVar``, so the process-global warnings
+    state (filters, ``showwarning``) is never read or changed and concurrent threads can neither see nor
+    lose each other's notices::
+
+        with collect_notices() as notes:
+            series, freq = prepare(raw)
+        texts = [n.text("en") for n in notes]
+    """
+    sink: list[Warning] = []
+    token = _NOTICE_SINK.set(sink)
+    try:
+        yield sink
+    finally:
+        _NOTICE_SINK.reset(token)
+
+
+def emit_notice(message: str, category: type = DataWarning, stacklevel: int = 2) -> None:
+    """The single emission point of data notices: appends ``category(message)`` to the active
+    :func:`collect_notices` list if there is one, else ``warnings.warn(message, category,
+    stacklevel=stacklevel + 1)`` -- outside a collect block the category, the text and the reported
+    caller line are exactly those of calling ``warnings.warn(message, category, stacklevel)`` from the
+    caller of this function."""
+    sink = _NOTICE_SINK.get()
+    if sink is not None:
+        sink.append(category(message))
+        return
+    warnings.warn(message, category, stacklevel=stacklevel + 1)
+
+
 def _warn(message: str, category: type = DataWarning) -> None:
-    warnings.warn(message, category, stacklevel=3)
+    emit_notice(message, category, stacklevel=3)
 
 
 def season_length(freq: str) -> int:
@@ -857,9 +915,32 @@ def _is_step1_sequence(v: pd.Series) -> bool:
     return bool(np.all(d == 1.0) or np.all(d == -1.0))
 
 
+def _clean_labels(columns: Iterable[Any]) -> list[str]:
+    """Column labels as ``str`` (BOM removed, whitespace collapsed); a label that occurs again becomes
+    ``'<label> (2)'``, ``'<label> (3)'`` ... so every column (and every series named after one) is unique.
+    Idempotent: clean, unique labels are returned unchanged."""
+    labels = [re.sub(r"\s+", " ", str(c).replace("\ufeff", "")).strip() for c in columns]
+    if len(set(labels)) == len(labels):
+        return labels
+    taken = set(labels)
+    seen: set[str] = set()
+    out = []
+    for label in labels:
+        name = label
+        if name in seen:
+            k = 2
+            while f"{label} ({k})" in taken:
+                k += 1
+            name = f"{label} ({k})"
+            taken.add(name)
+        seen.add(name)
+        out.append(name)
+    return out
+
+
 def _clean_frame(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [re.sub(r"\s+", " ", str(c).replace("\ufeff", "")).strip() for c in df.columns]
+    df.columns = _clean_labels(df.columns)
     if not df.empty:
         blank = df.apply(lambda c: c.isna() | c.astype("string").str.strip().fillna("").eq(""))
         df = df.loc[~blank.all(axis=1), ~blank.all(axis=0).to_numpy()]
@@ -911,7 +992,8 @@ def _wide_to_series(df: pd.DataFrame, prefer_decimal_comma: bool) -> Optional[di
         while nm in out:
             nm, k = f"{base} ({k})", k + 1
         s = pd.Series(vals.to_numpy(dtype=float), index=dates, name=nm)
-        s.attrs["trendai"] = {"date_col": "(열 머리글)", "date_format": label, "n_rows": int(len(df))}
+        s.attrs["trendai"] = {"date_col": "(열 머리글)", "date_format": label, "n_rows": int(len(df)),
+                              "date_cols": []}
         out[nm] = s
     if not out:
         return None
@@ -960,7 +1042,10 @@ def frame_to_series(df: pd.DataFrame, date_col: Optional[str] = None,
     value columns are all columns whose cells read as numbers (see
     :func:`parse_numbers`), minus row-number columns.  A table whose dates run
     across the columns is read row by row.  Each returned series carries
-    ``series.attrs['trendai']`` = ``{'date_col', 'date_format', 'n_rows'}``.
+    ``series.attrs['trendai']`` = ``{'date_col', 'date_format', 'n_rows', 'date_cols'}``:
+    ``date_col`` is the display string (``'연도 + 월'``), ``date_cols`` the real column
+    name(s) the dates came from (``['연도', '월']``, ``['날짜']``; ``[]`` for a wide table).
+    Series names are unique: a repeated column or row name gets `` (2)``, `` (3)`` ...
     """
     if df is None or df.empty:
         raise DataError(msg("table_empty_rows"))
@@ -1043,7 +1128,8 @@ def frame_to_series(df: pd.DataFrame, date_col: Optional[str] = None,
             _warn(msg("col_values_unreadable", col=str(c), n=n_bad, examples=", ".join(map(repr, ex)), edge=edge))
         s = s[valid_date]
         shown = f"{date_col} + {period_col}" if period_col else str(date_col)
-        s.attrs["trendai"] = {"date_col": shown, "date_format": label, "n_rows": int(len(df))}
+        s.attrs["trendai"] = {"date_col": shown, "date_format": label, "n_rows": int(len(df)),
+                              "date_cols": [str(date_col)] + ([str(period_col)] if period_col else [])}
         out[str(c)] = s
     return out
 
@@ -1118,13 +1204,31 @@ def _header_is_data(columns: list[str]) -> bool:
     return bool(vals.notna().all())
 
 
-def _read_text_table(text: str, what: str) -> tuple[pd.DataFrame, bool]:
-    """Parse delimited text into an all-string DataFrame. Returns (df, decimal_comma_hint)."""
+def _count_fields(line: str, sep: str) -> int:
+    """Number of fields in one (header) line split with ``sep``."""
+    if sep == r"\s+":
+        return len(line.split())
+    try:
+        return len(next(csv.reader([line], delimiter=sep), []))
+    except csv.Error:
+        return line.count(sep) + 1
+
+
+def _parse_text_table(text: str, what: str,
+                      max_columns: Optional[int] = None) -> tuple[pd.DataFrame, str]:
+    """Parse delimited text into an all-string DataFrame. Returns ``(df, separator)``.
+
+    ``max_columns``: a header row with more fields raises ``table_too_many_columns`` before the
+    full parse."""
     text = text.lstrip("\ufeff")
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if not lines:
         raise DataError(msg("file_empty", what=what))
     sep = _sniff_sep(lines[:50]) or ","
+    if max_columns is not None:
+        n_fields = _count_fields(lines[0], sep)
+        if n_fields > max_columns:
+            raise DataError(msg("table_too_many_columns", n=n_fields, max=int(max_columns)))
     kw: dict[str, Any] = dict(sep=sep, dtype=str, keep_default_na=False, na_filter=False,
                               skipinitialspace=True, skip_blank_lines=True)
     if sep == r"\s+":
@@ -1146,6 +1250,12 @@ def _read_text_table(text: str, what: str) -> tuple[pd.DataFrame, bool]:
                      " Thousands separators (1,234) without quotes change the number of columns: quote the "
                      "values or save the file with tabs or semicolons as separators.")
         raise DataError(msg("csv_ragged", what=what, error=str(exc), hint=hint)) from None
+    return df, sep
+
+
+def _read_text_table(text: str, what: str) -> tuple[pd.DataFrame, bool]:
+    """Parse delimited text into an all-string DataFrame. Returns (df, decimal_comma_hint)."""
+    df, sep = _parse_text_table(text, what)
     return df, sep == ";"
 
 
@@ -1195,9 +1305,13 @@ def _json_to_frame(obj: Any, what: str) -> pd.DataFrame:
 
 
 _EXCEL_SIGNATURES = (b"PK\x03\x04", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+_EXCEL_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".ods")
+_EXCEL_FORMATS = {".xlsx": "xlsx", ".xlsm": "xlsx", ".xls": "xls", ".ods": "ods"}
+_TEXT_FORMATS = {".csv": "csv", ".tsv": "tsv", ".txt": "txt"}
 
 
-def _read_excel(p: Path, raw: bytes, what: str) -> pd.DataFrame:
+def _read_excel(raw: bytes, what: str) -> pd.DataFrame:
+    """The first sheet of an Excel file given as bytes (read in memory), cells with pandas' native types."""
     if not raw.startswith(_EXCEL_SIGNATURES):
         head = raw[:2000].lstrip().lower()
         if head.startswith((b"<!doctype html", b"<html", b"<table", b"<?xml")):
@@ -1206,7 +1320,7 @@ def _read_excel(p: Path, raw: bytes, what: str) -> pd.DataFrame:
         return pd.DataFrame()  # caller falls back to text parsing
     engine_pkg = "xlrd" if raw.startswith(_EXCEL_SIGNATURES[1]) else "openpyxl"
     try:
-        df = pd.read_excel(p, sheet_name=0)
+        df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
     except ImportError:
         raise DataError(msg("excel_needs_pkg", what=what, pkg=engine_pkg)) from None
     except (ValueError, zipfile.BadZipFile, KeyError, OSError, TypeError) as exc:
@@ -1215,12 +1329,214 @@ def _read_excel(p: Path, raw: bytes, what: str) -> pd.DataFrame:
         raise DataError(msg("excel_unreadable_engine", what=what, error=f"{type(exc).__name__}: {exc}")) from None
     if _header_is_data([str(c) for c in df.columns]):
         try:
-            df = pd.read_excel(p, sheet_name=0, header=None)
+            df = pd.read_excel(io.BytesIO(raw), sheet_name=0, header=None)
         except Exception:  # noqa: BLE001 - already read once; keep the first result
             return df
         ncol = df.shape[1]
         df.columns = ["date"] + (["value"] if ncol == 2 else [f"value{i}" for i in range(1, ncol)])
     return df
+
+
+# ---- Google Trends CSV exports
+#
+# Detected by structure, not by fixed strings (the current export layout and its Korean headers are
+# unverified): an optional first line "Category: ..." / "카테고리: ..." (and blank lines), then a header
+# whose value columns read "term: (region)" ("sunscreen: (South Korea)", "선크림: (대한민국)") under a
+# time column ("Week", "주", ...), or a pytrends-style header with an "isPartial" column.
+
+_GT_PREAMBLE = re.compile(r'^\s*"?\s*(?:category|카테고리)\s*:\s*(.*?)\s*"?\s*[,;\t|]*\s*$', re.IGNORECASE)
+_GT_COLUMN = re.compile(r"^\s*(.+?)\s*:\s*\((.+)\)\s*$", re.DOTALL)
+_GT_TIME_HEADERS = frozenset({"week", "month", "day", "time", "date", "주", "월", "일", "시간", "날짜"})
+_GT_PARTIAL = "ispartial"
+
+
+@dataclass
+class GoogleTrendsInfo:
+    """What :func:`read_table_bytes` found in a Google Trends CSV export."""
+
+    terms: dict[str, tuple[str, Optional[str]]]   # final column name -> (term, region or None)
+    lt1_count: int                                 # '<1' cells read as 0.5
+    category: Optional[str]                        # text after 'Category:' / '카테고리:' if present
+
+
+@dataclass
+class RawTable:
+    """A table as read by :func:`read_table_bytes`, before any date / value detection.
+
+    ``frame`` holds str cells for CSV/TSV/TXT, JSON's own value types for JSON and pandas' native cell
+    types for Excel (Timestamps, floats such as ``2020.0`` for integer columns with blanks) -- exactly what
+    :func:`load_table` hands :func:`frame_to_series` -- with ``str`` column labels (header row applied,
+    whitespace collapsed, repeats numbered; a Google Trends preamble skipped, its columns renamed to the
+    terms, ``'<1'`` -> ``'0.5'``, ``isPartial`` dropped).  Pass ``decimal_comma`` to
+    ``frame_to_series(prefer_decimal_comma=...)``."""
+
+    frame: pd.DataFrame
+    filename: str
+    format: str                    # 'csv' | 'tsv' | 'txt' | 'xlsx' | 'xls' | 'ods' | 'json'
+    encoding: Optional[str]        # e.g. 'utf-8-sig', 'cp949'; None for Excel
+    decimal_comma: bool
+    google_trends: Optional[GoogleTrendsInfo]
+
+
+def _next_line(text: str, pos: int) -> tuple[int, int, str]:
+    """``(start, end, line)`` of the first non-blank line at or after ``pos`` (``line`` without its line
+    break; ``start == len(text)`` when there is none).  A line of separators only (``,,`` -- the blank
+    line of an export saved again by Excel) counts as blank."""
+    while pos < len(text):
+        nl = text.find("\n", pos)
+        end = len(text) if nl < 0 else nl + 1
+        line = text[pos:end].rstrip("\r\n")
+        if line.strip(" \t,;|\"'"):
+            return pos, end, line
+        pos = end
+    return len(text), len(text), ""
+
+
+def _detect_google_trends(text: str) -> Optional[tuple[str, Optional[str]]]:
+    """``(text from the header row on, category)`` when ``text`` is a Google Trends export, else None.
+    Only the first lines are looked at."""
+    text = text.lstrip("\ufeff")
+    start, end, line = _next_line(text, 0)
+    if not line:
+        return None
+    category: Optional[str] = None
+    preamble = _GT_PREAMBLE.match(line) if len(line) <= 1000 else None
+    if preamble:
+        category = preamble.group(1).strip().strip('"').strip() or None
+        start, end, line = _next_line(text, end)
+        if not line:
+            return None
+    head = [ln for ln in text[start:start + 200_000].splitlines()[:60] if ln.strip()][:50]
+    sep = _sniff_sep(head) or ","
+    if sep == r"\s+":
+        return None
+    try:
+        header = [f.strip() for f in next(csv.reader([line], delimiter=sep), [])]
+    except csv.Error:
+        return None
+    if len(header) < 2:
+        return None
+    values = [f for f in header[1:] if f.lower() != _GT_PARTIAL]
+    if not values:
+        return None
+    time_first = header[0].lower() in _GT_TIME_HEADERS
+    has_partial = len(values) < len(header) - 1
+    by_pattern = all(_GT_COLUMN.match(f) for f in values)
+    if not (preamble or (time_first and (by_pattern or has_partial))):
+        return None
+    return text[start:], category
+
+
+def _apply_google_trends(df: pd.DataFrame, category: Optional[str]) -> tuple[pd.DataFrame, GoogleTrendsInfo]:
+    """Drop ``isPartial``, read ``'<1'`` as ``'0.5'`` and rename ``'term: (region)'`` columns to the term
+    (``'term (region)'`` when two columns share a term); emits ``gt_detected`` / ``gt_lt1_half``."""
+    df = df.drop(columns=[c for c in df.columns[1:] if str(c).strip().lower() == _GT_PARTIAL])
+    date_col = str(df.columns[0])
+    split: dict[str, tuple[str, Optional[str]]] = {}
+    for c in df.columns[1:]:
+        m = _GT_COLUMN.match(str(c))
+        split[str(c)] = (m.group(1).strip(), m.group(2).strip()) if m else (str(c).strip(), None)
+    per_term = Counter(term for term, _ in split.values())
+    taken = {date_col}
+    rename: dict[str, str] = {}
+    terms: dict[str, tuple[str, Optional[str]]] = {}
+    lt1 = 0
+    for col, (term, region) in split.items():
+        name = term if (per_term[term] == 1 or not region) else f"{term} ({region})"
+        base, k = name, 2
+        while name in taken:
+            name, k = f"{base} ({k})", k + 1
+        taken.add(name)
+        rename[col] = name
+        terms[name] = (term, region)
+        less_than_one = df[col].astype("string").str.strip().eq("<1").fillna(False).to_numpy(dtype=bool)
+        if less_than_one.any():
+            df.loc[less_than_one, col] = "0.5"
+            lt1 += int(less_than_one.sum())
+    df = df.rename(columns=rename)
+    unique_terms = list(dict.fromkeys(term for term, _ in terms.values()))
+    regions = list(dict.fromkeys(region for _, region in terms.values() if region))
+    region_text: Any = (regions[0] if len(regions) == 1 else ", ".join(f"‘{r}’" for r in regions) if regions
+                        else L("표시 없음", "not stated"))
+    _warn(msg("gt_detected", terms=", ".join(f"‘{t}’" for t in unique_terms), region=region_text), DataNotice)
+    if lt1:
+        _warn(msg("gt_lt1_half", n=lt1), DataNotice)
+    return df, GoogleTrendsInfo(terms=terms, lt1_count=lt1, category=category)
+
+
+def read_table_bytes(raw: bytes, filename: str, *, max_columns: Optional[int] = None) -> RawTable:
+    """Parse file bytes in memory (nothing is written to disk) into a :class:`RawTable`.
+
+    The format comes from the extension of ``filename`` (.csv .tsv .txt .xlsx .xlsm .xls .ods .json;
+    anything else: text with the separator sniffed); Excel is read from an in-memory buffer.  Emits
+    the same :class:`DataNotice` / :class:`DataWarning` as :func:`load_table` (plus ``gt_detected`` /
+    ``gt_lt1_half`` for a Google Trends export) and raises :class:`DataError` for unreadable input.
+    ``max_columns``: for text formats the header row is split with the sniffed separator *before* the
+    full parse and more fields raise ``DataError(table_too_many_columns)``; for Excel / JSON the check
+    runs right after reading.  ``None`` = no limit."""
+    what = str(filename)
+    if not raw.strip():
+        raise DataError(msg("file_empty", what=what))
+    suffix = Path(what).suffix.lower()
+    df: Optional[pd.DataFrame] = None
+    fmt = ""
+    encoding: Optional[str] = None
+    decimal_comma = False
+    gt: Optional[GoogleTrendsInfo] = None
+    if suffix in _EXCEL_SUFFIXES:
+        df = _read_excel(raw, what)
+        if df.empty and not raw.startswith(_EXCEL_SIGNATURES):
+            df = None  # text content behind an Excel extension: parse as CSV below
+        else:
+            fmt = _EXCEL_FORMATS[suffix]
+    elif suffix == ".json":
+        text, encoding = _decode(raw, what)
+        try:
+            obj = json.loads(text.lstrip("\ufeff"))
+        except json.JSONDecodeError as exc:
+            try:  # JSON Lines
+                obj = [json.loads(ln) for ln in text.lstrip("\ufeff").splitlines() if ln.strip()]
+            except json.JSONDecodeError:
+                raise DataError(msg("json_invalid", what=what, error=exc.msg, line=exc.lineno)) from None
+        try:
+            df = _json_to_frame(obj, what)
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            if isinstance(exc, DataError):
+                raise
+            raise DataError(msg("json_to_table", what=what, error=str(exc))) from None
+        fmt = "json"
+    if df is None:
+        if raw.startswith(_EXCEL_SIGNATURES):
+            raise DataError(msg("excel_wrong_ext", what=what))
+        text, encoding = _decode(raw, what)
+        trends = _detect_google_trends(text)
+        df, sep = _parse_text_table(trends[0] if trends else text, what, max_columns)
+        decimal_comma = sep == ";"
+        fmt = _TEXT_FORMATS.get(suffix) or ("tsv" if sep == "\t" else "txt" if sep == r"\s+" else "csv")
+        if trends:
+            df, gt = _apply_google_trends(df, trends[1])
+    elif max_columns is not None and df.shape[1] > max_columns:
+        raise DataError(msg("table_too_many_columns", n=int(df.shape[1]), max=int(max_columns)))
+    df.columns = _clean_labels(df.columns)
+    return RawTable(frame=df, filename=what, format=fmt, encoding=encoding, decimal_comma=decimal_comma,
+                    google_trends=gt)
+
+
+def load_table_bytes(raw: bytes, filename: str, date_col: Optional[str] = None,
+                     value_cols: Optional[Iterable[str]] = None) -> dict[str, pd.Series]:
+    """:func:`read_table_bytes` + :func:`frame_to_series`: file bytes -> ``{name: raw series}``.
+
+    For a Google Trends export every series also gets ``attrs['trendai'] |= {'source':
+    'google_trends_upload', 'term', 'region', 'value_kind': 'relative_index_gt'}``."""
+    table = read_table_bytes(raw, filename)
+    out = frame_to_series(table.frame, date_col=date_col, value_cols=value_cols,
+                          prefer_decimal_comma=table.decimal_comma)
+    if table.google_trends is not None:
+        for name, s in out.items():
+            term, region = table.google_trends.terms.get(name, (name, None))
+            s.attrs["trendai"] = {**s.attrs.get("trendai", {}), "source": "google_trends_upload", "term": term,
+                                  "region": region, "value_kind": "relative_index_gt"}
+    return out
 
 
 def load_table(path: Union[str, Path], date_col: Optional[str] = None,
@@ -1230,7 +1546,8 @@ def load_table(path: Union[str, Path], date_col: Optional[str] = None,
     The encoding, separator, date column and numeric value columns are
     detected automatically unless given explicitly (see the module docstring
     for the supported formats).  Returned series are *raw*; pass them through
-    :func:`prepare` (or :func:`trendai.pipeline.run`) before analysis.
+    :func:`prepare` (or :func:`trendai.pipeline.run`) before analysis.  The file
+    is read as bytes and parsed by :func:`load_table_bytes`.
 
     Raises :class:`DataError` with a Korean message for every unreadable input
     (missing / empty / directory path, damaged Excel, unknown JSON shape,
@@ -1246,37 +1563,7 @@ def load_table(path: Union[str, Path], date_col: Optional[str] = None,
         raw = p.read_bytes()
     except OSError as exc:
         raise DataError(msg("file_unreadable", what=what, error=str(exc.strerror or exc))) from None
-    if not raw.strip():
-        raise DataError(msg("file_empty", what=what))
-    suffix = p.suffix.lower()
-    decimal_comma = False
-    df: Optional[pd.DataFrame] = None
-    if suffix in (".xlsx", ".xlsm", ".xls", ".ods"):
-        df = _read_excel(p, raw, what)
-        if df.empty and not raw.startswith(_EXCEL_SIGNATURES):
-            df = None  # text content behind an Excel extension: parse as CSV below
-    elif suffix == ".json":
-        text, _ = _decode(raw, what)
-        try:
-            obj = json.loads(text.lstrip("\ufeff"))
-        except json.JSONDecodeError as exc:
-            try:  # JSON Lines
-                obj = [json.loads(ln) for ln in text.lstrip("\ufeff").splitlines() if ln.strip()]
-            except json.JSONDecodeError:
-                raise DataError(msg("json_invalid", what=what, error=exc.msg, line=exc.lineno)) from None
-        try:
-            df = _json_to_frame(obj, what)
-        except (ValueError, TypeError, KeyError, AttributeError) as exc:
-            if isinstance(exc, DataError):
-                raise
-            raise DataError(msg("json_to_table", what=what, error=str(exc))) from None
-    if df is None:
-        if raw.startswith(_EXCEL_SIGNATURES):
-            raise DataError(msg("excel_wrong_ext", what=what))
-        text, _ = _decode(raw, what)
-        df, decimal_comma = _read_text_table(text, what)
-    return frame_to_series(df, date_col=date_col, value_cols=value_cols,
-                           prefer_decimal_comma=decimal_comma)
+    return load_table_bytes(raw, what, date_col=date_col, value_cols=value_cols)
 
 
 def from_values(values: Iterable[float], start: str = "2020-01-01", freq: str = "M",

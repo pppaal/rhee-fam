@@ -1,0 +1,16 @@
+.git
+.gitignore
+.trendai-data
+.pytest_cache
+.ruff_cache
+**/__pycache__
+*.egg-info
+build
+dist
+out
+reports
+tests
+docs
+node_modules
+read.py
+trendai/web/static/dev

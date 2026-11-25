@@ -16,6 +16,7 @@ pip install -e .              # numpy, pandas만 필요
 pip install -e ".[llm]"       # Claude 해석/질문 기능 (anthropic SDK)
 pip install -e ".[connectors]" # 위키백과/Google Trends 데이터 수집
 pip install -e ".[dev]"       # 테스트 (pytest)
+pip install -e ".[web]"       # 웹 앱의 엑셀 내보내기·AI 해석 (openpyxl, anthropic; 없어도 웹 앱은 동작)
 pip install openpyxl          # .xlsx 파일 읽기 (.xls는 xlrd)
 ```
 
@@ -82,6 +83,20 @@ CSV 예시 (값 열이 여러 개면 각각 분석하고 비교 순위까지 만
 
 평일(영업일)만 있는 데이터(주가 등)는 주말을 보간해 달력일 기준으로 분석하며 이를 경고로 알립니다
 (주 단위로 보려면 `--freq W`). 주간 데이터는 원래 요일(예: 월요일)을 유지하고 예측 날짜도 그 요일로 이어집니다.
+
+## 웹 앱
+
+같은 분석을 브라우저에서 쓰는 웹 앱이 들어 있습니다. 검색어(네이버 데이터랩 검색어트렌드·위키백과 조회수)나 내 파일,
+내장 샘플로 최대 5개를 비교하고, 국면·전망·예측 차트와 해석을 한국어/영어로 보여 줍니다. 추가 의존성은 없습니다.
+
+```bash
+trendai serve                 # http://127.0.0.1:8000 (--port 0이면 빈 포트, Ctrl+C로 종료)
+```
+
+- 운영(환경 변수, 네이버 HUB 키, 배포·리버스 프록시, 요청 한도, 데이터 보관, 법무 확인 항목)은 [docs/WEB.md](docs/WEB.md)를 보세요.
+- 개인정보: 앱은 업로드한 원본 파일을 디스크에 쓰지 않고(프록시 설정은 docs/WEB.md), 결과는 24시간 뒤 지웁니다. 공유 링크는 직접 만들 때만 생기며 30일 뒤 사라집니다.
+- 네이버 출처는 API 키(`NAVER_API_HUB_KEY_ID`/`NAVER_API_HUB_KEY`, 또는 레거시 키)가 있을 때만 켜지고, 이용약관에 따라 AI로 보내지 않으며 원본 값은 내려받기에서 뺍니다.
+- AI 해석은 `anthropic`과 `ANTHROPIC_API_KEY`가 있을 때 사용자가 누를 때만 만들고, `AI 해석 · Claude`로 표시합니다.
 
 ## 결과 읽는 법
 
@@ -202,6 +217,8 @@ render_compare_html(list(reports.values()), ranking, "compare.html")
 ## 테스트
 
 ```bash
-python -m pytest            # 전체 (약 1,450개, 3분 안팎)
+python -m pytest            # 전체 (약 2,000개, 6분 안팎; node와 Playwright가 있으면 브라우저 E2E 포함)
+python -m pytest -m "not e2e"   # 파이썬 테스트만
 python -m pytest tests/test_data.py tests/test_cli.py
+node --test tests/js        # 웹 프런트엔드 단위 테스트 (Node 22)
 ```

@@ -13,6 +13,8 @@ dependencies = ["numpy>=1.24", "pandas>=2.0"]
 [project.optional-dependencies]
 llm = ["anthropic>=1.0"]
 connectors = ["requests>=2.28", "pytrends>=4.9"]
+xlsx = ["openpyxl>=3.1"]
+web = ["openpyxl>=3.1", "anthropic>=1.0"]    # optional features of the web app (it runs without them)
 dev = ["pytest>=7"]
 
 [project.scripts]
@@ -20,7 +22,15 @@ trendai = "trendai.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["trendai*"]
+namespaces = false    # trendai/web/static/** is package data of trendai.web, not a tree of namespace packages
+
+[tool.setuptools.package-data]
+"trendai.web" = ["static/**/*", "vm.schema.json"]
+
+[tool.setuptools.exclude-package-data]
+"trendai.web" = ["static/dev/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["e2e: browser end-to-end tests (need node and playwright)"]

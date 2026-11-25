@@ -1,0 +1,63 @@
+/* Design tokens (spec F.8, exact values; brief §4.2). Owner: WP3-app.
+ * Light values on :root; the dark block applies with the system setting unless the user chose light, and again,
+ * verbatim, when the user chose dark. Up/down colours follow data-updown (theme-init.js). */
+:root {
+  --font: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo",
+          "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+  --bg: #f6f6f3; --surface: #ffffff; --surface-2: #f2f2ee;
+  --ink: #141413; --ink-2: #4e4d49; --ink-3: #6b6963;
+  --grid: #ebeae5; --axis: #c3c2b7;
+  --border: rgba(20, 20, 19, .10); --border-strong: rgba(20, 20, 19, .18);
+  --accent: #2a78d6; --accent-ink: #ffffff; --focus: #2a78d6;
+  --c-hist: #2a78d6; --c-fc: #eb6834; --c-trend: #7a7871; --c-anom: #b4418e;
+  --c-cp-bg: var(--ink); --c-cp-fg: #ffffff;
+  --fc-region: rgba(235, 104, 52, .045);
+  --band95-op: .11; --band80-op: .20;
+  --up-kr: #d22d3d; --down-kr: #1e5fc2; --up-intl: #0b7a33; --down-intl: #c0362c;
+  --up: var(--up-kr); --down: var(--down-kr);
+  --slot-1: #257de0; --slot-2: #f47230; --slot-3: #00b894; --slot-4: #f2a600; --slot-5: #ee7fac;
+  --ph-emerging: #0f8a7e; --ph-growing: #2f8a3a; --ph-peaking: #b26b00; --ph-declining: #8c5a3c;
+  --ph-stable: #6b6963; --ph-reviving: #6741d9; --ph-volatile: #c2255c;
+  --warn: #b26b00; --danger: #b4418e;
+  --r-card: 12px; --r-chip: 999px;
+  --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 24px; --s-6: 32px;
+  --fs-body: 16px; --fs-2: 14px; --fs-cap: 13px; --fs-tile: 28px; --fs-hero: clamp(28px, 4vw, 32px);
+  --lh-body: 1.65; --lh-head: 1.3;
+  --content-max: 1120px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e0e0d; --surface: #1a1a19; --surface-2: #242422;
+    --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9c9a92;
+    --grid: #2a2a28; --axis: #46463f;
+    --border: rgba(240, 239, 236, .12); --border-strong: rgba(240, 239, 236, .22);
+    --accent: #5a9cea; --accent-ink: #0e0e0d; --focus: #5a9cea;
+    --c-hist: #3987e5; --c-fc: #e2683a; --c-trend: #a3a199; --c-anom: #c94f98;
+    --c-cp-fg: #0e0e0d;
+    --fc-region: rgba(226, 104, 58, .07);
+    --band95-op: .20; --band80-op: .34;
+    --up-kr: #ff6b6b; --down-kr: #6ea8fe; --up-intl: #45c46c; --down-intl: #f07a7a;
+    --slot-1: #338ced; --slot-2: #e76624; --slot-3: #00a888; --slot-4: #d28e05; --slot-5: #e24d8b;
+    --ph-emerging: #2fbfaf; --ph-growing: #5cc46a; --ph-peaking: #e0a030; --ph-declining: #c7916b;
+    --ph-stable: #9c9a92; --ph-reviving: #9b87f5; --ph-volatile: #f06595;
+    --warn: #e0a030; --danger: #c94f98;
+  }
+}
+:root[data-theme="dark"] {
+    --bg: #0e0e0d; --surface: #1a1a19; --surface-2: #242422;
+    --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9c9a92;
+    --grid: #2a2a28; --axis: #46463f;
+    --border: rgba(240, 239, 236, .12); --border-strong: rgba(240, 239, 236, .22);
+    --accent: #5a9cea; --accent-ink: #0e0e0d; --focus: #5a9cea;
+    --c-hist: #3987e5; --c-fc: #e2683a; --c-trend: #a3a199; --c-anom: #c94f98;
+    --c-cp-fg: #0e0e0d;
+    --fc-region: rgba(226, 104, 58, .07);
+    --band95-op: .20; --band80-op: .34;
+    --up-kr: #ff6b6b; --down-kr: #6ea8fe; --up-intl: #45c46c; --down-intl: #f07a7a;
+    --slot-1: #338ced; --slot-2: #e76624; --slot-3: #00a888; --slot-4: #d28e05; --slot-5: #e24d8b;
+    --ph-emerging: #2fbfaf; --ph-growing: #5cc46a; --ph-peaking: #e0a030; --ph-declining: #c7916b;
+    --ph-stable: #9c9a92; --ph-reviving: #9b87f5; --ph-volatile: #f06595;
+    --warn: #e0a030; --danger: #c94f98;
+}
+:root[data-updown="intl"] { --up: var(--up-intl); --down: var(--down-intl); }
+@media (max-width: 639px) { :root { --fs-tile: 24px; } }

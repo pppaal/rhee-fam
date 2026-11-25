@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import http.server
+import json
 import sys
 import re
+import threading
+import time
 import types
 
 import numpy as np
@@ -186,10 +190,20 @@ def test_only_malformed_items():
         fetch_wikipedia_pageviews("Python", lang="en", start="2020-01-01", end="2020-12-31", session=session)
 
 
-def test_missing_requests(monkeypatch):
+def test_wiki_falls_back_to_urllib_without_requests(monkeypatch):
+    """docs/WEB_SPEC.md B.3.1: without ``requests`` the stdlib UrllibSession is used (it used to raise
+    conn_need_requests)."""
     monkeypatch.setitem(sys.modules, "requests", None)
-    with pytest.raises(ConnectorError, match="pip install requests"):
-        fetch_wikipedia_pageviews("Python", lang="en", start="2020-01-01", end="2020-12-31")
+    used: list[str] = []
+
+    class RecordingSession(connectors.UrllibSession):
+        def get(self, url, headers=None, timeout=connectors.TIMEOUT):
+            used.append(url)
+            return connectors.HttpResponse(200, {}, json.dumps(_items(("2020010100", 5))).encode())
+
+    monkeypatch.setattr(connectors, "UrllibSession", RecordingSession)
+    s = fetch_wikipedia_pageviews("Python", lang="en", start="2020-01-01", end="2020-01-31")
+    assert len(used) == 1 and s.tolist() == [5.0]
 
 
 # --------------------------------------------------------------------------- Google Trends
@@ -368,3 +382,201 @@ def test_connector_errors_are_catalog_messages():
         fetch_wikipedia_pageviews("Foo", session=types.SimpleNamespace(
             get=lambda url, **kw: FakeResponse(status_code=404)))
     assert "article not found" in ei.value.text("en") and not re.search("[가-힣]", ei.value.text("en"))
+
+
+# --------------------------------------------------------------------------- web app: stdlib HTTP, weekly, UA
+
+
+class _EchoHandler(http.server.BaseHTTPRequestHandler):
+    def _send(self, status: int, body: bytes, content_type: str = "application/json") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("X-Test-Header", "Yes")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _echo(self, body: bytes = b"") -> bytes:
+        return json.dumps({"method": self.command, "path": self.path, "body": body.decode("utf-8"),
+                           "headers": {k.lower(): v for k, v in self.headers.items()}}, ensure_ascii=False).encode()
+
+    def do_GET(self):  # noqa: N802 - http.server API
+        if self.path == "/missing":
+            self._send(404, b'{"type": "not_found"}')
+        elif self.path == "/slow":
+            time.sleep(1.5)
+            self._send(200, b"late")
+        elif self.path == "/big":
+            self._send(200, b"x" * 5000, "text/plain")
+        else:
+            self._send(200, self._echo())
+
+    def do_POST(self):  # noqa: N802 - http.server API
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self._send(201, self._echo(body))
+
+    def log_message(self, *args):  # silence
+        pass
+
+
+class _QuietServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+
+    def handle_error(self, request, client_address):  # the /slow client hangs up early
+        pass
+
+
+@pytest.fixture
+def local_server(monkeypatch):
+    for var in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+    server = _QuietServer(("127.0.0.1", 0), _EchoHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+def test_urllib_session_get_post(local_server):
+    session = connectors.UrllibSession()
+    resp = session.get(local_server + "/hello?x=1", headers={"User-Agent": "ua-test", "X-Custom": "v"})
+    assert isinstance(resp, connectors.HttpResponse) and resp.status_code == 200
+    assert resp.headers["x-test-header"] == "Yes" and resp.headers["content-type"] == "application/json"
+    assert all(k == k.lower() for k in resp.headers)
+    echo = resp.json()
+    assert echo["method"] == "GET" and echo["path"] == "/hello?x=1"
+    assert echo["headers"]["user-agent"] == "ua-test" and echo["headers"]["x-custom"] == "v"
+    assert json.loads(resp.text) == echo and resp.content == resp.text.encode()
+    resp.raise_for_status()
+    resp = session.post(local_server + "/api", json={"키": "값", "n": [1, 2]}, headers={"X-A": "1"}, timeout=5)
+    echo = resp.json()
+    assert resp.status_code == 201 and echo["method"] == "POST"
+    assert json.loads(echo["body"]) == {"키": "값", "n": [1, 2]}
+    assert echo["headers"]["content-type"] == "application/json" and echo["headers"]["x-a"] == "1"
+    with pytest.raises(ValueError):
+        connectors.HttpResponse(200, {}, b"<html>").json()
+    with pytest.raises(ValueError):
+        session.get("file:///etc/passwd")
+
+
+def test_urllib_session_http_error_returned(local_server):
+    resp = connectors.UrllibSession().get(local_server + "/missing")
+    assert resp.status_code == 404 and resp.json() == {"type": "not_found"}
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        resp.raise_for_status()
+
+
+def test_urllib_session_timeout_raises(local_server):
+    t0 = time.perf_counter()
+    with pytest.raises(TimeoutError):
+        connectors.UrllibSession().get(local_server + "/slow", timeout=0.2)
+    assert time.perf_counter() - t0 < 1.4
+
+
+def test_urllib_session_size_limit_and_network_error(local_server):
+    with pytest.raises(OSError, match="response too large"):
+        connectors.UrllibSession(max_bytes=1000).get(local_server + "/big")
+    assert len(connectors.UrllibSession(max_bytes=5000).get(local_server + "/big").content) == 5000
+    import socket
+
+    with socket.socket() as sock:   # a port that was free a moment ago: nothing listens there
+        sock.bind(("127.0.0.1", 0))
+        free_port = sock.getsockname()[1]
+    with pytest.raises(OSError):    # connection refused -> URLError, an OSError
+        connectors.UrllibSession().get(f"http://127.0.0.1:{free_port}/", timeout=2)
+
+
+def _daily(start: str, end: str, value=lambda d: d.day) -> dict:
+    days = pd.date_range(start, end, freq="D")
+    return {"items": [{"timestamp": f"{d:%Y%m%d}00", "views": value(d)} for d in days]}
+
+
+def test_wiki_weekly_aggregation(pinned_today):
+    # the API answers daily data from Wednesday 2024-01-03 to Wednesday 2024-01-24: only the complete
+    # Monday-Sunday weeks 01-08..01-14 and 01-15..01-21 are kept, indexed by their Monday
+    session = FakeSession(FakeResponse(200, _daily("2024-01-03", "2024-01-24")))
+    s = fetch_wikipedia_pageviews("Python", lang="en", start="2024-01-01", end="2024-01-28",
+                                  granularity="weekly", session=session)
+    url = session.calls[0]["url"]
+    assert "/daily/2024010100/2024012800" in url   # start snapped to Monday 01-01, end to Sunday 01-28
+    assert list(s.index) == [pd.Timestamp("2024-01-08"), pd.Timestamp("2024-01-15")]
+    assert (s.index.dayofweek == 0).all() and s.index.name == "date" and s.name == "Python"
+    assert s.tolist() == [float(sum(range(8, 15))), float(sum(range(15, 22)))]
+    # request bounds are snapped: Wednesday..Wednesday asks for Monday 01-08 .. Sunday 01-21
+    session = FakeSession(FakeResponse(200, _daily("2024-01-08", "2024-01-21", lambda d: 1)))
+    s = fetch_wikipedia_pageviews("Python", lang="en", start="2024-01-03", end="2024-01-24",
+                                  granularity="weekly", session=session)
+    assert "/daily/2024010800/2024012100" in session.calls[0]["url"]
+    assert s.tolist() == [7.0, 7.0]
+    # a day without views inside a week is missing from the API answer: it counts as 0
+    payload = _daily("2024-01-08", "2024-01-21", lambda d: 1)
+    del payload["items"][3]
+    s = fetch_wikipedia_pageviews("Python", lang="en", start="2024-01-08", end="2024-01-21",
+                                  granularity="weekly", session=FakeSession(FakeResponse(200, payload)))
+    assert s.tolist() == [6.0, 7.0]
+    # default end = the last Sunday before today (2026-11-11 is a Wednesday)
+    session = FakeSession(FakeResponse(200, _daily("2026-10-26", "2026-11-08")))
+    fetch_wikipedia_pageviews("Python", lang="en", start="2026-10-26", granularity="weekly", session=session)
+    assert session.calls[0]["url"].endswith("/daily/2026102600/2026110800")
+    # less than one complete week
+    with pytest.raises(ConnectorError) as ei:
+        fetch_wikipedia_pageviews("Python", lang="en", start="2024-01-03", end="2024-01-06",
+                                  granularity="weekly", session=FakeSession(FakeResponse(200, _daily(
+                                      "2024-01-03", "2024-01-06"))))
+    assert ei.value.code == "conn_start_after_end"
+    with pytest.raises(ConnectorError) as ei:
+        fetch_wikipedia_pageviews("Python", lang="en", start="2024-01-01", end="2024-01-14",
+                                  granularity="weekly", session=FakeSession(FakeResponse(200, _daily(
+                                      "2024-01-03", "2024-01-09"))))
+    assert ei.value.code == "conn_wiki_empty"
+
+
+def test_wiki_weekly_accepts_dates_from_period_bounds(pinned_today):
+    start, end = connectors.period_bounds("all", "week", dt.date(2026, 11, 11), connectors.WIKI_EARLIEST)
+    session = FakeSession(FakeResponse(200, _daily("2016-01-04", "2016-01-17")))
+    s = fetch_wikipedia_pageviews("Python", lang="en", start=start, end=end, granularity="weekly", session=session)
+    assert session.calls[0]["url"].endswith("/daily/2016010400/2026110800") and len(s) == 2
+
+
+def test_wiki_user_agent_param(pinned_today):
+    session = FakeSession(FakeResponse(200, _items(("2020010100", 1))))
+    ua = connectors.user_agent("https://trendai.example", "ops@example.com")
+    fetch_wikipedia_pageviews("Python", lang="en", start="2020-01-01", end="2020-01-31", session=session,
+                              user_agent=ua)
+    assert session.calls[0]["headers"] == {"User-Agent": "trendai-web/0.1.0 (+https://trendai.example; "
+                                                         "ops@example.com)"}
+    fetch_wikipedia_pageviews("Python", lang="en", start="2020-01-01", end="2020-01-31", session=session)
+    assert session.calls[1]["headers"] == {"User-Agent": USER_AGENT}
+
+
+def test_wiki_timeout_code():
+    class ReadTimeout(Exception):   # requests.exceptions.ReadTimeout-like
+        pass
+
+    for exc in (TimeoutError("timed out"), ReadTimeout("read timed out"),
+                connectors.urllib.error.URLError(TimeoutError("timed out"))):
+        with pytest.raises(ConnectorError) as ei:
+            fetch_wikipedia_pageviews("Python", lang="en", start="2020-01-01", end="2020-12-31",
+                                      session=FakeSession(exc=exc))
+        assert ei.value.code == "conn_timeout"
+        assert ei.value.text("en") == "The Wikimedia API did not answer within 20 s."
+    with pytest.raises(ConnectorError) as ei:
+        fetch_wikipedia_pageviews("Python", lang="en", start="2020-01-01", end="2020-12-31",
+                                  session=FakeSession(exc=ConnectionResetError("reset")))
+    assert ei.value.code == "conn_network"
+
+
+def test_user_agent_format():
+    assert connectors.user_agent() == "trendai-web/0.1.0"
+    assert connectors.user_agent("https://trendai.example", "ops@example.com") == \
+        "trendai-web/0.1.0 (+https://trendai.example; ops@example.com)"
+    assert connectors.user_agent(public_url="https://t.example") == "trendai-web/0.1.0 (+https://t.example)"
+    assert connectors.user_agent(contact="ops@example.com") == "trendai-web/0.1.0 (ops@example.com)"
+    assert connectors.user_agent("", "  ") == "trendai-web/0.1.0"
+    # non-printable / non-ASCII characters (header injection, Hangul) are dropped
+    assert connectors.user_agent("https://t.example\r\nX-Evil: 1", "운영 ops@example.com") == \
+        "trendai-web/0.1.0 (+https://t.exampleX-Evil: 1; ops@example.com)"
+    import trendai
+    assert connectors.user_agent().endswith(trendai.__version__)

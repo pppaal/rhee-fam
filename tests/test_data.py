@@ -515,6 +515,9 @@ def test_message_catalog_renders_every_code_in_both_languages():
         # connectors.ConnectorError (R5-REV-5)
         "lang": "'k o'", "choices": "('daily', 'monthly')", "start": "2024-05-01", "end": "2024-01-01",
         "status": 503, "url": "https://example.org/x", "title": "Foo", "kind": "ImportError", "kw": "foo",
+        # web app codes (docs/WEB_SPEC.md C.12)
+        "param": "range", "group": "g1", "max_mb": 10, "retry_after": 30, "limit": 20, "fetched": "2026.11.25",
+        "terms": "‘sunscreen’", "region": "KR", "span": MS.L("104주", "104 weeks"),
     }
     for code, (ko, en) in MS.MESSAGES.items():
         names = {f for t in (ko, en) for _, f, _, _ in __import__("string").Formatter().parse(t) if f}

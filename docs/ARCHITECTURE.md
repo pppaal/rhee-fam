@@ -13,8 +13,10 @@ and connector messages (`DataError` / `DataWarning` / `DataNotice` /
 Korean, and `str(exc)` of those exceptions stays Korean (`exc.text('en')`
 gives the English text).
 
-Runtime deps: `numpy`, `pandas` only. Optional: `anthropic` (Claude narrative /
-Q&A), `requests` / `pytrends` (online connectors), `openpyxl` / `xlrd` (Excel
+Runtime deps: `numpy`, `pandas` only (the web app in `trendai/web/` adds none:
+it is a stdlib WSGI server). Optional: `anthropic` (Claude narrative /
+Q&A), `requests` / `pytrends` (online connectors; the Wikipedia and Naver
+connectors fall back to the stdlib `UrllibSession`), `openpyxl` / `xlrd` (Excel
 files). Python >= 3.10, pandas 3.x compatible (pandas 3 may store datetimes at
 `us` resolution: never use `.asi8` or assume ns). Everything is deterministic:
 no randomness, no clock in the analysis, forecasting or rendering paths.
@@ -39,6 +41,7 @@ pipeline.run() = all of the above ─────────────► Tre
 report.render_text() / render_html() ──────────► terminal summary / self-contained HTML page
 compare.rank_trends() + report.render_compare_html() ► ranking table / comparison page
 cli.py exposes everything as `python -m trendai <command>` (also the `trendai` script)
+trendai/web/ (`trendai serve`) ─ JSON API + single-page app over pipeline.run() and the exports above
 ```
 
 ---
@@ -157,8 +160,13 @@ class DataWarning(Localised, UserWarning)  # data was repaired (values dropped, 
 class DataNotice(Localised, UserWarning)   # how the input was interpreted (ignored columns, date order...)
 
 def load_table(path, date_col=None, value_cols=None) -> dict[str, pd.Series]       # raw series
+def read_table_bytes(raw, filename, *, max_columns=None) -> RawTable                # in memory, no detection
+def load_table_bytes(raw, filename, date_col=None, value_cols=None) -> dict[str, pd.Series]
+class RawTable;  class GoogleTrendsInfo     # frame + format/encoding/decimal_comma + Google Trends layout
 def frame_to_series(df, date_col=None, value_cols=None, *, decimal=None,
                     prefer_decimal_comma=False) -> dict[str, pd.Series]
+def collect_notices() -> ContextManager[list[Warning]]   # per-thread notice capture (ContextVar)
+def emit_notice(message, category=DataWarning, stacklevel=2) -> None
 def parse_dates(col, name_hint=True, allow_epoch=True) -> tuple[pd.Series | None, str, str | None]
 def parse_numbers(col, decimal=None, prefer_decimal_comma=False) -> tuple[pd.Series, int, list[str]]
 def prepare(series, freq=None, name=None, how="mean") -> tuple[pd.Series, str]
@@ -222,6 +230,28 @@ PANDAS_FREQ, FREQ_KO
   `messages.Msg` (a `str` subclass). Numbers inside the messages use
   `numfmt` (thousands separators, U+2212 minus; the numeric-index bounds no
   longer use Python's `:g` format).
+* **Notice capture** (for the web app): every data notice and warning goes
+  through `emit_notice`, the single emission point. Outside a
+  `collect_notices()` block it is `warnings.warn(message, category,
+  stacklevel)` with the same caller line as before; inside one it is appended
+  to that block's list instead and `warnings` never sees it. The sink is a
+  `ContextVar`, so the capture is per thread and touches no process-global
+  `warnings` state (`warnings.catch_warnings` swaps global state and mixes
+  threads on Python 3.12/3.13). Blocks nest.
+* `read_table_bytes` parses bytes entirely in memory (Excel from `BytesIO` with
+  native cell types; `max_columns` refuses a too-wide header with
+  `table_too_many_columns` before the full parse) and returns a `RawTable`
+  (`frame`, `format`, `encoding`, `decimal_comma`, `google_trends`). Google
+  Trends CSV exports are recognised by their layout (an optional
+  `Category:` / `카테고리:` line, `term: (region)` headers or a pytrends
+  `isPartial` column): `<1` is read as 0.5 and the `gt_detected` /
+  `gt_lt1_half` notices are emitted; `load_table_bytes` adds
+  `attrs['trendai'] |= {'source': 'google_trends_upload', 'term', 'region',
+  'value_kind': 'relative_index_gt'}`. `load_table(path)` reads the file's
+  bytes and delegates (identical series, attrs and notices). `frame_to_series`
+  adds `attrs['trendai']['date_cols']` (the real column names the dates came
+  from: `['연도', '월']`, `['날짜']`, `[]` for a wide table) and makes repeated
+  series names unique (`A`, `A (2)`, `A (3)`).
 * Weekly series keep the weekday they were recorded on, and
   `future_index(last, 'W', h)` continues on `last.weekday()`.
   `PANDAS_FREQ['W']` is only the default anchor (`W-SUN`): build weekly dates
@@ -821,6 +851,7 @@ class NarrativeUnavailable(RuntimeError)
 def rule_based_narrative(analysis, forecast, outlook, lang="ko") -> str
 def build_llm_payload(analysis, forecast, outlook) -> dict
 def llm_narrative(analysis, forecast, outlook, lang="ko", model=DEFAULT_MODEL, client=None) -> str
+def llm_narrative_from_payload(payload, lang="ko", model=DEFAULT_MODEL, client=None) -> str
 def generate_narrative(analysis, forecast, outlook, use_llm=False, lang="ko",
                        model=DEFAULT_MODEL, client=None) -> tuple[str, str]   # (text, 'llm'|'rule')
 def ask(report, question, lang="ko", model=DEFAULT_MODEL, client=None) -> str
@@ -1122,24 +1153,55 @@ PHASE_EN                                            # English phase names
   truncation and fallback `RuntimeWarning`s follow the language too.
   `generate_narrative(use_llm=True)` falls back to the rule-based text with a
   `RuntimeWarning` (source `'rule'`). Tests mock the client — no network.
+* `llm_narrative_from_payload(payload, lang, model, client)` makes exactly the
+  prompt and call of `llm_narrative` from a stored `build_llm_payload` dict;
+  `llm_narrative` builds the payload and delegates to it. The web app's AI job
+  uses it on the payload it stored with the result (never for Naver results).
 
 ## connectors.py — online data (optional)
 
 ```python
-class ConnectorError(Localised, RuntimeError);  USER_AGENT;  WIKIMEDIA_PAGEVIEWS;  DEFAULT_START = "20160101"
+class ConnectorError(Localised, RuntimeError)      # .log_detail: upstream detail for operator logs (or None)
+USER_AGENT;  TIMEOUT = 20;  NAVER_HUB_URL;  NAVER_LEGACY_URL;  NAVER_EARLIEST;  WIKI_EARLIEST
+NAVER_MAX_GROUPS = 5;  NAVER_MAX_KEYWORDS = 5;  NAVER_AGE_CODES
+class HttpResponse;  class UrllibSession           # stdlib .get/.post (status returned, OSError raised)
+def user_agent(public_url=None, contact=None) -> str   # 'trendai-web/0.1.0 (+https://…; ops@…)'
+def period_bounds(range_spec, unit, today, earliest=NAVER_EARLIEST) -> tuple[date, date]
+class NaverCredentials (.from_env(), masked repr);  class NaverGroup;  class NaverResult
+def build_naver_body(groups, start, end, time_unit, device=None, gender=None, ages=()) -> dict
+def naver_cache_key(groups, start, end, time_unit, device=None, gender=None, ages=()) -> str
+def fetch_naver_search_trend(groups, start, end, time_unit="week", device=None, gender=None, ages=(), *,
+                             credentials, session=None, ...) -> NaverResult
 def wikipedia_pageviews_url(article, lang="ko", start=None, end=None, granularity="monthly") -> str
 def fetch_wikipedia_pageviews(article, lang="ko", start=None, end=None, granularity="monthly",
-                              session=None) -> pd.Series
+                              session=None, *, user_agent=None) -> pd.Series
 def fetch_google_trends(keyword, timeframe="today 5-y", geo="") -> pd.Series
 ```
 
-Wikimedia REST pageviews (`user` agent type, all access, `monthly`/`daily`,
-default 2016-01-01 to the last complete month/day), via `requests` or any
-object with a compatible `.get`; Google Trends via the optional `pytrends`.
-Generic User-Agent, no personal data, 20 s timeout; every failure is a
-`ConnectorError` that says what to do, raised with a catalog message (codes
-`conn_*` in `messages.MESSAGES`): Korean `str(exc)`, English `exc.text('en')`
-(the CLI's `wiki` / `trends` follow `--lang`). Both return raw series.
+Wikimedia REST pageviews (`user` agent type, all access, `monthly`/`daily`/
+`weekly` — weekly sums complete Monday–Sunday weeks of daily data, Monday
+index), default 2016-01-01 to the last complete month/day, via `requests`,
+any object with a compatible `.get`, or the stdlib `UrllibSession` when
+`requests` is missing; Google Trends via the optional `pytrends`.
+The CLI keeps the generic User-Agent; the web app passes
+`user_agent(public_url, contact)`. 20 s timeout (`conn_timeout`); every
+failure is a `ConnectorError` that says what to do, raised with a catalog
+message (codes `conn_*` in `messages.MESSAGES`): Korean `str(exc)`, English
+`exc.text('en')` (the CLI's `wiki` / `trends` follow `--lang`). Both return raw
+series.
+
+**Naver DataLab search trend** (web app only): one POST to NAVER API HUB
+(`X-NCP-APIGW-API-KEY-ID` / `X-NCP-APIGW-API-KEY`) or, when only the legacy
+Developers keys are set, `openapi.naver.com/v1/datalab/search`
+(`NaverCredentials.from_env`: HUB first, partial pairs ignored). At most 5
+groups of at most 5 keywords; `period_bounds` snaps weeks to Monday–Sunday and
+always ends at the last *completed* period; results are matched to groups by
+position and title; a trailing incomplete bucket is dropped and missing buckets
+are re-gridded to 0 (`NaverResult.filled`). `series.attrs['trendai_source']`
+carries the request conditions. HTTP failures map to the `conn_naver_*` codes;
+keys never appear in any text (`log_detail` holds the upstream `errorCode` /
+message, at most 200 characters). `UrllibSession` keeps no state between calls,
+so one instance is shared by every thread.
 
 ## report.py — presentation
 
@@ -1364,7 +1426,7 @@ only `data`, `numfmt` and `types`, `forecast` only `models`, `analysis` and
 
 ```python
 def run(series, name=None, freq=None, horizon=None, levels=(80, 95), use_llm=False, lang="ko",
-        model="claude-opus-5-5", candidates=None, client=None) -> TrendReport
+        model="claude-opus-5-5", candidates=None, client=None, on_stage=None) -> TrendReport
 def run_many(series_map, errors=None, **kwargs) -> dict[str, TrendReport]
 class SeriesFailedWarning(Localised, UserWarning)   # code 'series_failed'
 def report_to_dict(report, lang="ko") -> dict
@@ -1374,7 +1436,13 @@ MAX_HORIZON = 10_000
 
 `run`: prepare → analyze → auto_forecast (of `analysis.series`, with
 `random_walk=is_random_walk(analysis)`) → compute_outlook →
-generate_narrative. A built-in sample's mark (`samples.SYNTHETIC_ATTR`) is
+generate_narrative. `on_stage(name)`, when given, is called immediately
+before each step (`"prepare"`, `"analyze"`, `"forecast"`, `"outlook"`,
+`"narrative"`); an exception it raises propagates unchanged (the web app uses
+it for progress, cancellation and time-outs). Without it the output is
+unchanged. The `horizon_long` warning goes through `data.emit_notice`, so it is
+a normal `DataWarning` outside a `collect_notices()` block and collected inside
+one. A built-in sample's mark (`samples.SYNTHETIC_ATTR`) is
 copied to `analysis.series.attrs`. The default horizon (`data.default_horizon(freq)`) is
 resolved before the horizon checks, so it gets the same checks and warnings
 as an explicit one. `DataError` for a horizon that is not a whole number
@@ -1474,6 +1542,22 @@ a note) and answers with Claude (exit 1 if Claude is unavailable).
   `TRENDAI_DEBUG=1` for the traceback), `2` input error (`DataError`, missing
   file, bad sample name, nothing to compare, every series failing with a
   `DataError`, argparse errors), `130` interrupted.
+* `serve [--host] [--port] [--data-dir] [--dev] [--lang]` (`cmd_serve`) runs
+  the web app. It imports `trendai.web` lazily and, inside `main`'s
+  `catch_warnings` block, installs the web warnings baseline
+  (`web.install_warning_baseline()`, overriding the CLI filters for the
+  process), builds `WebConfig.from_env(**flags)` (flags > `TRENDAI_*` > defaults),
+  calls `validate_public()` (a public bind without `TRENDAI_CONTACT` → exit 2
+  with the Korean/English B.5 message), configures logging
+  (`web.log.basic_config`), builds the app, and runs
+  `web.server.serve_forever(app, host, port, on_ready=…)`; the ready callback
+  prints `trendai 웹 앱: {url} (Ctrl+C로 종료)` (flushed) and the start-up notes
+  (no contact on loopback, no Naver keys, `TRENDAI_TRUST_PROXY` without
+  `TRENDAI_PUBLIC_URL`) to stderr. A port that cannot be opened → exit 1
+  (`오류: 127.0.0.1:8000을 열 수 없습니다 — 이미 다른 프로그램이 이 포트를 쓰고 있습니다`,
+  the particle by `messages.josa`); after a graceful stop the command flushes
+  and calls `os._exit(0)`, so no job thread can hold the process. `--port`
+  takes 0–65535 (0 = any free port, the real one is printed).
 
 ## numfmt.py — number notation
 
@@ -1500,12 +1584,17 @@ def msg(code, **params) -> Msg;  join(*msgs) -> Msg | None;  render(code, params
 def localise(obj, lang="ko") -> str        # an exception / warning / Msg in lang
 class Localised                            # mixin: .code, .params, .text(lang); str() stays Korean
 def unit(freq) -> L;  format_label(label, lang="ko") -> str;  FREQ_EN
+WEB_OVERRIDES: dict[str, tuple[str, str]]  # web wording (해요체, no CLI flags / Python) of library codes
+def render_web(code, params=None, lang="ko") -> str;  render_web_msg(m, lang="ko") -> str
+def josa(word, pair) -> str                # '번호'+'은/는' -> '번호'는; 104주+'으로/로' -> 104주로
+def fix_label(action, lang="ko") -> str    # button label of a fix action ('fix_<action>' codes)
 ```
 
 The texts of `DataError` / `DataWarning` / `DataNotice` (data.py), of
 `pipeline.SeriesFailedWarning` and of `connectors.ConnectorError` (codes
-`conn_*`) come from this catalog (83 codes, e.g. `upsampled` for a `--freq`
-finer than the data). Library users see the
+`conn_*`) come from this catalog (184 codes: the library's own, e.g. `upsampled` for a
+`--freq` finer than the data, plus the web app's error, notice and fix-action codes of
+`docs/WEB_SPEC.md` C.12). Library users see the
 Korean text (`str(exc)`); the CLI renders the same message in `--lang`
 (`localise(exc, lang)` / `exc.text('en')`). A parameter that is itself a `Msg`
 (the reason inside "could not be analysed — …") is rendered in the same
@@ -1514,7 +1603,99 @@ language, and an `L(ko, en)` parameter carries its own particle
 connector messages give a short reason and what to do
 (`conn_network`: `… 인터넷 연결(회사망이면 프록시 설정)을 확인한 뒤 다시
 시도하세요. (자세한 오류: ProxyError: …)`, the detail cut to 120 characters).
-Imports nothing of the package.
+`render` output of the library codes is unchanged; the web app never shows it
+directly but uses `render_web` / `render_web_msg`, which take `WEB_OVERRIDES`
+where a library text names command-line flags or Python, render every part of a
+joined message and nested `Msg` / `L` parameters in the same language, quote
+list parameters as `‘a’, ‘b’` and choose Korean particles after a parameter
+(`josa`). Imports nothing of the package.
+
+## web/ — web app
+
+`trendai serve` (or `trendai.web.wsgi:application` under gunicorn/waitress)
+runs a single-process stdlib WSGI app: a JSON API, asynchronous analysis jobs,
+an on-disk store and a single-page frontend without a build step. The binding
+contract is `docs/WEB_SPEC.md` (sections B.3 Python signatures, C HTTP API, D
+view models); operators read `docs/WEB.md`. No runtime dependency beyond
+numpy/pandas (`openpyxl` enables the Excel export, `anthropic` the AI
+narrative).
+
+```python
+# trendai/web/__init__.py (names resolved lazily: importing the package starts nothing)
+create_app(config=None, *, fetchers=None, clock=None) -> TrendaiApp   # WSGI callable; .close(timeout)
+WebConfig.from_env(environ=os.environ, **overrides);  .is_public();  .validate_public()
+install_warning_baseline()                                           # process owners only
+# trendai/web/server.py
+make_server(app, host, port);  serve_forever(app, host, port, *, on_ready=None) -> int
+start_background(app, host="127.0.0.1", port=0) -> (server, thread, base_url)
+```
+
+| Module | Role |
+|---|---|
+| `config.py` | `WebConfig` (frozen; every `TRENDAI_*` variable of WEB_SPEC E.1, no secrets) |
+| `app.py` | app factory, ordered route table (E.3), request wrapper (request id, security headers, error envelope, `HEAD`, gzip, access log), static/SPA handlers, sweeper thread |
+| `http.py` · `errors.py` | request/response helpers, Origin check, strict JSON (`allow_nan=False`); `WebError`, the C.12.1 envelope and the `ConnectorError` / `DataError` → web code mapping |
+| `api.py` | handlers of C.1–C.11 (health, config, samples, upload, analyze, jobs, results, share, shared, exports, narrative) |
+| `jobs.py` | `JobManager`: analysis pool (`workers` running + `max_queued` waiting) and AI pool (2 + 4), in-flight joining of identical queries, subscriber counts for cancellation, time-outs at stage boundaries, snapshots with `since` |
+| `analyze.py` | the analyze job (E.6): request normalisation, unique display names, Naver (wire names `g1`…`g5`, single-flight fetch, cache, budget), Wikipedia (cache), samples, uploads; per series `prepare` → `pipeline.run(on_stage=…)` → view models, exports, LLM payload, HTML; ranking and compare view model |
+| `uploads.py` | multipart / paste parsing in memory (`email.parser`, no `cgi`), zip-bomb guard, table limits, column detection and preview, 30-minute in-memory upload cache, 2 parse slots |
+| `store.py` | the disk store (E.7): atomic `0600` writes, paths only from validated ids, lazy expiry, sweeper (TTL, size eviction) |
+| `ratelimit.py` · `budget.py` | per-IP token buckets (C.13); Naver monthly budget (KST month, reserved before the call, 80 %/90 % states) and AI daily cap |
+| `fetchers.py` | `Fetchers(naver, naver_endpoint, wiki, llm)`, injectable; `default_fetchers(config)` builds the real connectors and the Claude client |
+| `narrative_ai.py` | the AI narrative job (C.11) over the stored LLM payload |
+| `viewmodel.py` · `fmt.py` · `texts.py` · `exports.py` · `vm.schema.json` | series/compare view models per language (D), Korean/English number and date formatting (mirrored by `static/js/fmt.js`), server texts, CSV/XLSX/JSON/HTML export serializers, the machine-readable VM contract |
+| `static_files.py` | static index built once at start-up (only indexed paths are served; `dev/` only with `--dev`) |
+| `log.py` · `server.py` · `wsgi.py` | loggers, daily-salted IP hashes, message-free exception logging, the warnings baseline; threaded `wsgiref` server with graceful drain; the lazy WSGI entry point |
+| `testing.py` | `TestClient`, `FakeNaver` / `FakeWiki` / `fake_llm`, `FrozenClock`, `make_test_app` (hermetic), the stdlib schema validator |
+| `static/` | the single-page app: vanilla ES modules and CSS (`js/pages`, `js/views`, `js/components`, `js/chart`), catalog `js/catalog.js`, self-hosted Pretendard 1.3.9; `static/dev/` (fixtures, `mock.html`) is excluded from the wheel |
+
+**Request and job flow.** `POST /api/analyze` validates the query, takes an
+`analyze` token, then answers `200 cached` (fresh result for the same
+result-cache key), `202 joined` (an identical job is queued or running) or
+`202` with a new job (`job_id == result_id`). The job walks the stages `data`
+→ `series` → `finish`; the SPA polls `GET /api/jobs/<id>?since=k` (≈ 500 ms),
+receives each finished series' view model as it completes, and fetches
+`GET /api/results/<id>?hl=…` at the end. `DELETE /api/jobs/<id>` drops one
+subscriber; the job is cancelled when none is left. Uploads are parsed
+synchronously by `POST /api/upload` (confirm step), cached in memory, and
+analysed by reference (`upload_id`); raw bytes are never written to disk.
+Shares (`POST /api/share`, uploads only) copy the stored result into
+`shares/<sid>/` without its `result_id`; the delete token is stored hashed.
+
+**Store** (`TRENDAI_DATA_DIR`): `results/<id>/` (result.json with export
+availability, `vm-ko/en.json`, `export-ko/en.json`, HTML reports, LLM payloads,
+`ai/`), `shares/<sid>/`, `cache/naver` (≤ 21 days), `cache/wiki`,
+`cache/results`, `budget/`. Results and shares carry `schema` =
+`viewmodel.WEB_VM_SCHEMA`; a different value reads as absent. Stored view
+models hold no URLs or ids: export links are added per response.
+
+**Limits.** Per-IP token buckets (`analyze`, `upload`, `naver`, `ai`, `share`,
+`export`, `poll` per job, `read`), executor caps (`503 server_busy` with
+`Retry-After`), the Naver monthly budget, the AI daily cap, 2 concurrent upload
+parses, body limits checked before reading, a 30 MB zip guard and table-size
+limits.
+
+**Notices and threads.** Request threads only parse uploads; analyses run on
+the job pools. Every call that must capture data notices (`read_table_bytes`,
+`frame_to_series`, `prepare`) runs inside `data.collect_notices()`, and
+`pipeline.run` runs inside a *discarded* block, so notices never cross threads
+and `warnings` state is never touched by the app. The process owner (`trendai
+serve`, `wsgi.application`, the E2E server) calls
+`install_warning_baseline()` (ignore every warning category) once; the sweeper
+re-asserts it. `create_app` holds no module-level state, so several apps can
+live in one process (tests).
+
+**Engine hooks** used by the web app: `pipeline.run(..., on_stage=)`,
+`data.emit_notice` / `collect_notices`, `data.read_table_bytes` /
+`load_table_bytes`, `narrative.llm_narrative_from_payload`,
+`connectors.fetch_naver_search_trend` / `period_bounds` / `user_agent` /
+`UrllibSession`, `messages.render_web` / `render_web_msg` / `josa`. None of them
+changes the library's or the CLI's behaviour.
+
+**Security headers and logs**: a strict CSP and the other E.12 headers on every
+response (no inline script or style in `static/`); access lines carry the route
+template, a hashed IP, status, time and size — never terms, query strings, file
+names, bodies, header values, full ids or keys.
 
 ## Cross-module private dependencies
 
@@ -1541,6 +1722,18 @@ the de-facto contract (rename only together):
   `report._change_undefined_short` (the ranking notes), all lazily.
 * `compare.expected_change_annualised` follows compute_outlook's window rule
   (`k_cur = min(m, n)`, `k_fut = min(m, h)`).
+* `web.viewmodel` imports from `report`, lazily, the helpers that word
+  undefined values exactly like the HTML report (WEB_SPEC E.18):
+  `report._ChartData(report)` (argument of the others),
+  `_change_basis` / `_change_basis_en` (hero basis and level names),
+  `_change_undefined(report, d, lang)` (`.code`, `.short`, `.sentence`,
+  `.levels`: undefined expected change), `_pct_why(code, key, lang)`
+  (undefined recent change), `_rate_why(report, code, lang)` (undefined
+  momentum / volatility) and `_recent_lag(report, n)` (recent-change basis).
+  It also mirrors, without importing them, the narrative's peak-season rule
+  (`narrative._seasonal_pattern`: condition, grouping, weekday names) and the
+  15-significant-digit JSON rule of `pipeline._clean`; change those together
+  with `trendai/web/viewmodel.py` (and bump `WEB_VM_SCHEMA`).
 
 Public cross-module imports (the shared rules; `report` keeps no copy of a
 `narrative` / `analysis` rule: its former `_MOVING_PHASES`, `_trend_drawdown`,
@@ -1574,12 +1767,23 @@ imports `data` and `numfmt`; `forecast` imports `models`, `analysis` and
 imports `analysis`, `data`, `forecast` and `narrative`; `report` imports
 `analysis`, `data`, `narrative` and `numfmt`; `connectors` imports
 `messages`; `pipeline` imports `analysis`, `data`, `forecast`, `messages`,
-`narrative` and `samples`; `cli` imports `data` and `messages` (the rest
-lazily). `forecast` imports neither `narrative`, `report` nor `compare`, and
+`narrative` and `samples`; `cli` imports `data` and `messages` (the rest, including `trendai.web`,
+lazily). In `trendai.web`, `analyze`, `api`, `errors` and `uploads` import
+`data`, `connectors` and `messages` at module level and everything else
+(`pipeline`, `narrative`, `report`, `compare`, `samples`) inside functions;
+`fmt`, `texts` and `viewmodel` import no engine module at import time. No
+engine module imports `trendai.web`. `forecast` imports neither `narrative`, `report` nor `compare`, and
 `narrative`, `report` and `cli` import it lazily, so there is no cycle.
 
 ## Known gaps
 
+* Web app: the MVP deferrals (backtest window count in the accuracy line,
+  number-to-tile links in the narrative, share expiry extension, Naver DataLab
+  Excel uploads, plain-word phase reasons, …) are listed with their reasons in
+  `docs/WEB_SPEC.md` A.2; the unverified Naver/Wikimedia facts and the safe
+  choices taken are in A.5, and the legal points to confirm before a public
+  launch in `docs/WEB.md`. The app is single-process by design (in-memory job
+  registry, upload cache and rate limiter).
 * The HTML pages are Korean only (`--lang en` changes the narrative inside them,
   not the page chrome). The argparse help texts (`--help`) and the generated
   name `행N` of an unlabelled row of a wide table are Korean too.
@@ -1629,10 +1833,22 @@ lazily). `forecast` imports neither `narrative`, `report` nor `compare`, and
 
 ## Tests
 
-`python -m pytest -o addopts="" -q` (about 1,450 tests, ~3 min). Each module
+`python -m pytest -o addopts="" -q` (about 2,000 Python tests, ~6 min). Each module
 has its own test file (`tests/test_<module>.py`, plus `test_connectors.py`);
 `tests/conftest.py` provides a hand-built `fake_report` fixture. Tests never
-touch the network (the Claude client and HTTP sessions are mocked).
+touch the network (the Claude client and HTTP sessions are mocked; the web
+tests use `trendai.web.testing`'s fakes and hermetic `make_test_app`).
+
+Web app: `tests/test_web_*.py` (backend, view models, formatting, exports),
+`tests/test_connectors_naver.py`, `test_data_gtrends.py`, `test_data_notices.py`,
+`test_messages_web.py` (data layer), `tests/test_cli_serve.py` (`trendai serve`
+in subprocesses: help, start-up notes, exit codes 0/1/2, drain, second signal),
+`tests/test_packaging.py` (package data, fonts, dependencies, lazy WSGI, Docker
+files). Frontend unit tests: `node --test tests/js` (Node 22). Browser E2E:
+`tests/e2e/` (Node `node:test` + the global Playwright, 14 WEB_SPEC H.4.3
+scenarios plus 9b and a Google Trends upload, each against its own
+`tests/e2e/server.py` with fake fetchers), run by `tests/e2e/test_e2e.py`
+(marker `e2e`, skipped without node/playwright; it also runs `tests/js`).
 
 ## File ownership (historical)
 

@@ -11,14 +11,14 @@ import datetime as _dt
 import json
 import math
 import warnings
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 import pandas as pd
 from pandas.errors import OutOfBoundsDatetime
 
 from .analysis import analyze
-from .data import DataError, DataWarning, default_horizon, future_index, prepare
+from .data import DataError, DataWarning, default_horizon, emit_notice, future_index, prepare
 from .forecast import auto_forecast, compute_outlook, is_random_walk, outlook_levels
 from .messages import Localised, Msg, msg
 from .narrative import direction_label, generate_narrative, is_synthetic, metric_pct_undefined, prob_undefined
@@ -31,7 +31,8 @@ DEFAULT_LLM_MODEL = "claude-opus-5-5"
 def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = None,
         horizon: Optional[int] = None, levels: tuple[int, ...] = (80, 95),
         use_llm: bool = False, lang: str = "ko", model: str = DEFAULT_LLM_MODEL,
-        candidates: Optional[list[str]] = None, client: Any = None) -> TrendReport:
+        candidates: Optional[list[str]] = None, client: Any = None,
+        on_stage: Optional[Callable[[str], None]] = None) -> TrendReport:
     """Analyse one series end to end and return a :class:`TrendReport`.
 
     Parameters
@@ -47,6 +48,12 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
     use_llm:
         Ask Claude to write the interpretation (falls back to the rule-based
         narrative when the SDK/credentials are unavailable).
+    on_stage:
+        Optional progress hook (the web app's job progress): ``on_stage(name)`` is called
+        immediately before each step -- ``"prepare"``, ``"analyze"``, ``"forecast"``,
+        ``"outlook"``, ``"narrative"``, in that order.  Exceptions it raises propagate
+        unchanged (the web app cancels a job this way).  ``None`` (the default) leaves the
+        behaviour and the output unchanged.
 
     The forecast is told when the analysis found a driftless random walk
     (:func:`trendai.forecast.is_random_walk`), so trend-extrapolating models
@@ -70,6 +77,8 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
         if h_int > MAX_HORIZON:
             raise DataError(msg("horizon_too_long", horizon=h_int, max=MAX_HORIZON))
         horizon = h_int
+    stage = on_stage if on_stage is not None else _no_stage
+    stage("prepare")
     s, f = prepare(series, freq=freq, name=name)
     if horizon is None:
         # resolve the default here, so that it gets the same checks and warnings as an explicit
@@ -77,16 +86,24 @@ def run(series: pd.Series, name: Optional[str] = None, freq: Optional[str] = Non
         horizon = default_horizon(f)
     _check_horizon(s, f, horizon)
     display_name = str(name if name is not None else (s.name if s.name is not None else "series"))
+    stage("analyze")
     analysis = analyze(s, freq=f, name=display_name)
     if is_synthetic_series(series):   # a built-in sample: every surface says it is synthetic
         analysis.series.attrs[SYNTHETIC_ATTR] = True
+    stage("forecast")
     forecast = auto_forecast(analysis.series, horizon=horizon, freq=f, levels=tuple(levels),
                              candidates=candidates, random_walk=is_random_walk(analysis))
+    stage("outlook")
     outlook = compute_outlook(analysis, forecast)
+    stage("narrative")
     text, source = generate_narrative(analysis, forecast, outlook, use_llm=use_llm, lang=lang,
                                       model=model, client=client)
     return TrendReport(name=display_name, analysis=analysis, forecast=forecast, outlook=outlook,
                        narrative=text, narrative_source=source)
+
+
+def _no_stage(name: str) -> None:
+    """The default ``on_stage`` hook of :func:`run`: does nothing."""
 
 
 #: longest horizon run() accepts (forecasting time grows faster than linearly with it)
@@ -97,7 +114,9 @@ _LONG_HORIZON_RATIO = 5
 
 def _check_horizon(s: pd.Series, freq: str, horizon: int) -> None:
     """Korean DataError if the forecast dates leave pandas' datetime range; DataWarning if the
-    horizon is far longer than the history."""
+    horizon is far longer than the history (through :func:`trendai.data.emit_notice`: a plain
+    ``warnings.warn`` with the same category, text and caller line, except inside a
+    ``data.collect_notices()`` block, which collects it instead)."""
     try:
         end = future_index(s.index[-1], freq, horizon)[-1]
     except (OutOfBoundsDatetime, OverflowError, ValueError):
@@ -106,8 +125,8 @@ def _check_horizon(s: pd.Series, freq: str, horizon: int) -> None:
         raise DataError(msg("horizon_out_of_range", horizon=horizon))
     n = len(s)
     if horizon > _LONG_HORIZON_RATIO * n:
-        warnings.warn(msg("horizon_long", horizon=horizon, n=n, ratio=_LONG_HORIZON_RATIO),
-                      DataWarning, stacklevel=3)
+        emit_notice(msg("horizon_long", horizon=horizon, n=n, ratio=_LONG_HORIZON_RATIO),
+                    DataWarning, stacklevel=3)
 
 
 class SeriesFailedWarning(Localised, UserWarning):

@@ -1,0 +1,2469 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "trendai/web/vm.schema.json",
+ "title": "trendai web view-model contract (WEB_VM_SCHEMA 1)",
+ "description": "Machine-readable twin of docs/WEB_SPEC.md section D (B.3.3). Entry points: #/$defs/seriesVM (D.2), #/$defs/compareVM (D.4), #/$defs/analyzeJob and #/$defs/narrativeJob (C.6 job snapshots, picked by 'kind'), #/$defs/resultEnvelope (C.7; also C.9 with 'shared'). The root validates a series VM. Keywords used (a subset): type (a name or an array of names; 'integer' and 'number' never match booleans), required, properties, additionalProperties (false only), items (one schema), enum, minItems, maxItems, $defs and $ref ('#/$defs/<name>'). Null rule: an instance that is null is valid when the schema's 'type' array contains 'null'; no other keyword of that schema is then checked (this is how nullable $ref objects are written). Any other keyword (title, description, $schema, $id) is documentation only.",
+ "$ref": "#/$defs/seriesVM",
+ "$defs": {
+  "fix": {
+   "type": "object",
+   "properties": {
+    "action": {
+     "type": "string"
+    },
+    "label_ko": {
+     "type": "string"
+    },
+    "label_en": {
+     "type": "string"
+    },
+    "params": {
+     "type": "object"
+    }
+   },
+   "required": [
+    "action",
+    "label_ko",
+    "label_en",
+    "params"
+   ],
+   "additionalProperties": false
+  },
+  "notice": {
+   "type": "object",
+   "properties": {
+    "code": {
+     "type": "string"
+    },
+    "level": {
+     "type": "string",
+     "enum": [
+      "notice",
+      "warning",
+      "info"
+     ]
+    },
+    "text": {
+     "type": "string"
+    },
+    "series_index": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "fixes": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/fix"
+     },
+     "maxItems": 3
+    }
+   },
+   "required": [
+    "code",
+    "level",
+    "text",
+    "series_index",
+    "fixes"
+   ],
+   "additionalProperties": false
+  },
+  "error": {
+   "type": "object",
+   "properties": {
+    "code": {
+     "type": "string"
+    },
+    "status": {
+     "type": "integer"
+    },
+    "message_ko": {
+     "type": "string"
+    },
+    "message_en": {
+     "type": "string"
+    },
+    "params": {
+     "type": "object"
+    },
+    "fixes": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/fix"
+     },
+     "maxItems": 3
+    },
+    "retry_after": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "request_id": {
+     "type": [
+      "string",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "code",
+    "status",
+    "message_ko",
+    "message_en",
+    "params",
+    "fixes",
+    "retry_after",
+    "request_id"
+   ],
+   "additionalProperties": false
+  },
+  "failedEntry": {
+   "type": "object",
+   "properties": {
+    "index": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "error": {
+     "$ref": "#/$defs/error"
+    }
+   },
+   "required": [
+    "index",
+    "name",
+    "error"
+   ],
+   "additionalProperties": false
+  },
+  "source": {
+   "type": "object",
+   "properties": {
+    "kind": {
+     "type": "string",
+     "enum": [
+      "naver",
+      "wiki",
+      "upload",
+      "google_trends_upload",
+      "sample"
+     ]
+    },
+    "label": {
+     "type": "string"
+    },
+    "short": {
+     "type": "string"
+    },
+    "line": {
+     "type": "string"
+    },
+    "value_kind": {
+     "type": "string",
+     "enum": [
+      "relative_index",
+      "relative_index_gt",
+      "pageviews",
+      "raw"
+     ]
+    },
+    "value_kind_label": {
+     "type": "string"
+    },
+    "value_kind_note": {
+     "type": "string"
+    },
+    "unit_label": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "freq": {
+     "type": "string",
+     "enum": [
+      "D",
+      "W",
+      "M",
+      "Q",
+      "Y"
+     ]
+    },
+    "freq_label": {
+     "type": "string"
+    },
+    "start": {
+     "type": "string"
+    },
+    "end": {
+     "type": "string"
+    },
+    "range_label": {
+     "type": "string"
+    },
+    "as_of": {
+     "type": "string"
+    },
+    "as_of_label": {
+     "type": "string"
+    },
+    "filters": {
+     "type": [
+      "object",
+      "null"
+     ],
+     "properties": {
+      "device": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "enum": [
+        "pc",
+        "mo",
+        null
+       ]
+      },
+      "gender": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "enum": [
+        "m",
+        "f",
+        null
+       ]
+      },
+      "ages": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      }
+     },
+     "required": [
+      "device",
+      "gender",
+      "ages"
+     ],
+     "additionalProperties": false
+    },
+    "filters_label": {
+     "type": "string"
+    },
+    "filename": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "attribution": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "kind",
+    "label",
+    "short",
+    "line",
+    "value_kind",
+    "value_kind_label",
+    "value_kind_note",
+    "unit_label",
+    "freq",
+    "freq_label",
+    "start",
+    "end",
+    "range_label",
+    "as_of",
+    "as_of_label",
+    "filters",
+    "filters_label",
+    "filename",
+    "attribution"
+   ],
+   "additionalProperties": false
+  },
+  "hero": {
+   "type": "object",
+   "properties": {
+    "title": {
+     "type": "string"
+    },
+    "outlook": {
+     "type": "object",
+     "properties": {
+      "direction": {
+       "type": "string",
+       "enum": [
+        "up",
+        "down",
+        "flat"
+       ]
+      },
+      "arrow": {
+       "type": "string",
+       "enum": [
+        "▲",
+        "▼",
+        "▶"
+       ]
+      },
+      "tone": {
+       "type": "string",
+       "enum": [
+        "up",
+        "down",
+        "neutral"
+       ]
+      },
+      "word": {
+       "type": "string"
+      },
+      "likelihood": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "prob": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "prob_text": {
+       "type": "string"
+      },
+      "prob_exact": {
+       "type": "string"
+      },
+      "prob_undefined_reason": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "line": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "direction",
+      "arrow",
+      "tone",
+      "word",
+      "likelihood",
+      "prob",
+      "prob_text",
+      "prob_exact",
+      "prob_undefined_reason",
+      "line"
+     ],
+     "additionalProperties": false
+    },
+    "sentence": {
+     "type": "string"
+    },
+    "basis": {
+     "type": "string"
+    },
+    "change_undefined": {
+     "type": [
+      "object",
+      "null"
+     ],
+     "properties": {
+      "code": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "reason": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "levels": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "code",
+      "reason",
+      "levels"
+     ],
+     "additionalProperties": false
+    },
+    "reliability": {
+     "type": "object",
+     "properties": {
+      "level": {
+       "type": "string",
+       "enum": [
+        "high",
+        "medium",
+        "low"
+       ]
+      },
+      "label": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "level",
+      "label"
+     ],
+     "additionalProperties": false
+    },
+    "accuracy_line": {
+     "type": "string"
+    },
+    "reference_note": {
+     "type": [
+      "string",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "title",
+    "outlook",
+    "sentence",
+    "basis",
+    "change_undefined",
+    "reliability",
+    "accuracy_line",
+    "reference_note"
+   ],
+   "additionalProperties": false
+  },
+  "phase": {
+   "type": "object",
+   "properties": {
+    "label": {
+     "type": "string",
+     "enum": [
+      "emerging",
+      "growing",
+      "peaking",
+      "declining",
+      "stable",
+      "reviving",
+      "volatile"
+     ]
+    },
+    "name": {
+     "type": "string"
+    },
+    "name_long": {
+     "type": "string"
+    },
+    "icon": {
+     "type": "string",
+     "enum": [
+      "emerging",
+      "growing",
+      "peaking",
+      "declining",
+      "stable",
+      "reviving",
+      "volatile"
+     ]
+    },
+    "seasonal_note": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "certainty": {
+     "type": "object",
+     "properties": {
+      "level": {
+       "type": "string",
+       "enum": [
+        "high",
+        "medium",
+        "low"
+       ]
+      },
+      "label": {
+       "type": "string"
+      },
+      "value": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "pct_text": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "level",
+      "label",
+      "value",
+      "pct_text"
+     ],
+     "additionalProperties": false
+    },
+    "tentative": {
+     "type": "boolean"
+    },
+    "reasons": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "detail": {
+        "type": [
+         "string",
+         "null"
+        ]
+       }
+      },
+      "required": [
+       "text",
+       "detail"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "rules_url": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "label",
+    "name",
+    "name_long",
+    "icon",
+    "seasonal_note",
+    "certainty",
+    "tentative",
+    "reasons",
+    "rules_url"
+   ],
+   "additionalProperties": false
+  },
+  "tile": {
+   "type": "object",
+   "properties": {
+    "key": {
+     "type": "string",
+     "enum": [
+      "phase",
+      "recent_change",
+      "momentum",
+      "expected_change",
+      "prob_increase",
+      "peak_season",
+      "volatility"
+     ]
+    },
+    "label": {
+     "type": "string"
+    },
+    "value": {
+     "type": "string"
+    },
+    "icon": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "tone": {
+     "type": "string",
+     "enum": [
+      "up",
+      "down",
+      "neutral"
+     ]
+    },
+    "sub": {
+     "type": "string"
+    },
+    "tooltip": {
+     "type": "string"
+    },
+    "undefined_reason": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "value_raw": {
+     "type": [
+      "number",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "key",
+    "label",
+    "value",
+    "icon",
+    "tone",
+    "sub",
+    "tooltip",
+    "undefined_reason",
+    "value_raw"
+   ],
+   "additionalProperties": false
+  },
+  "chart": {
+   "type": "object",
+   "properties": {
+    "title": {
+     "type": "string"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "freq": {
+     "type": "string",
+     "enum": [
+      "D",
+      "W",
+      "M",
+      "Q",
+      "Y"
+     ]
+    },
+    "value_kind": {
+     "type": "string",
+     "enum": [
+      "relative_index",
+      "relative_index_gt",
+      "pageviews",
+      "raw"
+     ]
+    },
+    "x_label": {
+     "type": "string"
+    },
+    "y_label": {
+     "type": "string"
+    },
+    "dates": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "actual": {
+     "type": "array",
+     "items": {
+      "type": [
+       "number",
+       "null"
+      ]
+     }
+    },
+    "trend": {
+     "type": "array",
+     "items": {
+      "type": [
+       "number",
+       "null"
+      ]
+     }
+    },
+    "forecast": {
+     "type": "object",
+     "properties": {
+      "dates": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "mean": {
+       "type": "array",
+       "items": {
+        "type": [
+         "number",
+         "null"
+        ]
+       }
+      },
+      "lo80": {
+       "type": "array",
+       "items": {
+        "type": [
+         "number",
+         "null"
+        ]
+       }
+      },
+      "hi80": {
+       "type": "array",
+       "items": {
+        "type": [
+         "number",
+         "null"
+        ]
+       }
+      },
+      "lo95": {
+       "type": "array",
+       "items": {
+        "type": [
+         "number",
+         "null"
+        ]
+       }
+      },
+      "hi95": {
+       "type": "array",
+       "items": {
+        "type": [
+         "number",
+         "null"
+        ]
+       }
+      }
+     },
+     "required": [
+      "dates",
+      "mean",
+      "lo80",
+      "hi80",
+      "lo95",
+      "hi95"
+     ],
+     "additionalProperties": false
+    },
+    "forecast_start": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "last_actual": {
+     "type": [
+      "object",
+      "null"
+     ],
+     "properties": {
+      "date": {
+       "type": "string"
+      },
+      "value": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "label": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "date",
+      "value",
+      "label"
+     ],
+     "additionalProperties": false
+    },
+    "levels": {
+     "type": "array",
+     "items": {
+      "type": "integer"
+     }
+    },
+    "display": {
+     "type": "string",
+     "enum": [
+      "normal",
+      "weak",
+      "bands_only"
+     ]
+    },
+    "nonnegative": {
+     "type": "boolean"
+    },
+    "y_hint": {
+     "type": "object",
+     "properties": {
+      "min": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "max": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "include_zero": {
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "min",
+      "max",
+      "include_zero"
+     ],
+     "additionalProperties": false
+    },
+    "y_note": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "changepoints": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "n": {
+        "type": "integer"
+       },
+       "date": {
+        "type": "string"
+       },
+       "date_label": {
+        "type": "string"
+       },
+       "label": {
+        "type": "string"
+       },
+       "kind": {
+        "type": "string"
+       },
+       "strength": {
+        "type": "string",
+        "enum": [
+         "large",
+         "medium",
+         "small"
+        ]
+       },
+       "strength_label": {
+        "type": "string"
+       },
+       "on_chart": {
+        "type": "boolean"
+       },
+       "text": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "n",
+       "date",
+       "date_label",
+       "label",
+       "kind",
+       "strength",
+       "strength_label",
+       "on_chart",
+       "text"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "anomalies": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "date": {
+        "type": "string"
+       },
+       "date_label": {
+        "type": "string"
+       },
+       "value": {
+        "type": [
+         "number",
+         "null"
+        ]
+       },
+       "expected": {
+        "type": [
+         "number",
+         "null"
+        ]
+       },
+       "direction": {
+        "type": "string",
+        "enum": [
+         "up",
+         "down"
+        ]
+       },
+       "text": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "date",
+       "date_label",
+       "value",
+       "expected",
+       "direction",
+       "text"
+      ],
+      "additionalProperties": false
+     }
+    }
+   },
+   "required": [
+    "title",
+    "desc",
+    "freq",
+    "value_kind",
+    "x_label",
+    "y_label",
+    "dates",
+    "actual",
+    "trend",
+    "forecast",
+    "forecast_start",
+    "last_actual",
+    "levels",
+    "display",
+    "nonnegative",
+    "y_hint",
+    "y_note",
+    "changepoints",
+    "anomalies"
+   ],
+   "additionalProperties": false
+  },
+  "past": {
+   "type": "object",
+   "properties": {
+    "summary": {
+     "type": "string"
+    },
+    "seasonality": {
+     "type": "object",
+     "properties": {
+      "strength": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "text": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "strength",
+      "text"
+     ],
+     "additionalProperties": false
+    }
+   },
+   "required": [
+    "summary",
+    "seasonality"
+   ],
+   "additionalProperties": false
+  },
+  "future": {
+   "type": "object",
+   "properties": {
+    "horizon": {
+     "type": "integer"
+    },
+    "horizon_label": {
+     "type": "string"
+    },
+    "end_label": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "scenarios": {
+     "type": [
+      "object",
+      "null"
+     ],
+     "properties": {
+      "date_label": {
+       "type": "string"
+      },
+      "title": {
+       "type": "string"
+      },
+      "reference": {
+       "type": [
+        "object",
+        "null"
+       ],
+       "properties": {
+        "label": {
+         "type": "string"
+        },
+        "value_text": {
+         "type": "string"
+        },
+        "text": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "label",
+        "value_text",
+        "text"
+       ],
+       "additionalProperties": false
+      },
+      "rows": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "key": {
+          "type": "string",
+          "enum": [
+           "pessimistic",
+           "base",
+           "optimistic"
+          ]
+         },
+         "label": {
+          "type": "string"
+         },
+         "value_text": {
+          "type": "string"
+         },
+         "pct_text": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "text": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "key",
+         "label",
+         "value_text",
+         "pct_text",
+         "text"
+        ],
+        "additionalProperties": false
+       },
+       "minItems": 3,
+       "maxItems": 3
+      },
+      "note": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "date_label",
+      "title",
+      "reference",
+      "rows",
+      "note"
+     ],
+     "additionalProperties": false
+    },
+    "table": {
+     "type": "object",
+     "properties": {
+      "rows": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "date": {
+          "type": "string"
+         },
+         "date_label": {
+          "type": "string"
+         },
+         "mean": {
+          "type": "string"
+         },
+         "range80": {
+          "type": "string"
+         },
+         "range95": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "date",
+         "date_label",
+         "mean",
+         "range80",
+         "range95"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     "required": [
+      "rows"
+     ],
+     "additionalProperties": false
+    },
+    "accuracy": {
+     "type": "object",
+     "properties": {
+      "line": {
+       "type": "string"
+      },
+      "skill": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "details": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "line",
+      "skill",
+      "details"
+     ],
+     "additionalProperties": false
+    },
+    "method": {
+     "type": "string"
+    },
+    "models": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       },
+       "name": {
+        "type": "string"
+       },
+       "weight": {
+        "type": [
+         "number",
+         "null"
+        ]
+       },
+       "weight_text": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id",
+       "name",
+       "weight",
+       "weight_text"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "phase": {
+     "type": "object",
+     "properties": {
+      "label": {
+       "type": "string"
+      },
+      "name": {
+       "type": "string"
+      },
+      "hedge": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "text": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "label",
+      "name",
+      "hedge",
+      "text"
+     ],
+     "additionalProperties": false
+    },
+    "peak": {
+     "type": "object",
+     "properties": {
+      "date": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "text": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "date",
+      "text"
+     ],
+     "additionalProperties": false
+    }
+   },
+   "required": [
+    "horizon",
+    "horizon_label",
+    "end_label",
+    "scenarios",
+    "table",
+    "accuracy",
+    "method",
+    "models",
+    "phase",
+    "peak"
+   ],
+   "additionalProperties": false
+  },
+  "aiNarrative": {
+   "type": "object",
+   "properties": {
+    "markdown": {
+     "type": "string"
+    },
+    "caveats_markdown": {
+     "type": "string"
+    },
+    "badge": {
+     "type": "string"
+    },
+    "model": {
+     "type": "string"
+    },
+    "note": {
+     "type": "string"
+    },
+    "created_at": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "markdown",
+    "caveats_markdown",
+    "badge",
+    "model",
+    "note",
+    "created_at"
+   ],
+   "additionalProperties": false
+  },
+  "narrative": {
+   "type": "object",
+   "properties": {
+    "markdown": {
+     "type": "string"
+    },
+    "date_links": {
+     "type": "object"
+    },
+    "source": {
+     "type": "string",
+     "enum": [
+      "rule",
+      "llm"
+     ]
+    },
+    "badge": {
+     "type": "string"
+    },
+    "ai": {
+     "$ref": "#/$defs/aiNarrative",
+     "type": [
+      "object",
+      "null"
+     ]
+    },
+    "ai_allowed": {
+     "type": "boolean"
+    },
+    "ai_block_reason": {
+     "type": [
+      "string",
+      "null"
+     ],
+     "enum": [
+      "naver_terms",
+      "ai_unavailable",
+      "shared_readonly",
+      null
+     ]
+    },
+    "ai_block_text": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "ai_privacy_note": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "markdown",
+    "date_links",
+    "source",
+    "badge",
+    "ai",
+    "ai_allowed",
+    "ai_block_reason",
+    "ai_block_text",
+    "ai_privacy_note"
+   ],
+   "additionalProperties": false
+  },
+  "seriesExports": {
+   "type": "object",
+   "properties": {
+    "csv": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "xlsx": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "html": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "json": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "unavailable": {
+     "type": "object"
+    }
+   },
+   "required": [
+    "csv",
+    "xlsx",
+    "html",
+    "json",
+    "unavailable"
+   ],
+   "additionalProperties": false
+  },
+  "resultExports": {
+   "type": "object",
+   "properties": {
+    "csv": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "xlsx": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "html": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "json": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "values_csv": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "unavailable": {
+     "type": "object"
+    }
+   },
+   "required": [
+    "csv",
+    "xlsx",
+    "html",
+    "json",
+    "values_csv",
+    "unavailable"
+   ],
+   "additionalProperties": false
+  },
+  "seriesVM": {
+   "type": "object",
+   "properties": {
+    "schema": {
+     "type": "integer"
+    },
+    "lang": {
+     "type": "string",
+     "enum": [
+      "ko",
+      "en"
+     ]
+    },
+    "index": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "terms": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "minItems": 1
+    },
+    "slot": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "enum": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      null
+     ]
+    },
+    "icon": {
+     "type": [
+      "string",
+      "null"
+     ],
+     "enum": [
+      "circle",
+      "diamond",
+      "hexagon",
+      "square",
+      "cross",
+      null
+     ]
+    },
+    "flags": {
+     "type": "object",
+     "properties": {
+      "synthetic": {
+       "type": "boolean"
+      },
+      "tentative": {
+       "type": "boolean"
+      },
+      "intermittent": {
+       "type": "boolean"
+      },
+      "all_zero": {
+       "type": "boolean"
+      },
+      "low_resolution": {
+       "type": "boolean"
+      },
+      "reference_only": {
+       "type": "boolean"
+      },
+      "seasonal": {
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "synthetic",
+      "tentative",
+      "intermittent",
+      "all_zero",
+      "low_resolution",
+      "reference_only",
+      "seasonal"
+     ],
+     "additionalProperties": false
+    },
+    "source": {
+     "$ref": "#/$defs/source"
+    },
+    "hero": {
+     "$ref": "#/$defs/hero"
+    },
+    "phase": {
+     "$ref": "#/$defs/phase"
+    },
+    "tiles": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/tile"
+     },
+     "minItems": 6,
+     "maxItems": 6
+    },
+    "chart": {
+     "$ref": "#/$defs/chart"
+    },
+    "past": {
+     "$ref": "#/$defs/past"
+    },
+    "future": {
+     "$ref": "#/$defs/future"
+    },
+    "narrative": {
+     "$ref": "#/$defs/narrative"
+    },
+    "caveats": {
+     "type": "object",
+     "properties": {
+      "markdown": {
+       "type": "string"
+      },
+      "disclaimer": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "markdown",
+      "disclaimer"
+     ],
+     "additionalProperties": false
+    },
+    "summary_line": {
+     "type": "string"
+    },
+    "exports": {
+     "$ref": "#/$defs/seriesExports"
+    },
+    "notices": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/notice"
+     }
+    }
+   },
+   "required": [
+    "schema",
+    "lang",
+    "index",
+    "name",
+    "terms",
+    "slot",
+    "icon",
+    "flags",
+    "source",
+    "hero",
+    "phase",
+    "tiles",
+    "chart",
+    "past",
+    "future",
+    "narrative",
+    "caveats",
+    "summary_line",
+    "exports",
+    "notices"
+   ],
+   "additionalProperties": false
+  },
+  "rankingRow": {
+   "type": "object",
+   "properties": {
+    "rank": {
+     "type": "integer"
+    },
+    "index": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "slot": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "enum": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      null
+     ]
+    },
+    "icon": {
+     "type": [
+      "string",
+      "null"
+     ],
+     "enum": [
+      "circle",
+      "diamond",
+      "hexagon",
+      "square",
+      "cross",
+      null
+     ]
+    },
+    "phase": {
+     "type": "object",
+     "properties": {
+      "label": {
+       "type": "string",
+       "enum": [
+        "emerging",
+        "growing",
+        "peaking",
+        "declining",
+        "stable",
+        "reviving",
+        "volatile"
+       ]
+      },
+      "name": {
+       "type": "string"
+      },
+      "icon": {
+       "type": "string",
+       "enum": [
+        "emerging",
+        "growing",
+        "peaking",
+        "declining",
+        "stable",
+        "reviving",
+        "volatile"
+       ]
+      },
+      "tentative": {
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "label",
+      "name",
+      "icon",
+      "tentative"
+     ],
+     "additionalProperties": false
+    },
+    "outlook": {
+     "type": "object",
+     "properties": {
+      "arrow": {
+       "type": "string",
+       "enum": [
+        "▲",
+        "▼",
+        "▶"
+       ]
+      },
+      "tone": {
+       "type": "string",
+       "enum": [
+        "up",
+        "down",
+        "neutral"
+       ]
+      },
+      "word": {
+       "type": "string"
+      },
+      "likelihood": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "prob_text": {
+       "type": "string"
+      },
+      "line": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "arrow",
+      "tone",
+      "word",
+      "likelihood",
+      "prob_text",
+      "line"
+     ],
+     "additionalProperties": false
+    },
+    "expected_change": {
+     "type": "object",
+     "properties": {
+      "text": {
+       "type": "string"
+      },
+      "basis": {
+       "type": "string"
+      },
+      "undefined_reason": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "text",
+      "basis",
+      "undefined_reason"
+     ],
+     "additionalProperties": false
+    },
+    "recent_change": {
+     "type": "object",
+     "properties": {
+      "text": {
+       "type": "string"
+      },
+      "basis": {
+       "type": "string"
+      },
+      "undefined_reason": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "text",
+      "basis",
+      "undefined_reason"
+     ],
+     "additionalProperties": false
+    },
+    "momentum": {
+     "type": "object",
+     "properties": {
+      "text": {
+       "type": "string"
+      },
+      "word": {
+       "type": "string"
+      },
+      "undefined_reason": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "text",
+      "word",
+      "undefined_reason"
+     ],
+     "additionalProperties": false
+    },
+    "score": {
+     "type": "object",
+     "properties": {
+      "value": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "text": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "value",
+      "text"
+     ],
+     "additionalProperties": false
+    },
+    "confidence": {
+     "type": "object",
+     "properties": {
+      "level": {
+       "type": "string",
+       "enum": [
+        "high",
+        "medium",
+        "low"
+       ]
+      },
+      "label": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "level",
+      "label"
+     ],
+     "additionalProperties": false
+    },
+    "sort": {
+     "type": "object",
+     "properties": {
+      "score": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "prob": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "expected": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "recent": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "level": {
+       "type": [
+        "number",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "score",
+      "prob",
+      "expected",
+      "recent",
+      "level"
+     ],
+     "additionalProperties": false
+    },
+    "spark": {
+     "type": "object",
+     "properties": {
+      "history": {
+       "type": "array",
+       "items": {
+        "type": [
+         "number",
+         "null"
+        ]
+       }
+      },
+      "forecast": {
+       "type": "array",
+       "items": {
+        "type": [
+         "number",
+         "null"
+        ]
+       }
+      }
+     },
+     "required": [
+      "history",
+      "forecast"
+     ],
+     "additionalProperties": false
+    },
+    "display": {
+     "type": "string",
+     "enum": [
+      "normal",
+      "weak",
+      "bands_only"
+     ]
+    },
+    "flags": {
+     "type": "object",
+     "properties": {
+      "low_resolution": {
+       "type": "boolean"
+      },
+      "reference_only": {
+       "type": "boolean"
+      },
+      "tentative": {
+       "type": "boolean"
+      },
+      "synthetic": {
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "low_resolution",
+      "reference_only",
+      "tentative",
+      "synthetic"
+     ],
+     "additionalProperties": false
+    }
+   },
+   "required": [
+    "rank",
+    "index",
+    "name",
+    "slot",
+    "icon",
+    "phase",
+    "outlook",
+    "expected_change",
+    "recent_change",
+    "momentum",
+    "score",
+    "confidence",
+    "sort",
+    "spark",
+    "display",
+    "flags"
+   ],
+   "additionalProperties": false
+  },
+  "compareVM": {
+   "type": "object",
+   "properties": {
+    "count": {
+     "type": "integer"
+    },
+    "slots": {
+     "type": "object"
+    },
+    "value_kind": {
+     "type": "string",
+     "enum": [
+      "relative_index",
+      "relative_index_gt",
+      "pageviews",
+      "raw"
+     ]
+    },
+    "source_line": {
+     "type": "string"
+    },
+    "axis_label": {
+     "type": "string"
+    },
+    "axis_note": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "scale": {
+     "type": "object",
+     "properties": {
+      "default": {
+       "type": "string",
+       "enum": [
+        "raw",
+        "index",
+        "log"
+       ]
+      },
+      "allowed": {
+       "type": "object",
+       "properties": {
+        "raw": {
+         "type": "boolean"
+        },
+        "index": {
+         "type": "boolean"
+        },
+        "log": {
+         "type": "boolean"
+        }
+       },
+       "required": [
+        "raw",
+        "index",
+        "log"
+       ],
+       "additionalProperties": false
+      },
+      "disabled_reason": {
+       "type": "object",
+       "properties": {
+        "log": {
+         "type": [
+          "string",
+          "null"
+         ]
+        },
+        "index": {
+         "type": [
+          "string",
+          "null"
+         ]
+        }
+       },
+       "required": [
+        "log",
+        "index"
+       ],
+       "additionalProperties": false
+      },
+      "index_base": {
+       "type": [
+        "object",
+        "null"
+       ],
+       "properties": {
+        "start": {
+         "type": "string"
+        },
+        "end": {
+         "type": "string"
+        },
+        "label": {
+         "type": "string"
+        },
+        "values": {
+         "type": "object"
+        }
+       },
+       "required": [
+        "start",
+        "end",
+        "label",
+        "values"
+       ],
+       "additionalProperties": false
+      },
+      "log_hint": {
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "default",
+      "allowed",
+      "disabled_reason",
+      "index_base",
+      "log_hint"
+     ],
+     "additionalProperties": false
+    },
+    "ranking": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/rankingRow"
+     },
+     "maxItems": 20
+    },
+    "failed": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/failedEntry"
+     }
+    },
+    "score_note": {
+     "type": "string"
+    },
+    "spark_note": {
+     "type": "string"
+    },
+    "notices": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/notice"
+     }
+    }
+   },
+   "required": [
+    "count",
+    "slots",
+    "value_kind",
+    "source_line",
+    "axis_label",
+    "axis_note",
+    "scale",
+    "ranking",
+    "failed",
+    "score_note",
+    "spark_note",
+    "notices"
+   ],
+   "additionalProperties": false
+  },
+  "analyzeJob": {
+   "type": "object",
+   "properties": {
+    "job_id": {
+     "type": "string"
+    },
+    "kind": {
+     "type": "string",
+     "enum": [
+      "analyze"
+     ]
+    },
+    "status": {
+     "type": "string",
+     "enum": [
+      "queued",
+      "running",
+      "done",
+      "failed",
+      "cancelled"
+     ]
+    },
+    "stage": {
+     "type": "string"
+    },
+    "series_total": {
+     "type": "integer"
+    },
+    "series_done": {
+     "type": "integer"
+    },
+    "current": {
+     "type": [
+      "object",
+      "null"
+     ],
+     "properties": {
+      "index": {
+       "type": "integer"
+      },
+      "name": {
+       "type": "string"
+      },
+      "step": {
+       "type": "string",
+       "enum": [
+        "analyze",
+        "forecast",
+        "narrative"
+       ]
+      }
+     },
+     "required": [
+      "index",
+      "name",
+      "step"
+     ],
+     "additionalProperties": false
+    },
+    "series": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "index": {
+        "type": "integer"
+       },
+       "status": {
+        "type": "string",
+        "enum": [
+         "done"
+        ]
+       },
+       "vm": {
+        "$ref": "#/$defs/seriesVM"
+       }
+      },
+      "required": [
+       "index",
+       "status",
+       "vm"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "failed": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/failedEntry"
+     }
+    },
+    "notices": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/notice"
+     }
+    },
+    "compare": {
+     "$ref": "#/$defs/compareVM",
+     "type": [
+      "object",
+      "null"
+     ]
+    },
+    "view": {
+     "type": "string",
+     "enum": [
+      "detail",
+      "compare"
+     ]
+    },
+    "error": {
+     "$ref": "#/$defs/error",
+     "type": [
+      "object",
+      "null"
+     ]
+    },
+    "result_url": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "elapsed_ms": {
+     "type": "integer"
+    },
+    "poll_after_ms": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "job_id",
+    "kind",
+    "status",
+    "stage",
+    "series_total",
+    "series_done",
+    "current",
+    "series",
+    "failed",
+    "notices",
+    "compare",
+    "view",
+    "error",
+    "result_url",
+    "elapsed_ms",
+    "poll_after_ms"
+   ],
+   "additionalProperties": false
+  },
+  "narrativeJob": {
+   "type": "object",
+   "properties": {
+    "job_id": {
+     "type": "string"
+    },
+    "kind": {
+     "type": "string",
+     "enum": [
+      "narrative"
+     ]
+    },
+    "status": {
+     "type": "string",
+     "enum": [
+      "queued",
+      "running",
+      "done",
+      "failed",
+      "cancelled"
+     ]
+    },
+    "error": {
+     "$ref": "#/$defs/error",
+     "type": [
+      "object",
+      "null"
+     ]
+    },
+    "elapsed_ms": {
+     "type": "integer"
+    },
+    "poll_after_ms": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "narrative": {
+     "type": [
+      "object",
+      "null"
+     ],
+     "properties": {
+      "markdown": {
+       "type": "string"
+      },
+      "caveats_markdown": {
+       "type": "string"
+      },
+      "source": {
+       "type": "string",
+       "enum": [
+        "llm"
+       ]
+      },
+      "badge": {
+       "type": "string"
+      },
+      "model": {
+       "type": "string"
+      },
+      "note": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "markdown",
+      "caveats_markdown",
+      "source",
+      "badge",
+      "model",
+      "note"
+     ],
+     "additionalProperties": false
+    }
+   },
+   "required": [
+    "job_id",
+    "kind",
+    "status",
+    "error",
+    "elapsed_ms",
+    "poll_after_ms",
+    "narrative"
+   ],
+   "additionalProperties": false
+  },
+  "resultEnvelope": {
+   "type": "object",
+   "properties": {
+    "result_id": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "created_at": {
+     "type": "string"
+    },
+    "expires_at": {
+     "type": "string"
+    },
+    "readonly": {
+     "type": "boolean"
+    },
+    "view": {
+     "type": "string",
+     "enum": [
+      "detail",
+      "compare"
+     ]
+    },
+    "query": {
+     "type": "object",
+     "required": [
+      "source"
+     ]
+    },
+    "series": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/seriesVM"
+     }
+    },
+    "failed": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/failedEntry"
+     }
+    },
+    "compare": {
+     "$ref": "#/$defs/compareVM",
+     "type": [
+      "object",
+      "null"
+     ]
+    },
+    "notices": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/notice"
+     }
+    },
+    "exports": {
+     "$ref": "#/$defs/resultExports"
+    },
+    "shared": {
+     "type": "object",
+     "properties": {
+      "share_id": {
+       "type": "string"
+      },
+      "created_at": {
+       "type": "string"
+      },
+      "expires_at": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "share_id",
+      "created_at",
+      "expires_at"
+     ],
+     "additionalProperties": false
+    }
+   },
+   "required": [
+    "result_id",
+    "created_at",
+    "expires_at",
+    "readonly",
+    "view",
+    "query",
+    "series",
+    "failed",
+    "compare",
+    "notices",
+    "exports"
+   ],
+   "additionalProperties": false
+  }
+ }
+}

@@ -43,7 +43,8 @@ from .types import (
 
 __all__ = [
     "DEFAULT_MODEL", "SYSTEM_PROMPT", "SECTION_HEADINGS", "NarrativeUnavailable",
-    "rule_based_narrative", "build_llm_payload", "llm_narrative", "generate_narrative", "ask",
+    "rule_based_narrative", "build_llm_payload", "llm_narrative", "llm_narrative_from_payload",
+    "generate_narrative", "ask",
     "format_number", "format_pct", "format_date", "format_prob", "period_unit", "translate_reason",
     "direction_label", "model_label", "describe_method", "MODEL_KO", "MODEL_EN",
     "format_scenario", "scenario_value", "is_intermittent", "is_synthetic", "changepoint_label", "phase_is_tentative",
@@ -3690,8 +3691,20 @@ def llm_narrative(analysis: AnalysisResult, forecast: ForecastResult, outlook: O
     ``client`` defaults to ``anthropic.Anthropic()`` (credentials from the
     environment).  Raises :class:`NarrativeUnavailable` on any failure.
     """
-    lang = _norm_lang(lang)
     payload = build_llm_payload(analysis, forecast, outlook)
+    return llm_narrative_from_payload(payload, lang=lang, model=model, client=client)
+
+
+def llm_narrative_from_payload(payload: dict, lang: str = "ko", model: str = DEFAULT_MODEL,
+                               client: Any = None) -> str:
+    """Claude narrative from a stored :func:`build_llm_payload` dict.
+
+    Exactly the prompt and the call of :func:`llm_narrative` (which builds the payload
+    and delegates here), so a caller that keeps only the computed facts -- the web app
+    stores the payload, never the data -- gets the same text.  ``client`` defaults to
+    ``anthropic.Anthropic()``.  Raises :class:`NarrativeUnavailable` on any failure.
+    """
+    lang = _norm_lang(lang)
     return _call_claude(_narrative_request(payload, lang), model=model, client=client, lang=lang)
 
 

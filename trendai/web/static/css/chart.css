@@ -1,0 +1,606 @@
+/* Charts (spec F.7, F.8, F.9). Owner: WP3-chart.
+ *
+ * Every class here is emitted by static/js/chart/*.js and is prefixed `chart-` or `spark-`; nothing outside a
+ * chart's container is styled. Colours come only from the tokens.css variables, so light/dark themes and the
+ * up/down colour setting apply without re-rendering; geometry lives in SVG attributes (no inline styles, CSP-safe).
+ * Series colours are passed down as `--series` (comparison) / `--spark` (sparklines) by the slot classes.
+ */
+
+/* ------------------------------------------------------------------------------------------- frame */
+
+.chart {
+  position: relative;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-wrap {
+  position: relative;
+  border-radius: 6px;
+  outline: none;
+  touch-action: pan-y;                 /* horizontal press-and-drag scrubs, vertical drags scroll the page (F.7.4) */
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: crosshair;
+}
+
+.chart-wrap:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 4px;
+}
+
+.chart-svg,
+.chart-overlay {
+  display: block;
+  overflow: visible;
+}
+
+.chart-svg text,
+.chart-overlay text {
+  font-family: var(--font);
+}
+
+.chart-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+}
+
+.chart-measure {
+  visibility: hidden;
+}
+
+/* ------------------------------------------------------------------------------------------- read-out bar (F.7.4) */
+
+.chart-readout {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: var(--s-3);
+  row-gap: 2px;
+  min-height: 28px;
+  padding: 0 0 var(--s-2);
+  font-size: var(--fs-2);
+  line-height: 1.45;
+  color: var(--ink);
+}
+
+.chart-readout-date {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.chart-readout.is-idle .chart-readout-date {
+  font-weight: 500;
+  color: var(--ink-2);
+}
+
+.chart-readout-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.chart-readout-value {
+  font-weight: 600;
+}
+
+.chart-readout-name {
+  color: var(--ink-2);
+}
+
+.chart-readout-note {
+  color: var(--ink-2);
+}
+
+@media (max-width: 639px) {
+  .chart-readout {
+    min-height: 3em;                   /* room for a wrapped note without the plot jumping */
+    font-size: var(--fs-cap);
+    column-gap: var(--s-2);
+  }
+}
+
+/* keys and glyphs used by read-outs and legends */
+.chart-key,
+.chart-glyph {
+  flex: none;
+  overflow: visible;
+}
+
+.chart-key-line {
+  fill: none;
+  stroke: var(--series, var(--c-hist));
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.chart-key-line.is-dashed {
+  stroke-dasharray: 4 3;
+  stroke-linecap: butt;
+}
+
+.chart-key-band {
+  fill: var(--series, var(--c-fc));
+  fill-opacity: var(--band80-op);
+}
+
+.chart-key-hist {
+  --series: var(--c-hist);
+}
+
+.chart-key-fc {
+  --series: var(--c-fc);
+}
+
+.chart-glyph-shape {
+  fill: var(--series, var(--c-hist));
+  stroke: var(--surface);
+  stroke-width: 1;
+}
+
+/* ------------------------------------------------------------------------------------------- axes and grid */
+
+.chart-tick,
+.chart-axis-label,
+.chart-y-label {
+  font-size: 12px;
+  fill: var(--ink-3);
+}
+
+.chart-grid-line {
+  stroke: var(--grid);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.chart-zero-line,
+.chart-axis-line,
+.chart-tick-mark {
+  stroke: var(--axis);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+/* ------------------------------------------------------------------------------------------- fan chart (F.7.1) */
+
+.chart-fc-region {
+  fill: var(--fc-region);
+}
+
+.chart-region-label,
+.chart-now-label,
+.chart-anom-edge,
+.chart-end-label {
+  paint-order: stroke;
+  stroke: var(--surface);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.chart-region-label {
+  font-size: 12px;
+  font-weight: 600;
+  fill: var(--ink-2);
+}
+
+.chart-band {
+  fill: var(--c-fc);
+  stroke: none;
+}
+
+.chart-band-95 {
+  fill-opacity: var(--band95-op);
+}
+
+.chart-band-80 {
+  fill-opacity: var(--band80-op);
+}
+
+.chart-trend {
+  fill: none;
+  stroke: var(--c-trend);
+  stroke-width: 1.5;
+  stroke-dasharray: 1 3;
+  stroke-linecap: round;
+}
+
+.chart-hist {
+  fill: none;
+  stroke: var(--c-hist);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.chart-fc-mean {
+  fill: none;
+  stroke: var(--c-fc);
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+  stroke-linejoin: round;
+}
+
+.chart-fc-mean.is-weak {
+  stroke-width: 1.5;
+  opacity: 0.6;
+}
+
+.chart-now {
+  stroke: var(--ink-3);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+.chart-now-label {
+  font-size: 12px;
+  fill: var(--ink-2);
+}
+
+.chart-cp-line {
+  fill: none;
+  stroke: var(--ink-3);
+  stroke-width: 1;
+}
+
+.chart-cp-line.is-active {
+  stroke: var(--ink);
+  stroke-width: 1.5;
+}
+
+.chart-cp-dot {
+  fill: var(--c-cp-bg);
+  stroke: var(--surface);
+  stroke-width: 2;
+}
+
+.chart-cp-badge.is-active .chart-cp-dot {
+  fill: var(--accent);
+}
+
+.chart-cp-num {
+  font-size: 11px;
+  font-weight: 700;
+  fill: var(--c-cp-fg);
+}
+
+.chart-cp-badge.is-active .chart-cp-num {
+  fill: var(--accent-ink);
+}
+
+.chart-cp-hit {
+  pointer-events: auto;
+  cursor: pointer;
+  outline: none;
+}
+
+.chart-cp-hit-area {
+  fill: transparent;
+}
+
+.chart-cp-ring {
+  fill: none;
+  stroke: var(--focus);
+  stroke-width: 2;
+  opacity: 0;
+}
+
+.chart-cp-hit:hover .chart-cp-ring {
+  stroke: var(--ink-3);
+  opacity: 1;
+}
+
+.chart-cp-hit:focus-visible .chart-cp-ring {
+  stroke: var(--focus);
+  opacity: 1;
+}
+
+.chart-anom {
+  fill: var(--surface);
+  stroke: var(--c-anom);
+  stroke-width: 2;
+}
+
+.chart-anom-edge-mark {
+  fill: var(--c-anom);
+}
+
+.chart-anom-edge {
+  font-size: 11px;
+  font-weight: 600;
+  fill: var(--ink-2);
+}
+
+.chart-last {
+  fill: var(--c-hist);
+  stroke: var(--surface);
+  stroke-width: 2;
+}
+
+.chart-ref-chip-bg {
+  fill: var(--surface-2);
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+
+.chart-ref-chip-text {
+  font-size: 12px;
+  font-weight: 600;
+  fill: var(--ink);
+}
+
+/* toggles (detail chart card: 80% · 95% · 추세선 · 이상치) */
+.chart[data-band="80"] .chart-band-95,
+.chart[data-band="95"] .chart-band-80,
+.chart[data-band="off"] .chart-band,
+.chart-no-trend .chart-trend,
+.chart-no-anoms .chart-anoms {
+  display: none;
+}
+
+/* ------------------------------------------------------------------------------------------- crosshair */
+
+.chart-xh {
+  pointer-events: none;
+}
+
+.chart-xh-line {
+  stroke: var(--ink-3);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.chart-xh-dot {
+  stroke: var(--surface);
+  stroke-width: 2;
+  fill: var(--series, var(--c-hist));
+}
+
+.chart-xh-dot-hist {
+  fill: var(--c-hist);
+}
+
+.chart-xh-dot-fc {
+  fill: var(--c-fc);
+}
+
+/* ------------------------------------------------------------------------------------------- comparison chart (F.7.2) */
+
+.chart-slot-1 { --series: var(--slot-1); }
+.chart-slot-2 { --series: var(--slot-2); }
+.chart-slot-3 { --series: var(--slot-3); }
+.chart-slot-4 { --series: var(--slot-4); }
+.chart-slot-5 { --series: var(--slot-5); }
+.chart-grey { --series: var(--ink-3); }
+.chart-grey.is-highlight { --series: var(--ink-2); }
+
+.chart-line {
+  fill: none;
+  stroke: var(--series);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.chart-line-fc {
+  stroke-dasharray: 6 4;
+  stroke-linecap: butt;
+}
+
+.chart-line-fc.is-weak {
+  stroke-width: 1;
+  opacity: 0.6;
+}
+
+.chart-grey .chart-line {
+  stroke-width: 1;
+  opacity: 0.5;
+}
+
+.chart-grey.is-highlight .chart-line {
+  stroke-width: 2;
+  opacity: 1;
+}
+
+.chart-series.is-focused .chart-line {
+  stroke-width: 2.5;
+}
+
+.chart-series.is-focused .chart-line-fc.is-weak {
+  stroke-width: 1.5;
+}
+
+.chart-series.is-dimmed {
+  opacity: 0.25;
+}
+
+.chart-series-band {
+  fill: var(--series);
+  fill-opacity: var(--band80-op);
+  stroke: none;
+}
+
+.chart-end-marker {
+  fill: var(--series);
+  stroke: var(--surface);
+  stroke-width: 1.5;
+}
+
+.chart-end-label {
+  font-size: 12px;
+  font-weight: 600;
+  fill: var(--ink);
+}
+
+.chart-end-label.is-dimmed,
+.chart-leader.is-dimmed,
+.chart-end-marker.is-dimmed {
+  opacity: 0.35;
+}
+
+.chart-leader {
+  fill: none;
+  stroke: var(--ink-3);
+  stroke-width: 1;
+}
+
+.chart-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+  stroke-linejoin: round;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+/* legend chips above the plot: swatch + slot icon + name, button[aria-pressed] */
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin: 0 0 var(--s-2);
+}
+
+.chart-legend-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  max-width: 100%;
+  padding: 4px 12px 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-chip);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--fs-2);
+  line-height: 1.3;
+  cursor: pointer;
+}
+
+.chart-legend-chip:hover {
+  background: var(--surface-2);
+}
+
+.chart-legend-chip:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.chart-legend-chip[aria-pressed="false"] {
+  border-style: dashed;
+  background: transparent;
+  color: var(--ink-3);
+}
+
+.chart-legend-chip[aria-pressed="false"] .chart-key,
+.chart-legend-chip[aria-pressed="false"] .chart-glyph {
+  opacity: 0.35;
+}
+
+.chart-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chart-chip-ref {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: var(--r-chip);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chart-hint {
+  margin: 0 0 var(--s-2);
+  font-size: var(--fs-cap);
+  color: var(--ink-3);
+}
+
+@media (max-width: 639px) {
+  .chart-legend-chip {
+    min-height: 44px;                  /* F.9: chips >= 44 px tall below 640 px */
+  }
+}
+
+/* ------------------------------------------------------------------------------------------- sparkline (F.7.3) */
+
+.spark {
+  display: block;
+  overflow: visible;
+}
+
+.spark-line {
+  fill: none;
+  stroke: var(--spark, var(--c-hist));
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.spark-fc {
+  stroke-dasharray: 3 2;
+  stroke-linecap: butt;
+}
+
+.spark-weak .spark-fc {
+  opacity: 0.6;
+}
+
+.spark-dot {
+  fill: var(--spark, var(--c-hist));
+}
+
+.spark-slot-1 { --spark: var(--slot-1); }
+.spark-slot-2 { --spark: var(--slot-2); }
+.spark-slot-3 { --spark: var(--slot-3); }
+.spark-slot-4 { --spark: var(--slot-4); }
+.spark-slot-5 { --spark: var(--slot-5); }
+.spark-grey { --spark: var(--ink-3); }
+
+/* ------------------------------------------------------------------------------------------- motion and forced colours */
+
+@media (prefers-reduced-motion: no-preference) {
+  .chart-series,
+  .chart-end-label,
+  .chart-end-marker,
+  .chart-leader {
+    transition: opacity 0.15s ease;
+  }
+}
+
+@media (forced-colors: active) {
+  .chart-hist,
+  .chart-line,
+  .chart-key-line,
+  .spark-line {
+    stroke: CanvasText;
+  }
+
+  .chart-fc-mean,
+  .chart-cp-line,
+  .chart-now,
+  .chart-xh-line {
+    stroke: Highlight;
+  }
+
+  .chart-band,
+  .chart-series-band,
+  .chart-key-band {
+    fill: Highlight;
+  }
+
+  .chart-tick,
+  .chart-axis-label,
+  .chart-y-label,
+  .chart-region-label,
+  .chart-now-label,
+  .chart-end-label {
+    fill: CanvasText;
+  }
+}

@@ -1,0 +1,129 @@
+/* Base: reset, typography, layout grid, utilities, focus ring, skip link (spec F.1, F.8, F.9, F.10).
+ * Owner: WP3-app. Colours only through the tokens.css variables. */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  scroll-padding-top: 120px;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 var(--fs-body)/var(--lh-body) var(--font);
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, p, ul, ol, dl, figure, fieldset { margin: 0; }
+h1, h2, h3, h4 { line-height: var(--lh-head); font-weight: 700; letter-spacing: -0.01em; }
+ul, ol { padding: 0; }
+fieldset { border: 0; padding: 0; min-width: 0; }
+legend { padding: 0; }
+img, svg { display: block; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button:disabled, [aria-disabled="true"] { cursor: not-allowed; }
+table { border-collapse: collapse; }
+strong, b { font-weight: 600; }
+em, i { font-style: normal; font-weight: 600; }   /* no italics (F.8) */
+[hidden] { display: none !important; }
+
+a { color: var(--accent); text-underline-offset: 3px; text-decoration-thickness: 1px; }
+a:hover { text-decoration-thickness: 2px; }
+
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+:focus:not(:focus-visible) { outline: none; }
+/* headings and regions focused by the router or a step change (tabindex=-1) get no ring */
+[tabindex="-1"]:focus { outline: none; }
+
+::selection { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+
+/* ------------------------------------------------------------------------------------------ app frame */
+
+#app {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+#main {
+  flex: 1 0 auto;
+  width: 100%;
+  outline: none;
+}
+
+.page {
+  width: 100%;
+  max-width: calc(var(--content-max) + 2 * var(--s-5));
+  margin: 0 auto;
+  padding: var(--s-5) var(--s-5) var(--s-6);
+}
+
+.page-narrow { max-width: calc(720px + 2 * var(--s-5)); }
+
+@media (max-width: 639px) {
+  .page { padding: var(--s-4) var(--s-4) var(--s-6); }
+}
+
+html.has-modal { overflow: hidden; }
+
+/* ------------------------------------------------------------------------------------------ utilities */
+
+.sr-only {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+  white-space: nowrap; border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  left: var(--s-4);
+  top: -100px;
+  z-index: 100;
+  padding: var(--s-2) var(--s-4);
+  border-radius: var(--r-chip);
+  background: var(--ink);
+  color: var(--surface);
+  font-weight: 600;
+  text-decoration: none;
+}
+.skip-link:focus { top: var(--s-3); }
+
+.muted { color: var(--ink-2); }
+.small { font-size: var(--fs-cap); line-height: 1.5; }
+.prose { max-width: 40em; }
+.num, .tabular { font-variant-numeric: tabular-nums; }
+
+.noscript {
+  margin: var(--s-6) auto;
+  max-width: 40em;
+  padding: var(--s-4);
+  text-align: center;
+}
+
+.clipboard-proxy { position: fixed; top: 0; left: -9999px; opacity: 0; }
+
+.icon {
+  width: 1.25em;
+  height: 1.25em;
+  flex: none;
+  fill: currentColor;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

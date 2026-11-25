@@ -10,6 +10,7 @@ Examples::
     trendai trends "생성형 AI" --geo KR
     trendai compare a.csv b.csv --html compare.html
     trendai ask data.csv "앞으로 6개월 동안 어떻게 될까?"
+    trendai serve --port 8000          # the web app (docs/WEB.md)
 
 Exit codes: 0 success, 1 runtime failure (network, Claude, unexpected error),
 2 input error (bad file / data / arguments).  Data notes and warnings are
@@ -98,6 +99,22 @@ _MSG: dict[str, dict[str, str]] = {
         "arg_min": "{what}: {lo} 이상이어야 합니다 (입력: {v})",
         "what_horizon": "예측 기간",
         "what_n": "관측치 수(--n)",
+        # trendai serve (spec B.5)
+        "arg_port": "포트(--port): 0에서 65535 사이의 정수를 입력하세요 (입력: {text!r})",
+        "serve_url": "trendai 웹 앱: {url} (Ctrl+C로 종료)",
+        "serve_need_contact": ("오류: 공개 주소로 실행하려면 TRENDAI_CONTACT(운영자 이메일이나 URL)를 설정하세요. "
+                               "비공개로 쓰려면 TRENDAI_ALLOW_NO_CONTACT=1."),
+        "serve_no_contact": ("경고: TRENDAI_CONTACT가 설정되지 않아 Wikimedia 요청의 User-Agent에 연락처가 없습니다. "
+                             "공개 운영 전에 운영자 이메일이나 URL을 설정하세요."),
+        "serve_no_naver": "안내: 네이버 API 키가 없어 네이버 출처는 ‘준비 중’으로 표시됩니다.",
+        "serve_proxy_url": "경고: TRENDAI_TRUST_PROXY를 쓸 때는 TRENDAI_PUBLIC_URL도 설정하는 것이 안전합니다.",
+        # {where} is "host:port" with its object particle (messages.josa: 8000을, 8002를)
+        "serve_listen": "오류: {where} 열 수 없습니다 — {why}",
+        "serve_data_dir": "오류: 결과·캐시 저장 폴더를 준비할 수 없습니다 — {why}",
+        "listen_in_use": "이미 다른 프로그램이 이 포트를 쓰고 있습니다",
+        "listen_denied": "권한이 없습니다 (1024 미만 포트는 관리자 권한이 필요합니다)",
+        "listen_not_local": "이 컴퓨터의 주소가 아닙니다",
+        "listen_unknown_host": "주소를 찾을 수 없습니다",
     },
     "en": {
         "synthetic": "※ Synthetic sample data — not real data.",
@@ -148,6 +165,20 @@ _MSG: dict[str, dict[str, str]] = {
         "arg_min": "{what} must be at least {lo}: {v}",
         "what_horizon": "the forecast horizon",
         "what_n": "the number of observations (--n)",
+        "arg_port": "the port (--port) must be an integer from 0 to 65535: {text!r}",
+        "serve_url": "trendai web app: {url} (Ctrl+C to stop)",
+        "serve_need_contact": ("Error: set TRENDAI_CONTACT (operator e-mail or URL) to run on a public address, or "
+                               "TRENDAI_ALLOW_NO_CONTACT=1 for private use."),
+        "serve_no_contact": ("Warning: TRENDAI_CONTACT is not set, so Wikimedia requests carry no contact in their "
+                             "User-Agent. Set an operator e-mail or URL before running publicly."),
+        "serve_no_naver": "Note: no Naver API keys, so the Naver source shows as not available.",
+        "serve_proxy_url": "Warning: set TRENDAI_PUBLIC_URL as well when using TRENDAI_TRUST_PROXY.",
+        "serve_listen": "Error: cannot listen on {where} — {why}",
+        "serve_data_dir": "Error: cannot prepare the data folder — {why}",
+        "listen_in_use": "the port is already in use",
+        "listen_denied": "permission denied (ports below 1024 need administrator rights)",
+        "listen_not_local": "the address does not belong to this machine",
+        "listen_unknown_host": "the host name cannot be resolved",
     },
 }
 
@@ -744,6 +775,103 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- serve (the web app)
+
+
+def _port_number(text: str) -> int:
+    """argparse type of ``serve --port``: an integer 0..65535 (0 = any free port)."""
+    try:
+        port = int(text)
+    except (TypeError, ValueError):
+        port = -1
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError(_t(_LANG, "arg_port", text=text))
+    return port
+
+
+def _listen_error_text(exc: OSError, lang: str) -> str:
+    """Why the server socket could not be opened, as a short localised clause."""
+    import socket
+
+    if isinstance(exc, socket.gaierror):
+        return _t(lang, "listen_unknown_host")
+    key = {errno.EADDRINUSE: "listen_in_use", errno.EACCES: "listen_denied", errno.EPERM: "listen_denied",
+           errno.EADDRNOTAVAIL: "listen_not_local"}.get(getattr(exc, "errno", None) or -1)
+    return _t(lang, key) if key else str(getattr(exc, "strerror", None) or exc)
+
+
+def _flush_and_exit(code: int) -> "NoReturn":
+    """Flush stdout, stderr and logging, then ``os._exit`` (E.14): a still-running job thread (a pandas
+    computation, an AI call bounded by its timeout) must not hold the process after the server stopped."""
+    import logging
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):  # pragma: no cover - closed stream
+            pass
+    logging.shutdown()
+    os._exit(code)
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """``trendai serve``: the web app on the stdlib threaded WSGI server (spec B.5, E.13, E.14).
+
+    Start-up order: the web warnings baseline (it overrides the CLI filters for this process), the configuration
+    (flags > ``TRENDAI_*`` environment > defaults) and its public-address check, logging, the app, the server.
+    Exit codes: 0 after a graceful stop (SIGINT/SIGTERM), 2 for an invalid configuration, 1 when the port cannot
+    be opened and after a second signal (handled by ``trendai.web.server``)."""
+    from . import web
+    from .messages import josa
+    from .web import log as web_log
+    from .web import server as web_server
+
+    lang = args.lang
+    web.install_warning_baseline()
+    flags = {"host": args.host, "port": args.port, "data_dir": args.data_dir, "dev": True if args.dev else None}
+    try:
+        config = web.WebConfig.from_env(**{k: v for k, v in flags.items() if v is not None})
+    except ValueError as exc:
+        _err(_t(lang, "error", exc=exc))
+        return 2
+    try:
+        config.validate_public()
+    except ValueError:
+        _err(_t(lang, "serve_need_contact"))
+        return 2
+    web_log.basic_config(config.log_level)
+    try:
+        app = web.create_app(config)
+    except OSError as exc:
+        _err(_t(lang, "serve_data_dir", why=_os_error_text(exc, lang)))
+        return 2
+
+    listening = False
+
+    def on_ready(url: str) -> None:
+        nonlocal listening
+        listening = True
+        _say(_t(lang, "serve_url", url=url))
+        if not config.contact and not config.is_public():
+            _err(_t(lang, "serve_no_contact"))
+        if app.fetchers.naver is None:
+            _err(_t(lang, "serve_no_naver"))
+        if config.trust_proxy and not config.public_url:
+            _err(_t(lang, "serve_proxy_url"))
+
+    try:
+        code = web_server.serve_forever(app, config.host, config.port, on_ready=on_ready)
+    except OSError as exc:
+        if listening:
+            raise
+        app.close(timeout=0)
+        where = f"{config.host}:{config.port}"
+        _err(_t(lang, "serve_listen", where=josa(where, "을/를") if lang != "en" else where,
+                why=_listen_error_text(exc, lang)))
+        return 1
+    _flush_and_exit(code)
+
+
 # --------------------------------------------------------------------------- parser
 
 
@@ -807,7 +935,8 @@ class _Parser(argparse.ArgumentParser):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The ``trendai`` argument parser (subcommands analyze, sample, list-samples, wiki, trends, compare, ask)."""
+    """The ``trendai`` argument parser (subcommands analyze, sample, list-samples, wiki, trends, compare, ask,
+    serve)."""
     p = _Parser(
         prog="trendai",
         description="과거→현재→미래: 시계열 트렌드를 분석하고 예측하는 AI",
@@ -872,6 +1001,17 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--model", default="claude-opus-5-5", help="Claude 모델 ID")
     q.add_argument("--lang", choices=["ko", "en"], default="ko", help="답변 언어")
     q.set_defaults(func=cmd_ask)
+
+    v = sub.add_parser("serve", help="웹 앱 서버 실행 (기본 http://127.0.0.1:8000)",
+                       description="웹 앱 서버 실행 (기본 http://127.0.0.1:8000)")
+    v.add_argument("--host", default=None, help="접속 주소 (기본: TRENDAI_HOST 또는 127.0.0.1)")
+    v.add_argument("--port", type=_port_number, default=None,
+                   help="포트 (기본: TRENDAI_PORT 또는 8000, 0이면 빈 포트를 고름)")
+    v.add_argument("--data-dir", metavar="DIR", default=None,
+                   help="결과·캐시 저장 폴더 (기본: TRENDAI_DATA_DIR 또는 ./.trendai-data)")
+    v.add_argument("--dev", action="store_true", help="개발 모드: 정적 파일을 매번 새로 읽고 /static/dev를 제공")
+    v.add_argument("--lang", choices=["ko", "en"], default="ko", help="안내 문구 언어 (ko, en)")
+    v.set_defaults(func=cmd_serve)
     return p
 
 
